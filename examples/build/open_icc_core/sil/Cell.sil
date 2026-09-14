@@ -151,6 +151,8 @@ contract Cell(
         int gen__source_cell_output_idx = OpAuthOutputIdx(this.activeInputIndex, 0);
         // :: output target_cell: Cell
         int gen__target_cell_output_idx = OpAuthOutputIdx(this.activeInputIndex, 1);
+        // :: leader authorizes all covenant continuations (rule 5)
+        require(OpCovOutputCount(gen__cov_id) == OpAuthOutputCount(this.activeInputIndex));
 
         AgentCapsule prev_state = gen__remote_agent_state;
         int distance = abs1(dx) + abs1(dy);

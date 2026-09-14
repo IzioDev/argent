@@ -85,8 +85,6 @@ outputs.
    OpCovOutputCount(c) == OpAuthOutputCount(l)
    ```
 
-   ***[NOT IMPLEMENTED]***
-
 6. **Rule 6 — Zero-continuation position.** An otherwise-batchable,
    consumes-free ordinary entry on a delegate-capable actor requires its active
    input `i` to equal `I(c)[0]` when `m(e) = 0`. This includes `emits none`,
@@ -97,8 +95,6 @@ outputs.
    ```text
    OpCovInputIdx(c, 0) == this.activeInputIndex
    ```
-
-   ***[NOT IMPLEMENTED]***
 
 ## Security properties
 

@@ -5313,7 +5313,7 @@ fn consumed_route_reuses_input_template() {
     );
     assert_eq!(
         encode_hex(&controller_contract.compiled.template_hash),
-        "3091c3cb1b9eac52e3f7be3661e80720b5d2be1c0b9569e76f440a493ce53413"
+        "699b6e94e13f97afef35f88285457ea4ea85b21ed7ff4f1668e8651b680c6332"
     );
     let peer_contract = artifact.sil_abi.contract("Peer").expect("Peer contract exists");
     assert_eq!(peer_contract.runtime_state.fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["count"]);
@@ -5361,7 +5361,7 @@ fn single_actor_self_consume_is_pinned() {
     assert_eq!(source_state.fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["count"]);
     let contract = artifact.sil_abi.contract("Counter").expect("Counter contract exists");
     assert_eq!(contract.runtime_state.fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["count"]);
-    assert_eq!(encode_hex(&contract.compiled.template_hash), "7e3775a25b2ed4594671eb43b72ca5389252ec0a11f3f0b8b255f91d7851e44a");
+    assert_eq!(encode_hex(&contract.compiled.template_hash), "639aee9629f32312113a0107dc3cf298a0a59abc17d5cc13e2639d599c176d1c");
     let template = artifact
         .argent
         .template_plan

@@ -138,6 +138,8 @@ contract StonesSettle(
         int gen__player_a_out_output_idx = OpAuthOutputIdx(this.activeInputIndex, 0);
         // :: output player_b_out: Player
         int gen__player_b_out_output_idx = OpAuthOutputIdx(this.activeInputIndex, 1);
+        // :: leader authorizes all covenant continuations (rule 5)
+        require(OpCovOutputCount(gen__cov_id) == OpAuthOutputCount(this.activeInputIndex));
 
         require(status == A_WIN || status == B_WIN);
         byte[32] player_a_ref = player_ref(gen__player_a_in_state.owner, gen__player_a_in_state.player_id);
