@@ -158,6 +158,8 @@ contract Player(
         int gen__opponent_out_output_idx = OpAuthOutputIdx(this.activeInputIndex, 1);
         // :: output game: StonesGame
         int gen__game_output_idx = OpAuthOutputIdx(this.activeInputIndex, 2);
+        // :: continuation outputs count must equal to the outputs authorized by this leader (leader/delegate rule 5)
+        require(OpCovOutputCount(gen__cov_id) == OpAuthOutputCount(this.activeInputIndex));
 
         require(blake2b(byte[](owner_pk)) == owner);
         require(checkSig(owner_sig, owner_pk));
