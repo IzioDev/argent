@@ -151,7 +151,7 @@ contract Cell(
         int gen__source_cell_output_idx = OpAuthOutputIdx(this.activeInputIndex, 0);
         // :: output target_cell: Cell
         int gen__target_cell_output_idx = OpAuthOutputIdx(this.activeInputIndex, 1);
-        // :: continuation outputs count must equal to the outputs authorized by this leader (leader/delegate rule 5)
+        // :: leader authorizes all covenant continuations (rule 5)
         require(OpCovOutputCount(gen__cov_id) == OpAuthOutputCount(this.activeInputIndex));
 
         AgentCapsule prev_state = gen__remote_agent_state;
