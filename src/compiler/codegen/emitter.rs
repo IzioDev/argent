@@ -596,7 +596,8 @@ fn emit_entry(
     // without restricting the number of independently batched inputs.
     if allows_cov_batching
         && actor.entries.iter().any(|candidate| candidate.kind == EntryKind::Delegate)
-        // "emits none", which is treated as a zero continuation minimum is included in this condition because there will be no output
+        // `emits none` has no output interactions, so `all` returns true and
+        // correctly classifies it as having a zero continuation minimum.
         && entry_model
             .current()
             .outputs()
@@ -605,8 +606,8 @@ fn emit_entry(
     {
         let cov_id = hidden_cov_id_name();
         out.push_str("        // :: zero-minimum entry must lead its covenant group (rule 6)\n");
-        // cov_id was not yet generated at this stage. this branching is mututally exclusive with the previous branch
-        // which is executed when no covenant batching is allowed
+        // This branch runs only when the earlier covenant-input prelude was skipped,
+        // so it must materialize the current covenant ID itself.
         out.push_str(&format!("        byte[32] {cov_id} = OpInputCovenantId(this.activeInputIndex);\n"));
         out.push_str(&format!("        require(OpCovInputIdx({cov_id}, 0) == this.activeInputIndex);\n\n"));
     }
@@ -650,7 +651,7 @@ fn emit_entry(
     // Rule 5: the coordinated leader must authorize every continuation in
     // its covenant group. Genesis outputs are outside both output counts.
     if entry.kind == EntryKind::Leader && !entry.consumes.is_empty() {
-        assert!(!allows_cov_batching, "entries consuming an actor must not allow batching");
+        assert!(!allows_cov_batching, "internal invariant violated: coordinated leader entry skipped the covenant-input prelude");
 
         let cov_id = hidden_cov_id_name();
         out.push_str("        // :: leader authorizes all covenant continuations (rule 5)\n");
