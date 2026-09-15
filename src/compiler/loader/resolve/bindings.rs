@@ -4,6 +4,7 @@
 use super::*;
 use crate::compiler::syntax::body::{EntryBinding, EntryStatement, EntrySuccessor};
 use crate::compiler::syntax::lexer::{Span, Token, TokenKind, lex};
+use silverscript_lang::parser::{Rule, parse_expression};
 
 /// Identifies a text-bearing node within its owning declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -63,7 +64,7 @@ impl DeclarationBindings {
             ResolvedDeclaration::Const(item) => {
                 binder.ty(&item.ty)?;
                 let tokens = lex(&item.value)?;
-                let references = binder.references(&tokens, &BTreeSet::new(), &[])?;
+                let references = binder.references(&item.value, &tokens, &BTreeSet::new(), &[])?;
                 binder.bindings.text.insert(TextSite::Value, references);
             }
             ResolvedDeclaration::State(item) => {
@@ -264,7 +265,7 @@ impl DeclarationBinder<'_> {
         }).map(|param| param.name.clone()).collect::<BTreeSet<_>>();
         actor_locals.extend(self.actor_fields.iter().flat_map(|field| [field.clone(), format!("self.{field}")]));
         for (observe_index, observe) in entry.observes.iter().enumerate() {
-            let references = self.references(&lex(&observe.covenant_expr)?, &scope, &[])?;
+            let references = self.references(&observe.covenant_expr, &lex(&observe.covenant_expr)?, &scope, &[])?;
             self.bindings.text.insert(TextSite::Observe { entry: index, observe: observe_index }, references);
             let mut actor_scope = actor_locals.clone();
             actor_scope.extend(observe.inputs.iter().filter(|actor| actor.open_state.is_some()).map(|actor| actor.actor.clone()));
@@ -441,15 +442,53 @@ impl DeclarationBinder<'_> {
         let tokens = body.tokens();
         let start = tokens.partition_point(|token| token.span.start < span.start);
         let end = tokens.partition_point(|token| token.span.end <= span.end);
-        self.references(&tokens[start..end], locals, bindings)
+        self.references(body.text(), &tokens[start..end], locals, bindings)
     }
 
-    fn references(&mut self, tokens: &[Token], locals: &BTreeSet<String>, bindings: &[&EntryBinding]) -> Result<Vec<BoundReference>> {
+    fn references(
+        &mut self,
+        source: &str,
+        tokens: &[Token],
+        locals: &BTreeSet<String>,
+        bindings: &[&EntryBinding],
+    ) -> Result<Vec<BoundReference>> {
         let mut references = Vec::new();
         let mut cursor = 0;
         while cursor < tokens.len() {
             let start = cursor;
             cursor += 1;
+
+            // keep units such as `seconds` in `1 seconds` out of declaration lookup
+            if matches!(tokens[start].kind, TokenKind::Number(_)) {
+                // lexer splits `1_000` into `1` and `_000`, and `1e3` into `1` and `e3`. group together.
+                let mut end = cursor;
+                while end < tokens.len()
+                    && tokens[end - 1].span.end == tokens[end].span.start
+                    && matches!(tokens[end].kind, TokenKind::Number(_) | TokenKind::Ident(_))
+                {
+                    end += 1;
+                }
+
+                // include the next word in case it is a unit
+                if matches!(tokens.get(end).map(|token| &token.kind), Some(TokenKind::Ident(_))) {
+                    end += 1;
+                }
+                let offset = tokens[start].span.start;
+
+                // recognize the number literal at the start
+                if let Ok(parsed) = parse_expression(&source[offset..tokens[end - 1].span.end])
+                    && let Some(literal) = parsed.flatten().find(|pair| pair.as_rule() == Rule::number_literal)
+                    && literal.as_span().start() == 0
+                {
+                    let literal_end = offset + literal.as_span().end();
+                    // skip what has been accepted as number literal by Silver
+                    while cursor < end && tokens[cursor].span.end <= literal_end {
+                        cursor += 1;
+                    }
+                }
+                continue;
+            }
+
             let TokenKind::Ident(first) = &tokens[start].kind else {
                 continue;
             };

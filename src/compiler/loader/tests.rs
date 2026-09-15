@@ -49,6 +49,41 @@ fn source_bindings_respect_lexical_scopes_and_preserve_authored_text() {
 }
 
 #[test]
+fn source_bindings_distinguish_numeric_units_from_declaration_references() {
+    for unit in ["seconds", "minutes", "hours", "days", "weeks", "litras", "grains", "kas"] {
+        let ty = if matches!(unit, "litras" | "grains" | "kas") { "int" } else { "temporal" };
+        let program = load_inline_program(
+            PathBuf::from("numeric-units.ag"),
+            format!(
+                r#"
+                const int {unit} = 2;
+                state S {{ int count; }}
+                actor A owns S {{
+                    entry inspect() emits none {{
+                        {ty} value = 5 {unit};
+                        require(count + {unit} + int(value) >= 0);
+                    }}
+                }}
+            "#
+            ),
+        )
+        .expect("source resolves");
+        let actor = program.root_declarations().find(|id| id.kind() == SymbolKind::Actor).unwrap();
+        let ResolvedDeclaration::Actor(item) = program.declaration(actor) else {
+            panic!("actor expected");
+        };
+        // all references for the first (only) entry
+        let references = &program.bindings(actor).text[&TextSite::Entry(0)];
+        // should only contains one, at usage (2nd line)
+        assert_eq!(references.len(), 1, "{unit}: only the constant use should bind");
+        let body = item.entries[0].body.text();
+        let reference = &references[0];
+        assert_eq!(&body[reference.span.start..reference.span.end], unit);
+        assert!(body[..reference.span.start].ends_with("count + "));
+    }
+}
+
+#[test]
 fn selected_apps_reject_duplicate_actor_exports_instead_of_renaming_them() {
     let temp = temp_dir("duplicate-selected-exports");
     fs::write(temp.join("left.ag"), "state Left {} actor A owns Left {}").unwrap();
