@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::link::DeclarationOrigin;
 use crate::compiler::loader::{ActorSite, DeclId, ModuleId, ResolvedDeclaration, ResolvedModules, ResolvedName, SymbolKind, TextSite};
+use crate::compiler::syntax::lexer::RESERVED_GENERATED_MODULE_NAME_PREFIX;
 use crate::compiler::syntax::*;
 use crate::error::{ArgentError, Result};
 
@@ -66,7 +67,7 @@ impl<'a> ModelSource<'a> {
             if occupied.contains(&name) || foreign_locals.contains(&name) {
                 let mut suffix = 1;
                 loop {
-                    name = format!("Argent__{suffix}__{source_name}");
+                    name = format!("{RESERVED_GENERATED_MODULE_NAME_PREFIX}{suffix}__{source_name}");
                     if !occupied.contains(&name) && !authored_names.contains(&name) && !foreign_locals.contains(&name) {
                         break;
                     }
