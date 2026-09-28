@@ -1366,6 +1366,50 @@ fn actor_handle_accepts_imported_state_with_local_name_collision() {
 }
 
 #[test]
+fn linking_same_actor_enum_through_different_apps_is_rejected() {
+    let temp = std::env::temp_dir().join(format!("argent-shared-app-enum-{}", std::process::id()));
+    std::fs::create_dir_all(&temp).unwrap();
+    let shared = r#"
+        state S { int n; }
+        actor A owns S { entry hold() emits none { require(n >= 0); } }
+        actor B owns S { entry hold() emits none { require(n > 1); } }
+        actor C owns S { entry hold() emits none { require(n > 2); } }
+        app SmallApp { actor A; actor B; }
+        app LargeApp { actor A; actor B; actor C; }
+    "#;
+    std::fs::write(temp.join("shared.ag"), shared).unwrap();
+    std::fs::write(
+        temp.join("root.ag"),
+        r#"
+        import "./shared.ag" as shared;
+        state R { int nonce; }
+        actor Root owns R {
+            entry check(cov_id small_id, cov_id large_id)
+            observes small by small_id { inputs { a: shared::SmallApp::A, } }
+            observes large by large_id { inputs { a: shared::LargeApp::A, } }
+            emits none {}
+        }
+        app Test { actor Root; }
+    "#,
+    )
+    .unwrap();
+
+    build_file_app_bundle(temp.join("root.ag"), "Test", temp.join("without-enum"))
+        .expect("actors from both apps link without the enum");
+
+    // The restriction also applies when the root never references the enum.
+    std::fs::write(temp.join("shared.ag"), format!("{shared}\nactor enum Kind {{ A; B; }}\n")).unwrap();
+    let result = build_file_app_bundle(temp.join("root.ag"), "Test", temp.join("with-enum"));
+    std::fs::remove_dir_all(temp).unwrap();
+    let err = result.expect_err("linking the same enum declaration through different apps is unsupported");
+    assert_eq!(
+        err.message,
+        "actor enum `Kind` is provided through both `LargeApp` and `SmallApp`; \
+         linking the same enum declaration through different apps is not supported"
+    );
+}
+
+#[test]
 fn transitive_linked_enum_variants_keep_their_defining_app() {
     let temp = std::env::temp_dir().join(format!("argent-transitive-enum-{}", std::process::id()));
     std::fs::create_dir_all(&temp).unwrap();

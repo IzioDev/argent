@@ -62,6 +62,7 @@ impl LinkedContext {
         };
         let mut names_by_origin =
             context.origins.iter().map(|(name, origin)| (origin.clone(), name.clone())).collect::<BTreeMap<_, _>>();
+        let mut actor_enum_apps = BTreeMap::new();
 
         // for each linked dependencies, link state, actors and actor enums declarations to the context
         for (app, dependency) in dependencies {
@@ -170,10 +171,14 @@ impl LinkedContext {
                     })
                     .collect();
                 let linked = LinkedActorEnum { name: name.clone(), state, variants };
+                let previous_app = actor_enum_apps.entry(name.clone()).or_insert(app);
                 if let Some(previous) = context.actor_enums.insert(name.clone(), linked.clone())
                     && previous != linked
                 {
-                    return Err(ArgentError::new(format!("linked apps provide conflicting actor enum definitions for `{name}`")));
+                    return Err(ArgentError::new(format!(
+                        "actor enum `{name}` is provided through both `{previous_app}` and `{app}`; \
+                         linking the same enum declaration through different apps is not supported"
+                    )));
                 }
             }
         }
