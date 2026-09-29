@@ -120,30 +120,62 @@ compilation. Argent does not use Silverscript covenant macros.
 ## Language at a glance
 
 ```rust
+state EventState {
+    int remaining_tickets;
+    int price;
+}
+
 state TicketState {
     byte[32] owner;
-    int units;
+}
+
+actor Event owns EventState {
+    entry buy(byte[32] buyer)
+    // The `emits` clause declares the complete actor-output shape for this entry.
+    emits {
+        event: Event,
+        ticket: Ticket,
+    } {
+        require(remaining_tickets > 0);
+
+        // Every emitted output value must be constrained or explicitly unrestricted.
+        require(event.value == self.value + price);
+        unrestricted(ticket.value);
+
+        EventState next_event = {
+            remaining_tickets: remaining_tickets - 1,
+            price: price,
+        };
+        TicketState new_ticket = { owner: buyer };
+
+        // `become` binds each emitted handle to its successor actor and state.
+        become {
+            event <- Event(next_event),
+            ticket <- Ticket(new_ticket),
+        };
+    }
 }
 
 actor Ticket owns TicketState {
     entry transfer(byte[32] next_owner, sig owner_sig, pubkey owner_pk) emits next: Ticket {
+        // Prove ownership with a P2PKH-style public-key hash and signature.
         require(blake2b(byte[](owner_pk)) == owner);
         require(checkSig(owner_sig, owner_pk));
-        require(next.value == self.value);
-
-        TicketState new_state = {
-            owner: next_owner,
-            units: units,
-        };
-
+        unrestricted(next.value);
+        TicketState new_state = { owner: next_owner };
         become next <- Ticket(new_state);
     }
 }
 
+// An app defines a covenant boundary, keeping the covenant state machine closed to these actors.
 app Tickets {
+    actor Event;
     actor Ticket;
 }
 ```
+
+One `Event::buy` transaction advances the Event and creates a separately owned
+Ticket. Later transactions can transfer that Ticket independently.
 
 Argent uses type-first syntax for declarations and callable parameters.
 Bindings put the local name on the left. See
