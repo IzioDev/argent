@@ -36,12 +36,13 @@ practical.
 ## Project status
 
 > The project is still under active development and is not yet release-ready.
-Once Silverscript completes its audit and is released, advanced users who can
-review the generated `.sil` contracts will have a viable path to careful early
-production use. This requires understanding Argent's route semantics and
-compiler model well enough to verify that the generated contracts match the
-intended application. Argent itself will still need further audit and hardening
-before general production use.
+[Silverscript v1.0.0](https://github.com/kaspanet/silverscript/releases/tag/v1.0.0)
+is released for production use, and Argent is pinned to that release. Advanced
+users who can review the generated `.sil` contracts thus have a viable path to
+careful early production use. This requires understanding Argent's route
+semantics and compiler model well enough to verify that the generated contracts
+match the intended application. Argent itself will still need further audit and
+hardening before general production use.
 
 The main pieces are present: compiler, generated Silverscript, portable
 artifacts, runtime transaction building, multi-actor routing, cross-app linking,
@@ -79,7 +80,7 @@ Regenerate tracked example outputs and run the full check loop:
 ./check.sh --full
 ```
 
-Build one app manually:
+Build the tracked examples manually:
 
 ```sh
 cargo run -- build examples/tickets.ag --out examples/build/tickets
@@ -198,13 +199,14 @@ Core terms:
 - `become` is the terminal transition into successor actor state.
 - `observes` declares a foreign covenant view for ICC.
 - `spawns` declares a genesis covenant output group and binds its generated
-  covenant id. A spawn target can be an actor in the selected app or an
+  covenant ID. A spawn target can be an actor in the selected app or an
   `actor_type<State>` value.
 - `actor_type<State>` identifies a runtime-selected actor implementation
   compatible with `State`.
 - `actor enum` defines a closed set of runtime-selected actor targets.
 - `virtual` slots and `state X expands Base` let concrete actors bind private
   digest-backed memory while preserving a shared base state layout.
+- `app` declares the closed actor set shared by its covenant instances.
 
 ## Examples
 
@@ -237,14 +239,15 @@ Classic single-app flow:
 ```rust
 let builder = TxBuilder::new(&artifact)?;
 
-let input_state = state! { count: 2 };
-let output_state = state! { count: 5 };
+let before = state! { remaining_tickets: 10, price: price };
+let after = state! { remaining_tickets: 9, price: price };
+let ticket = state! { owner: buyer.clone() };
 
-// The covenant UTXO being spent.
-let input_utxo = builder.covenant_utxo(
-    "Counter",
-    input_state.clone(),
-    value,
+// Normally loaded from a Kaspa node or application storage.
+let event_utxo = builder.covenant_utxo(
+    "Event", // Actor type, specified by name.
+    before.clone(),
+    event_value,
     0,
     false,
     Some(covenant_id),
@@ -252,18 +255,27 @@ let input_utxo = builder.covenant_utxo(
 
 let context = TxContext::new()
     .actor_input(
-        "Counter",
-        input_state,
-        EntryCall::new("bump").args(args![3]),
-        outpoint,
-        input_utxo,
+        "Event",
+        before,
+        EntryCall::new("buy").args(args![buyer]),
+        event_outpoint,
+        event_utxo,
         0, // sequence
     )
+    // The ordinary buyer input funds the price, Ticket value, and fees.
+    .input(buyer_outpoint, buyer_utxo, buyer_sig_script, 0)
+    // Both actor outputs continue under the Event input's covenant.
     .actor_output(
-        "Counter",
-        output_state,
+        "Event",
+        after,
+        CovenantBinding::new(0 /* Event input index */, covenant_id),
+        event_value + price,
+    )
+    .actor_output(
+        "Ticket",
+        ticket,
         CovenantBinding::new(0, covenant_id),
-        value,
+        ticket_value,
     );
 
 let tx = builder.build(&context)?;
@@ -283,7 +295,7 @@ Kaspa covenants make it possible to build applications from several stateful
 UTXOs whose transitions compose atomically in one transaction. But hand-written
 multi-contract systems quickly accumulate mechanical obligations: state
 serialization, template hashes, route commitments, prefix/suffix witnesses,
-output ordering, observed covenant ids, and cross-contract state reads.
+output ordering, observed covenant IDs, and cross-contract state reads.
 
 Argent makes the application graph source-level. Actors own state. Entries
 declare the peer actors they consume, the outputs they emit, the foreign
@@ -298,9 +310,16 @@ runtime recipe needed to build transactions against them.
 
 The compiler parses `.ag` source into an actor/state model and lowers each actor
 to one Silverscript contract. Source state fields become the contract state
-layout. Compiler-generated fields and hidden entry arguments carry template
-receipts, route-family tables, observed-covenant witnesses, and expanded-state
-preimages.
+layout.
+
+A central compiler task is making each actor commit in advance to every actor
+template it may create next. Argent derives these commitments from the app's
+[route graph](docs/route-planner.md) and places the required context in generated
+contracts, so entries can validate successor templates without trusting values
+provided by callers.
+
+Compiler-generated fields and hidden entry arguments carry template receipts,
+route-family tables, observed-covenant witnesses, and expanded-state preimages.
 
 `become` routes lower to output validation. Exact continuations can use cheaper
 script-public-key checks. Foreign or runtime-selected actors use template
@@ -311,7 +330,7 @@ slots into structured memory.
 
 The portable artifact records the runtime recipe for all of this: script bytes,
 state layouts, type descriptors, route receipts, observed covenant metadata,
-hidden witness recipes, artifact ids, and interface fingerprints.
+hidden witness recipes, artifact IDs, and interface fingerprints.
 `argent-runtime` consumes that artifact directly; it does not depend on compiler
 AST types.
 
@@ -321,21 +340,14 @@ before they build a transaction.
 
 ## Current status
 
-What is useful today:
+The core language, compiler, artifact, and runtime flows are functional and
+covered by tracked end-to-end examples. Work before the first release is
+focused on:
 
-- compiling `.ag` apps to auditable `.sil`
-- building tracked example transactions through `argent-runtime`
-- closed and open ICC examples
-- route-family and actor-enum examples
-- virtual-slot expanded state for open-agent style apps
-
-What is still being built:
-
-- broader launch and bootstrap tooling
-- richer package and dependency tooling
-- stronger diagnostics and typechecking
-- generated app-specific builder APIs
-- broader hardening and negative-test coverage
+- completing ranged observe and spawn clauses
+- refactoring code generation into a pure Argent-to-Silverscript AST
+  transformation
+- auditing and hardening the compiler, artifacts, and runtime
 
 Design notes can be found in [docs/argent-design.md](docs/argent-design.md).
 ICC semantics can be found in [docs/icc-semantics.md](docs/icc-semantics.md).
