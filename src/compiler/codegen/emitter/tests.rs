@@ -5646,6 +5646,148 @@ fn singleton_input_can_authenticate_a_template_also_used_by_an_optional_range() 
 }
 
 #[test]
+fn current_template_length_literals_have_fixed_compiled_width() {
+    let mut expected_size = None;
+    for len in [0, 1, 16, 17, 127, 128, 255, 256, 32_767, 32_768, i32::MAX as usize] {
+        let constants = current_template_length_constants("Counter", len, len).expect("length fits byte[4]");
+        let sil = format!(
+            r#"
+                contract Counter(int initial) {{
+                    {constants}
+                    int count = initial;
+                    entry read(int input_index, byte[32] template_hash) {{
+                        int gen__counter_prefix_len = int(gen__const_counter_prefix_len);
+                        int gen__counter_suffix_len = int(gen__const_counter_suffix_len);
+                        State peer = readInputStateWithTemplate(
+                            input_index, gen__counter_prefix_len, gen__counter_suffix_len, template_hash
+                        );
+                        require(peer.count >= 0);
+                    }}
+                }}
+            "#
+        );
+        let compiled = compile_contract(&sil, &[SilExpr::int(0)], CompileOptions::default()).expect("fixed-width lengths compile");
+        assert_eq!(*expected_size.get_or_insert(compiled.bytecode.len()), compiled.bytecode.len(), "length {len}");
+    }
+}
+
+#[test]
+fn static_current_actor_targets_do_not_request_template_witnesses() {
+    let inputs = [
+        ("none", "", ""),
+        ("consumed", "consumes { peer: Counter, }", ""),
+        ("ranged", "consumes { peers: Counter[1..=2], }", ""),
+        ("optional", "consumes { peers: Counter[0..=2], }", ""),
+        ("observed", "", "inputs { peer: Counter, }"),
+    ];
+    let outputs = [
+        ("none", "emits none", "", "", ""),
+        ("emitted", "emits next: Counter", "", "", "unrestricted(next.value); become next <- Counter(next_state);"),
+        (
+            "ranged",
+            "emits next: Counter[1..=2]",
+            "",
+            "",
+            r#"
+                CounterState[] states = CounterState[]{ next_state };
+                unrestricted(next[0].value);
+                become next <- Counter[](states);
+            "#,
+        ),
+        ("exact", "emits next: Counter", "", "", "unrestricted(next.value); become next <- self;"),
+        ("observed", "emits none", "outputs { dst: Counter, }", "", "require remote.outputs become { dst <- Counter(next_state), };"),
+        (
+            "spawned",
+            "emits none",
+            "",
+            "spawns children by child_id { outputs { child: Counter, } }",
+            "unrestricted(children.outputs.child.value); require children.outputs become { child <- Counter(next_state), };",
+        ),
+    ];
+    let witness_names = [
+        hidden_witness_prefix_name("Counter"),
+        hidden_witness_suffix_name("Counter"),
+        hidden_witness_prefix_len_name("Counter"),
+        hidden_witness_suffix_len_name("Counter"),
+    ];
+    let template_purposes = [
+        HiddenParamPurposeArtifact::TemplatePrefixBytes,
+        HiddenParamPurposeArtifact::TemplateSuffixBytes,
+        HiddenParamPurposeArtifact::TemplatePrefixLen,
+        HiddenParamPurposeArtifact::TemplateSuffixLen,
+    ];
+    let witness_ids = template_purposes.map(|purpose| template_witness_recipe_id("Counter", purpose));
+
+    for (input_name, consumes, observed_input) in inputs {
+        for (output_name, emits, observed_output, spawns, body) in outputs {
+            let case = format!("{input_name}_{output_name}");
+            let observes = if observed_input.is_empty() && observed_output.is_empty() {
+                String::new()
+            } else {
+                format!("observes remote by remote_id {{ {observed_input} {observed_output} }}")
+            };
+            // Keep a second actor in the app: current-actor reads must still
+            // authenticate their template, rather than take the singleton shortcut.
+            let source = format!(
+                r#"
+                    state CounterState {{ int count; }}
+                    state GuardState {{ int marker; }}
+                    actor Counter owns CounterState {{
+                        entry check(cov_id remote_id) {consumes} {observes} {spawns} {emits} {{
+                            require(count >= 0);
+                            CounterState next_state = CounterState {{ count: count + 1, }};
+                            {body}
+                        }}
+                    }}
+                    actor Guard owns GuardState {{
+                        entry hold() emits none {{ require(marker == 123); }}
+                    }}
+                    app Test {{ actor Counter; actor Guard; }}
+                "#
+            );
+            let program = crate::compiler::loader::load_inline_program(PathBuf::from(format!("{case}.ag")), source)
+                .unwrap_or_else(|err| panic!("{case}: {err}"));
+            let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
+            let model = Model::from_source(&program_source).unwrap_or_else(|err| panic!("{case}: {err}"));
+            let actor = model.actor("Counter").expect("Counter actor exists");
+            let entry = &actor.entries[0];
+            let uses = model.entry_template_uses(actor, entry).expect("template uses resolve");
+            let reads_current = input_name != "none";
+            assert_eq!(uses.reads.contains("Counter"), reads_current, "{case}");
+            assert!(!uses.writes.contains("Counter"), "{case}: current outputs must not request template bytes");
+            let specs = entry_witness_specs(actor, entry, &model).expect("witness specs resolve");
+            assert_eq!(
+                specs.templates.iter().find(|spec| spec.actor == "Counter").map(|spec| spec.form),
+                reads_current.then_some(TemplateWitnessForm::Len),
+                "{case}: current-actor specs must be absent or Len, never Bytes"
+            );
+
+            let actor_sil = actor_sil_for_model(&model);
+            let sil = &actor_sil["Counter"];
+            assert!(!sil.contains("validateOutputStateWithTemplate("), "{case}: {sil}");
+            assert_eq!(sil.contains("readInputStateWithTemplate("), reads_current, "{case}: {sil}");
+            for part in ["prefix", "suffix"] {
+                let constant = current_template_length_const_name("Counter", part);
+                assert_eq!(sil.matches(&format!("int({constant})")).count(), usize::from(reads_current), "{case}: {sil}");
+            }
+            let artifact = emit_artifact(&program, &model, &actor_sil).unwrap_or_else(|err| panic!("{case}: {err}"));
+            let counter = artifact.argent.actors.iter().find(|actor| actor.name == "Counter").expect("Counter artifact exists");
+            let entry = &counter.entries[0];
+            let sil_entry = artifact.sil_abi.contract("Counter").unwrap().entry("check").unwrap();
+            assert!(sil_entry.params.iter().all(|param| !witness_names.contains(&param.name)), "{case}");
+            assert!(entry.hidden_params.iter().all(|param| !template_purposes.contains(&param.purpose)), "{case}");
+            assert!(entry.witnesses.iter().all(|witness| !template_purposes.contains(&witness.purpose)), "{case}");
+            assert!(entry.route_plan.witness_recipe_ids.iter().all(|id| !witness_ids.contains(id)), "{case}");
+            assert!(
+                artifact.argent.template_plan.witness_recipes.iter().all(|recipe| !template_purposes.contains(&recipe.purpose)),
+                "{case}"
+            );
+            artifact.check_consistency().unwrap_or_else(|err| panic!("{case}: {err}"));
+        }
+    }
+}
+
+#[test]
 fn selected_app_actor_count_controls_self_consume_template_authentication() {
     let path = PathBuf::from("multi_actor_self_consume.ag");
     let program = crate::compiler::loader::load_inline_program(
@@ -5660,6 +5802,12 @@ fn selected_app_actor_count_controls_self_consume_template_authentication() {
             }
 
             actor Counter owns CounterState {
+                entry inspect(cov_id remote_id)
+                observes remote by remote_id { inputs { peer: Counter, } }
+                emits none {
+                    require(remote.inputs.peer.count >= 0);
+                }
+
                 entry merge()
                 consumes {
                     other: Counter,
@@ -5703,14 +5851,20 @@ fn selected_app_actor_count_controls_self_consume_template_authentication() {
     assert!(!sil.contains("// :: direct input state"), "{sil}");
     let counter = artifact.argent.actors.iter().find(|actor| actor.name == "Counter").expect("Counter actor exists");
     let merge = counter.entries.iter().find(|entry| entry.name == "merge").expect("merge entry exists");
-    assert_eq!(
-        merge.hidden_params.iter().map(|param| param.name.as_str()).collect::<Vec<_>>(),
-        vec!["gen__counter_prefix_len", "gen__counter_suffix_len"]
-    );
-    assert_eq!(
-        merge.route_plan.witness_recipe_ids.iter().map(String::as_str).collect::<Vec<_>>(),
-        vec!["witness/counter/template_prefix_len", "witness/counter/template_suffix_len"]
-    );
+    assert!(merge.hidden_params.is_empty());
+    assert!(merge.route_plan.witness_recipe_ids.is_empty());
+    assert!(sil.contains("entry merge()"), "{sil}");
+    let compiled = &artifact.sil_abi.contract("Counter").expect("Counter compiles").compiled;
+    let (prefix, _, suffix) = compiled.script_parts(&compiled.bytecode).expect("state cut is valid");
+    assert!(sil.contains(&current_template_length_constants("Counter", prefix.len(), suffix.len()).unwrap()), "{sil}");
+    assert_eq!(sil.matches("int gen__counter_prefix_len = int(gen__const_counter_prefix_len);").count(), 2, "{sil}");
+    assert_eq!(sil.matches("int gen__counter_suffix_len = int(gen__const_counter_suffix_len);").count(), 2, "{sil}");
+    assert_eq!(sil.matches("int(gen__const_counter_prefix_len)").count(), 2, "{sil}");
+    assert_eq!(sil.matches("int(gen__const_counter_suffix_len)").count(), 2, "{sil}");
+    let inspect = counter.entries.iter().find(|entry| entry.name == "inspect").expect("inspect entry exists");
+    assert!(inspect.hidden_params.is_empty());
+    assert!(sil.contains("entry inspect(byte[32] remote_id)"), "{sil}");
+    assert!(sil.contains("State gen__remote_peer_state = readInputStateWithTemplate("), "{sil}");
     assert!(runtime_state_plan(&artifact, "Counter").is_some());
 
     let program_source = crate::compiler::model::ModelSource::new(&program, Some("Single")).expect("model source adapts");
@@ -5722,6 +5876,7 @@ fn selected_app_actor_count_controls_self_consume_template_authentication() {
 
     assert!(sil.contains("State gen__other_state = readInputState(gen__other_input_idx);"), "{sil}");
     assert!(!sil.contains("readInputStateWithTemplate"), "{sil}");
+    assert!(!sil.contains("gen__const_counter_prefix_len"), "{sil}");
     assert!(runtime_state_plan(&artifact, "Counter").is_none());
 }
 
@@ -6019,7 +6174,7 @@ fn rejects_observed_output_become_actor_mismatch() {
 }
 
 #[test]
-fn stones_delegate_reads_use_length_only_template_witnesses() {
+fn stones_embeds_current_lengths_and_keeps_foreign_template_witnesses() {
     let out_dir = std::env::temp_dir().join(format!("argent-stones-length-witness-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&out_dir);
 
@@ -6030,14 +6185,13 @@ fn stones_delegate_reads_use_length_only_template_witnesses() {
     let artifact_json = fs::read_to_string(out_dir.join("artifact.json")).expect("artifact json exists");
     let artifact: Artifact = serde_json::from_str(&artifact_json).expect("artifact deserializes");
 
-    assert!(player_sil.contains("entry accept_start(\n"), "{player_sil}");
-    assert!(player_sil.contains("sig owner_sig,"), "{player_sil}");
-    assert!(player_sil.contains("pubkey owner_pk,"), "{player_sil}");
-    assert!(player_sil.contains("int gen__player_prefix_len,"), "{player_sil}");
-    assert!(player_sil.contains("int gen__player_suffix_len"), "{player_sil}");
+    assert!(player_sil.contains("entry accept_start(sig owner_sig, pubkey owner_pk)"), "{player_sil}");
+    assert!(player_sil.contains("byte[4] constant gen__const_player_prefix_len"), "{player_sil}");
+    assert!(player_sil.contains("byte[4] constant gen__const_player_suffix_len"), "{player_sil}");
+    assert_eq!(player_sil.matches("int gen__player_prefix_len = int(gen__const_player_prefix_len);").count(), 2, "{player_sil}");
+    assert_eq!(player_sil.matches("int gen__player_suffix_len = int(gen__const_player_suffix_len);").count(), 2, "{player_sil}");
     assert!(!player_sil.contains("entry accept_start(sig owner_sig, pubkey owner_pk, byte[]"), "{player_sil}");
     assert!(player_sil.contains("entry start_game(\n"), "{player_sil}");
-    assert!(player_sil.contains("int gen__player_prefix_len,"), "{player_sil}");
     assert!(player_sil.contains("byte[] gen__stones_game_prefix,"), "{player_sil}");
     assert!(player_sil.contains("byte[] gen__stones_game_suffix"), "{player_sil}");
     assert!(!player_sil.contains("byte[] gen__player_prefix"), "{player_sil}");
@@ -6075,15 +6229,8 @@ fn stones_delegate_reads_use_length_only_template_witnesses() {
 
     let player_actor = artifact.argent.actors.iter().find(|actor| actor.name == "Player").expect("Player actor exists");
     let accept_start = player_actor.entries.iter().find(|entry| entry.name == "accept_start").expect("accept_start ABI exists");
-    assert_eq!(accept_start.hidden_params.len(), 2);
-    assert_eq!(accept_start.hidden_params[0].name, "gen__player_prefix_len");
-    assert_eq!(accept_start.hidden_params[0].ty, TypeArtifact::Int);
-    assert_eq!(subject_label(&accept_start.hidden_params[0].subject), "Player");
-    assert_eq!(accept_start.hidden_params[0].purpose, HiddenParamPurposeArtifact::TemplatePrefixLen);
-    assert_eq!(accept_start.hidden_params[1].name, "gen__player_suffix_len");
-    assert_eq!(accept_start.hidden_params[1].ty, TypeArtifact::Int);
-    assert_eq!(subject_label(&accept_start.hidden_params[1].subject), "Player");
-    assert_eq!(accept_start.hidden_params[1].purpose, HiddenParamPurposeArtifact::TemplateSuffixLen);
+    assert!(accept_start.hidden_params.is_empty());
+    assert!(accept_start.route_plan.witness_recipe_ids.is_empty());
 
     let start_game = player_actor.entries.iter().find(|entry| entry.name == "start_game").expect("start_game ABI exists");
     assert_eq!(
@@ -6093,8 +6240,6 @@ fn stones_delegate_reads_use_length_only_template_witnesses() {
             .map(|param| (param.name.as_str(), param.ty.clone(), subject_label(&param.subject), param.purpose))
             .collect::<Vec<_>>(),
         vec![
-            ("gen__player_prefix_len", TypeArtifact::Int, "Player", HiddenParamPurposeArtifact::TemplatePrefixLen),
-            ("gen__player_suffix_len", TypeArtifact::Int, "Player", HiddenParamPurposeArtifact::TemplateSuffixLen),
             ("gen__stones_game_prefix", TypeArtifact::Bytes, "StonesGame", HiddenParamPurposeArtifact::TemplatePrefixBytes),
             ("gen__stones_game_suffix", TypeArtifact::Bytes, "StonesGame", HiddenParamPurposeArtifact::TemplateSuffixBytes),
         ]
@@ -6114,12 +6259,7 @@ fn stones_delegate_reads_use_length_only_template_witnesses() {
     let sil_accept_start = player_contract.entry("accept_start").expect("accept_start Sil ABI entry exists");
     assert_eq!(
         sil_accept_start.params.iter().map(|param| (param.name.as_str(), param.ty.clone())).collect::<Vec<_>>(),
-        vec![
-            ("owner_sig", TypeArtifact::Sig),
-            ("owner_pk", TypeArtifact::Pubkey),
-            ("gen__player_prefix_len", TypeArtifact::Int),
-            ("gen__player_suffix_len", TypeArtifact::Int),
-        ]
+        vec![("owner_sig", TypeArtifact::Sig), ("owner_pk", TypeArtifact::Pubkey)]
     );
 
     let league_actor = artifact.argent.actors.iter().find(|actor| actor.name == "League").expect("League actor exists");
@@ -7749,6 +7889,24 @@ fn selector_can_include_its_source_actor() {
             "#,
     );
 
+    // A selector remains dynamic even when its domain contains the current actor.
+    // Its prefix/suffix bytes are not static current-actor length witnesses.
+    let choose = artifact
+        .argent
+        .actors
+        .iter()
+        .find(|actor| actor.name == "Challenge")
+        .unwrap()
+        .entries
+        .iter()
+        .find(|entry| entry.name == "choose")
+        .unwrap();
+    for purpose in [HiddenParamPurposeArtifact::TemplatePrefixBytes, HiddenParamPurposeArtifact::TemplateSuffixBytes] {
+        assert!(choose.hidden_params.iter().any(|param| {
+            param.purpose == purpose
+                && param.subject == HiddenParamSubjectArtifact::TemplateSelector { selector: "target".to_string() }
+        }));
+    }
     artifact.check_template_plan_consistency().expect("self selector variant has a valid identity cut transition");
 }
 
