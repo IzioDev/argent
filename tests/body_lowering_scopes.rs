@@ -487,6 +487,59 @@ fn lexical_shadowing_is_rejected_by_sil() {
     assert_source_rejected("lexical-shadowing", &source, "variable 'value' is already defined");
 }
 
+#[test]
+fn actor_helper_loop_and_local_bindings_skip_occupied_constant_names() {
+    let source = r#"
+        const int INDEX = 3;
+        const int INDEX__1 = 4;
+        const int INDEX__2 = 5;
+        state S { int count; }
+
+        actor A owns S {
+            fn loop_sum() -> int {
+                int result = 0;
+                for (INDEX, 0, 2, 2) {
+                    result = result + INDEX;
+                }
+                return result;
+            }
+
+            fn local_sum() -> int {
+                int result = 0;
+                int INDEX = 1;
+                return result + INDEX;
+            }
+
+            entry check() emits none {
+                require(loop_sum() == 1);
+                require(local_sum() == 1);
+            }
+        }
+        app Test { actor A; }
+    "#;
+    compile_app("actor-helper-occupied-local-names", source);
+}
+
+#[test]
+fn current_and_spawned_output_values_lower_to_sil() {
+    let source = include_str!("fixtures/runtime/context_genesis_spawn/app.ag")
+        .split("app PairApp {")
+        .next()
+        .expect("controller fixture has one selected app")
+        .replace("unrestricted(new_pair.outputs.left.value);", "require(new_pair.outputs.left.value >= 0);")
+        .replace("unrestricted(next.value);", "require(next.value >= 0);");
+    let out_dir = std::env::temp_dir().join(format!("argent-output-value-sites-{}", std::process::id()));
+    if out_dir.exists() {
+        fs::remove_dir_all(&out_dir).expect("old output-value fixture is removed");
+    }
+    argent::build_inline(PathBuf::from("output-value-sites.ag"), source, &out_dir)
+        .expect("bound output-value sites compile without test-only lowering fallbacks");
+    let sil = fs::read_to_string(out_dir.join("sil").join("Controller.sil")).expect("compiled controller Sil");
+    assert!(sil.contains("require(tx.outputs[gen__new_pair_left_output_idx].value >= 0);"), "{sil}");
+    assert!(sil.contains("require(tx.outputs[gen__next_output_idx].value >= 0);"), "{sil}");
+    fs::remove_dir_all(out_dir).expect("output-value fixture is removed");
+}
+
 fn assert_selector_shadow_rejected(name: &str, shadow: &str) {
     let source = SELECTOR_SHADOW_SOURCE.replace("__SHADOW__", shadow);
     assert_selector_source_rejected(name, &source, "entry binding `target` collides with entry parameter of the same name");
@@ -570,4 +623,36 @@ fn compile_app(name: &str, source: &str) -> Artifact {
         fs::remove_dir_all(&out_dir).expect("scope test output is removed");
     }
     result.unwrap_or_else(|err| panic!("scope fixture `{name}` must compile: {err}"))
+}
+
+#[test]
+fn ast_lowering_reconstructs_expanded_active_state() {
+    let source = r#"
+        state Capsule { int nonce; virtual detail; }
+        state Details { int count; }
+        state Expanded expands Capsule { detail: Details; }
+
+        actor Vault owns Expanded {
+            entry verify() emits none {
+                Expanded snapshot = state(self);
+                byte[32] direct = digest(state(self));
+                byte[32] local = digest(snapshot);
+                require(direct == local);
+            }
+        }
+
+        app Test { actor Vault; }
+    "#;
+    compile_app("ast-expanded-active-state", source);
+}
+
+#[test]
+fn ast_lowering_authenticates_observed_covenants_from_both_source_kinds() {
+    let state_field_source = include_str!("fixtures/emit/observed_template_witnesses/app.ag");
+    compile_app("ast-observed-state-field", state_field_source);
+
+    let argument_source = state_field_source
+        .replace("entry step()", "entry step(cov_id observed_id)")
+        .replace("observes asset by self.target_id", "observes asset by observed_id");
+    compile_app("ast-observed-entry-argument", &argument_source);
 }

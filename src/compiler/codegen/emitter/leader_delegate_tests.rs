@@ -13,6 +13,7 @@ use kaspa_consensus_core::{
     tx::{CovenantBinding, TransactionId, TransactionOutpoint},
 };
 
+use super::tests::{emit_actor, emit_artifact};
 use super::*;
 use crate::builder::{BuilderError, EntryCall, TxBuilder, TxContext, args, state};
 
@@ -115,13 +116,25 @@ app CoffeeShop { actor CoffeeMachine; actor Cup; actor Coffee; }
 "#;
 
 fn compile_coffee_shop(source: &str) -> (BTreeMap<String, String>, Artifact) {
-    let program = crate::compiler::loader::load_inline_program(PathBuf::from("coffee_shop.ag"), source.to_owned())
-        .expect("coffee shop source resolves");
-    let source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&source).expect("coffee shop model validates");
-    let sil = model.actors.iter().map(|actor| (actor.name.clone(), emit_actor(actor, &model).expect("actor emits"))).collect();
-    let artifact = emit_artifact(&program, &model, &sil).expect("coffee shop contracts compile");
-    (sil, artifact)
+    let sources = crate::compiler::loader::SourceSet::discover_inline(PathBuf::from("coffee_shop.ag"), source.to_owned())
+        .expect("coffee shop source discovers");
+    sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(
+                &program,
+                None,
+                &std::collections::BTreeMap::new(),
+                &crate::compiler::model::default_route_planner,
+            )?;
+            let sil = model
+                .app_actors
+                .iter_with_ids()
+                .map(|(id, name)| Ok((name.to_string(), emit_actor(model.actor_by_decl(id)?, &model)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            let artifact = emit_artifact(&program, &model)?;
+            Ok((sil, artifact))
+        })
+        .expect("coffee shop contracts compile")
 }
 
 fn entry_sil<'a>(sil: &'a str, entry: &str) -> &'a str {
@@ -136,7 +149,7 @@ fn rule_5_emits_closure_for_every_coordinated_entry_only() {
         for entry in ["brew", "brew_batch", "retire", "takeaway"] {
             let body = entry_sil(&sil["CoffeeMachine"], entry);
             assert_eq!(body.matches(closure).count(), 1, "{entry}: {body}");
-            assert!(body.find("// :: auth outputs").unwrap() < body.find(closure).unwrap(), "{body}");
+            assert!(body.find("OpAuthOutputCount(this.activeInputIndex)").unwrap() < body.find(closure).unwrap(), "{body}");
             assert_eq!(body.matches("byte[32] gen__cov_id =").count(), 1, "{body}");
         }
         assert!(!entry_sil(&sil["CoffeeMachine"], "service").contains(closure));

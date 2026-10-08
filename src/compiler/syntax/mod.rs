@@ -1,16 +1,107 @@
 //! Argent source declarations and the parser infrastructure that builds them.
 //!
-//! Ordinary Sil code remains opaque except for structure Argent must understand.
+//! Authored Sil expressions and statements share the source parser with Argent declarations.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub use self::body::EntryBody;
+use silverscript_lang::ast as sil;
+
+use self::node::{NodeId, SourceNodeIndex};
+use self::source::{Origin, SourceFile};
+
 pub(crate) use self::body::{EntryRoute, RouteId};
 
 pub mod body;
 pub mod lexer;
+pub(crate) mod node;
 pub mod parser;
+pub(crate) mod source;
 pub(crate) mod word;
+
+/// Borrowed authored syntax produced from one frozen source set.
+#[derive(Debug)]
+pub(crate) struct Program<'src> {
+    pub(crate) modules: Vec<SourceModule<'src>>,
+    pub(crate) nodes: SourceNodeIndex,
+}
+
+#[derive(Debug)]
+pub(crate) struct SourceModule<'src> {
+    pub(crate) source: &'src SourceFile,
+    pub(crate) legacy: Module,
+    pub(crate) const_values: Vec<sil::Expr<'src>>,
+    pub(crate) type_uses: BTreeMap<NodeId, ArgentTypeUse>,
+    pub(crate) function_bodies: BTreeMap<NodeId, Vec<sil::Statement<'src>>>,
+    pub(crate) entry_bodies: BTreeMap<NodeId, Vec<AuthoredEntryStatement<'src>>>,
+    pub(crate) observe_exprs: BTreeMap<NodeId, sil::Expr<'src>>,
+    pub(crate) name_paths: BTreeMap<NodeId, NamePath>,
+    pub(crate) actor_targets: BTreeMap<NodeId, sil::Expr<'src>>,
+}
+
+/// Combined source syntax for an entry; ordinary statements use Sil nodes.
+#[derive(Debug)]
+pub(crate) enum AuthoredEntryStatement<'src> {
+    Block { statements: Vec<Self>, span: sil::Span<'src> },
+    If { condition: sil::Expr<'src>, then_branch: Box<Self>, else_branch: Option<Box<Self>>, span: sil::Span<'src> },
+    Become { routes: Vec<AuthoredEntryRoute<'src>>, span: sil::Span<'src> },
+    ForeignBecome { group: NamePath, routes: Vec<AuthoredEntryRoute<'src>>, span: sil::Span<'src> },
+    Sil(Box<sil::Statement<'src>>),
+}
+
+impl<'src> AuthoredEntryStatement<'src> {
+    /// Visit expressions in an authored entry, including Argent control flow and routes.
+    pub(crate) fn visit_with(&self, visitor: &mut impl sil::visit::AstVisitorMut<'src>) {
+        match self {
+            Self::Block { statements, .. } => {
+                for statement in statements {
+                    statement.visit_with(visitor);
+                }
+            }
+            Self::If { condition, then_branch, else_branch, .. } => {
+                visitor.visit_expr(&mut condition.clone());
+                then_branch.visit_with(visitor);
+                if let Some(else_branch) = else_branch {
+                    else_branch.visit_with(visitor);
+                }
+            }
+            Self::Become { routes, .. } | Self::ForeignBecome { routes, .. } => {
+                for route in routes {
+                    if let AuthoredSuccessor::Constructed { actor, state, .. } = &route.successor {
+                        visitor.visit_expr(&mut actor.as_ref().clone());
+                        visitor.visit_expr(&mut state.as_ref().clone());
+                    }
+                }
+            }
+            Self::Sil(statement) => visitor.visit_statement(&mut statement.as_ref().clone()),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthoredEntryRoute<'src> {
+    pub(crate) id: RouteId,
+    pub(crate) output: NamePath,
+    pub(crate) successor: AuthoredSuccessor<'src>,
+}
+
+#[derive(Debug)]
+pub(crate) enum AuthoredSuccessor<'src> {
+    SelfRef { origin: Origin },
+    Constructed { actor: Box<sil::Expr<'src>>, state: Box<sil::Expr<'src>>, many: bool },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct NamePath {
+    pub(crate) segments: Vec<String>,
+    pub(crate) origin: Origin,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct ArgentTypeUse {
+    pub(crate) ty: sil::TypeRef,
+    pub(crate) actor_state: Option<NamePath>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Module {
@@ -35,7 +126,6 @@ pub struct Import {
 pub struct ConstDecl {
     pub ty: TypeRef,
     pub name: String,
-    pub value: String,
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +159,6 @@ pub struct FunctionDecl {
     pub name: String,
     pub params: Vec<ParamDecl>,
     pub return_ty: Option<TypeRef>,
-    pub body: String,
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +185,6 @@ pub struct EntryDecl {
     pub observes: Vec<ObserveDecl>,
     pub spawns: Vec<SpawnDecl>,
     pub emits: EmitSpec,
-    pub body: EntryBody,
     pub(crate) routes: Vec<EntryRoute>,
     pub(crate) terminal_route_sets: Vec<Vec<RouteId>>,
 }

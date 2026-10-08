@@ -6,29 +6,165 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::compiler::model::{
-    CompilerRouteTransition, ContractStateLowering, GeneratedFieldId, Model, OutputPhysicalTypePlan, PhysicalFieldId,
-    PhysicalStateLayout, PhysicalTargetId, SilStateType, SourceStateId, SourceStorageRelation, StaticActorTarget, TargetPhysicalPlan,
-    TemplateSelector,
+    AppCompilationContext, ClauseActorTypeRef, ContractStateLowering, EntryInputReferenceId, GeneratedFieldId, GeneratedFieldSource,
+    InputAuthentication, InputFieldAvailability, InputReferenceOrigin, InputReferenceRequirement, InteractionId, InteractionSource,
+    ObservedTemplateSource, OutputProofRequirement, OutputTargetPlan, PhysicalFieldId, PhysicalStateLayout, PhysicalTargetId,
+    ResolvedTypeBase, SilStateType, SourceFieldId, SourceStateId, SourceStorageRelation, StaticActorId, TargetPhysicalPlan,
+    TemplateSelector, TemplateWitnessForm, packed_field_len,
 };
-use crate::compiler::syntax::{ActorDecl, EntryDecl, ObserveDecl, ObservedActorDecl, word};
+use crate::compiler::syntax::node::{DeclId, EntryId};
+use crate::compiler::syntax::{ActorDecl, ArrayDim, EntryDecl, TypeRef, word};
 use crate::error::{ArgentError, Result};
+use silverscript_lang::ast::{
+    ArrayDim as SilArrayDim, Expr as SilExpr, ExprKind as SilExprKind, FunctionAst,
+    IndexedIntrospectionKind as SilIndexedIntrospectionKind, IntrospectionKind as SilIntrospectionKind, ParamAst, Span as SilSpan,
+    StateFieldExpr as SilStateFieldExpr, Statement as SilStatement, TypeBase as SilTypeBase, TypeRef as SilTypeRef,
+    UnarySuffixKind as SilUnarySuffixKind,
+};
 
-use super::super::emitter::*;
-use super::state_values::ContractStateValuePlan;
-use super::token_refs::count_qualified_ref;
+use super::contract::ContractLowerer;
+use super::names::*;
+use super::state_types::StateValueTypes;
 
 #[cfg(test)]
 mod tests;
 
+impl ContractLowerer<'_, '_> {
+    /// Authenticate expanded active-state preimages before authored entry operations.
+    pub(in crate::compiler::codegen) fn authenticated_expansion_prelude(&self) -> Result<Vec<SilStatement<'static>>> {
+        let specs = self.model.state_expansion_witnesses_by_id(self.actor_id)?;
+        let span = SilSpan::default();
+        let unpack = |ty: &TypeRef, packed: &str, offset: usize, end: usize| -> Result<SilExpr<'static>> {
+            if matches!((ty.name.as_str(), ty.array), ("byte", None)) {
+                return Ok(SilExpr::new(
+                    SilExprKind::ArrayIndex {
+                        source: Box::new(SilExpr::identifier(packed)),
+                        index: Box::new(SilExpr::int(offset as i64)),
+                    },
+                    span,
+                ));
+            }
+            let slice = SilExpr::new(
+                SilExprKind::Slice {
+                    source: Box::new(SilExpr::identifier(packed)),
+                    start: Box::new(SilExpr::int(offset as i64)),
+                    end: Box::new(SilExpr::int(end as i64)),
+                    span,
+                },
+                span,
+            );
+            if ty.is_actor_type() {
+                return Ok(SilExpr::call("byte[32]", vec![slice]));
+            }
+            let slice_expr = format!("{packed}.slice({offset}, {end})");
+            match (ty.name.as_str(), ty.array) {
+                ("int", None) => Ok(SilExpr::call("OpBin2Num", vec![slice])),
+                ("temporal", None) => Ok(SilExpr::call("temporal", vec![SilExpr::call("OpBin2Num", vec![slice])])),
+                ("bool", None) => Ok(SilExpr::new(
+                    SilExprKind::Binary {
+                        op: silverscript_lang::ast::BinaryOp::Ne,
+                        left: Box::new(SilExpr::call("OpBin2Num", vec![slice])),
+                        right: Box::new(SilExpr::int(0)),
+                    },
+                    span,
+                )),
+                ("byte", Some(ArrayDim::Fixed(len))) => Ok(SilExpr::call(format!("byte[{len}]"), vec![slice])),
+                ("pubkey", None) | (word::COVENANT_ID, None) => Ok(SilExpr::call("byte[32]", vec![slice])),
+                ("sig", None) => Ok(SilExpr::call("byte[65]", vec![slice])),
+                ("datasig", None) => Ok(SilExpr::call("byte[64]", vec![slice])),
+                ("bytes", None) | ("string", None) | (_, Some(_)) => {
+                    Err(ArgentError::new(format!("cannot unpack unsupported variable or array field from `{slice_expr}`")))
+                }
+                (name, None) => Err(ArgentError::new(format!("cannot unpack unsupported type `{name}` from `{slice_expr}`"))),
+            }
+        };
+        let mut statements = Vec::new();
+        for spec in specs {
+            let hidden = hidden_state_expansion_preimage_name(spec);
+            statements.push(SilStatement::Require {
+                expr: SilExpr::new(
+                    SilExprKind::Binary {
+                        op: silverscript_lang::ast::BinaryOp::Eq,
+                        left: Box::new(SilExpr::call(
+                            "blake3",
+                            vec![SilExpr::call("byte[]", vec![SilExpr::identifier(hidden.clone())])],
+                        )),
+                        right: Box::new(SilExpr::identifier(spec.field.clone())),
+                    },
+                    span,
+                ),
+                message: None,
+                span,
+                message_span: None,
+            });
+            let mut offset = 0usize;
+            for field in &self.model.state_by_source(&spec.memory_source)?.fields {
+                let len = packed_field_len(&field.ty)?;
+                let end = offset + len;
+                statements.push(SilStatement::VariableDefinition {
+                    type_ref: super::state_types::lower_planned_type(&field.ty, false),
+                    modifiers: Vec::new(),
+                    name: hidden_state_expansion_field_name(spec, &field.name),
+                    expr: Some(unpack(&field.ty, &hidden, offset, end)?),
+                    span,
+                    type_span: span,
+                    modifier_spans: Vec::new(),
+                    name_span: span,
+                });
+                offset = end;
+            }
+        }
+        Ok(statements)
+    }
+
+    /// Emit the digest helpers required by lowered entry bodies.
+    pub(in crate::compiler::codegen) fn authored_state_digest_helpers(
+        &self,
+        sources: &BTreeSet<SourceStateId>,
+    ) -> Result<Vec<FunctionAst<'static>>> {
+        let lowering = self.model.state_lowering_by_id(self.actor_id)?;
+        sources
+            .iter()
+            .map(|source| {
+                let sil_type = self.state_values.authored_sil_type(source).ok_or_else(|| {
+                    ArgentError::new(format!("state `{}` has no contract-local authored representation", source.as_str()))
+                })?;
+                let name = self.state_values.digest_helper_name(source);
+                let value = format!("{name}_value");
+                let span = SilSpan::default();
+                let digest_ast = authored_state_payload_digest_ast(source, SilExpr::identifier(value.clone()), lowering, self.model)
+                    .ok_or_else(|| ArgentError::new(format!("state `{}` has no direct digest AST", source.as_str())))?;
+                Ok(FunctionAst {
+                    name,
+                    attributes: Vec::new(),
+                    params: vec![ParamAst {
+                        type_ref: SilTypeRef { base: SilTypeBase::Custom(sil_type.to_string()), array_dims: Vec::new() },
+                        name: value,
+                        span,
+                        type_span: span,
+                        name_span: span,
+                    }],
+                    entrypoint: false,
+                    return_types: vec![SilTypeRef { base: SilTypeBase::Byte, array_dims: vec![SilArrayDim::Fixed(32)] }],
+                    returns_tuple: false,
+                    body: vec![SilStatement::Return { exprs: vec![digest_ast], span }],
+                    return_type_spans: vec![span],
+                    span,
+                    name_span: span,
+                    body_span: span,
+                })
+            })
+            .collect()
+    }
+}
+
 /// Output layout, rendered type, and compiler-owned field sources selected as one plan.
 pub(in crate::compiler::codegen) struct OutputStateTarget {
-    #[cfg(test)]
-    canonical_target: PhysicalTargetId,
     sil_type: String,
     authored_sil_type: String,
     named_physical_layout: Option<PhysicalStateLayout>,
     physical: TargetPhysicalPlan,
-    generated_fields: BTreeMap<GeneratedFieldId, String>,
+    generated_field_asts: BTreeMap<GeneratedFieldId, SilExpr<'static>>,
 }
 
 impl OutputStateTarget {
@@ -48,336 +184,305 @@ impl OutputStateTarget {
         &self.authored_sil_type
     }
 
-    pub(in crate::compiler::codegen) fn require_authored_value(
+    pub(in crate::compiler::codegen) fn is_unwrapped_authored_value(&self) -> bool {
+        self.physical.source_to_storage().is_identity()
+            && self.physical.storage_to_physical().is_identity()
+            && self.sil_type == self.authored_sil_type
+    }
+
+    pub(in crate::compiler::codegen) fn materialize_authored_ast(
         &self,
-        lower: impl FnOnce(&str) -> Result<String>,
-    ) -> Result<AuthoredStateExpr> {
-        Ok(AuthoredStateExpr {
-            source: self.physical.source().clone(),
-            sil_type: self.authored_sil_type.clone(),
-            sil: lower(&self.authored_sil_type)?,
-        })
-    }
-
-    #[cfg(test)]
-    pub(in crate::compiler::codegen) fn authored_value(&self, sil: impl Into<String>) -> AuthoredStateExpr {
-        AuthoredStateExpr { source: self.physical.source().clone(), sil_type: self.authored_sil_type.clone(), sil: sil.into() }
-    }
-
-    #[cfg(test)]
-    pub(in crate::compiler::codegen) fn target(&self) -> &PhysicalTargetId {
-        self.physical.id()
-    }
-
-    #[cfg(test)]
-    pub(in crate::compiler::codegen) fn canonical_target(&self) -> &PhysicalTargetId {
-        &self.canonical_target
+        authored: SilExpr<'static>,
+        lowering: &ContractStateLowering,
+        model: &AppCompilationContext<'_>,
+    ) -> Option<SilExpr<'static>> {
+        if self.is_unwrapped_authored_value() {
+            return Some(authored);
+        }
+        let span = SilSpan::default();
+        let mut physical_fields = BTreeMap::new();
+        for field in self.physical.source_to_storage().fields() {
+            let physical = self.physical.storage_to_physical().physical_field(field.storage())?.clone();
+            let source_value = SilExpr::new(
+                SilExprKind::FieldAccess {
+                    source: Box::new(authored.clone()),
+                    field: field.source().field().to_string(),
+                    field_span: span,
+                },
+                span,
+            );
+            let value = match field.expanded_state() {
+                Some(expanded) => authored_state_payload_digest_ast(expanded, source_value, lowering, model)?,
+                None => source_value,
+            };
+            if physical_fields.insert(physical, value).is_some() {
+                return None;
+            }
+        }
+        for (id, value) in &self.generated_field_asts {
+            if physical_fields.insert(PhysicalFieldId::Generated(id.clone()), value.clone()).is_some() {
+                return None;
+            }
+        }
+        let fields = self
+            .physical
+            .physical()
+            .fields()
+            .iter()
+            .map(|field| {
+                Some(SilStateFieldExpr {
+                    name: field.sil_name().to_string(),
+                    expr: physical_fields.remove(field.id())?,
+                    span,
+                    name_span: span,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if !physical_fields.is_empty() {
+            return None;
+        }
+        Some(SilExpr::new(SilExprKind::StructLiteral { name: self.sil_type.clone(), fields, name_span: span }, span))
     }
 }
 
 pub(in crate::compiler::codegen) fn plan_actor_output_state(
-    actor: &ActorDecl,
-    target_actor: &str,
-    model: &Model<'_>,
+    actor: DeclId,
+    target_actor: &StaticActorId,
+    model: &AppCompilationContext<'_>,
 ) -> Result<OutputStateTarget> {
-    let lowering = model.state_lowering(&actor.name)?;
-    let target = lowering
-        .output_type_for_actor(target_actor)
-        .ok_or_else(|| ArgentError::new(format!("actor `{}` has no output state target plan for `{target_actor}`", actor.name)))?;
-    let transition = output_transition_for_actor(actor, target_actor, model)?;
-    output_state_target(actor, target, lowering, &transition, model)
-}
-
-pub(in crate::compiler::codegen) fn plan_static_actor_output_state(
-    actor: &ActorDecl,
-    target_actor: StaticActorTarget<'_>,
-    model: &Model<'_>,
-) -> Result<OutputStateTarget> {
-    let lowering = model.state_lowering(&actor.name)?;
-    let (target, transition) = match target_actor {
-        StaticActorTarget::InApp(target) => {
-            (lowering.output_type_for_actor(&target.name), output_transition_for_actor(actor, &target.name, model)?)
-        }
-        StaticActorTarget::CrossApp(target) => {
-            (lowering.output_type_for_compiled_actor(&target.app, &target.actor), CompilerRouteTransition::default())
-        }
-    };
-    let target = target.ok_or_else(|| {
-        ArgentError::new(format!("actor `{}` has no output state target plan for `{}`", actor.name, target_actor.artifact_reference()))
-    })?;
-    output_state_target(actor, target, lowering, &transition, model)
-}
-
-pub(in crate::compiler::codegen) fn plan_open_output_state(
-    actor: &ActorDecl,
-    state: &str,
-    model: &Model<'_>,
-) -> Result<OutputStateTarget> {
-    let lowering = model.state_lowering(&actor.name)?;
-    let target = lowering
-        .output_type_for_open_state(&SourceStateId::new(state))
-        .ok_or_else(|| ArgentError::new(format!("actor `{}` has no open output state target plan for `{state}`", actor.name)))?;
-    output_state_target(actor, target, lowering, &CompilerRouteTransition::default(), model)
+    let target = model.output_plan_by_id(actor)?.actor(target_actor)?;
+    output_state_target(actor, target, model)
 }
 
 pub(in crate::compiler::codegen) fn plan_selector_output_state(
-    actor: &ActorDecl,
+    actor: DeclId,
     selector: &TemplateSelector,
-    model: &Model<'_>,
+    model: &AppCompilationContext<'_>,
 ) -> Result<OutputStateTarget> {
-    let lowering = model.state_lowering(&actor.name)?;
-    let target = lowering.output_type_for_actor_domain(&SourceStateId::new(&selector.state), &selector.variants).ok_or_else(|| {
-        ArgentError::new(format!("actor `{}` has no output state target plan for selector `{}`", actor.name, selector.name))
-    })?;
-    let mut transitions = selector.variants.iter().map(|variant| output_transition_for_actor(actor, variant, model));
-    let transition = transitions
-        .next()
-        .transpose()?
-        .ok_or_else(|| ArgentError::new(format!("actor selector `{}` has no variants", selector.name)))?;
-    for candidate in transitions {
-        if candidate? != transition {
-            return Err(ArgentError::new(format!("actor selector `{}` variants do not share one route transition", selector.name)));
-        }
-    }
-    output_state_target(actor, target, lowering, &transition, model)
+    let target = model.output_plan_by_id(actor)?.selector(selector)?;
+    output_state_target(actor, target, model)
 }
 
-fn output_transition_for_actor(source_actor: &ActorDecl, target_actor: &str, model: &Model<'_>) -> Result<CompilerRouteTransition> {
-    if target_actor == source_actor.name || model.linked_actor(target_actor).is_some() {
-        return Ok(CompilerRouteTransition::default());
-    }
-    model.route_transition(&source_actor.name, target_actor).cloned().ok_or_else(|| {
-        ArgentError::new(format!("entry model has no route transition from `{}` to in-app target `{target_actor}`", source_actor.name))
-    })
-}
-
-fn output_state_target(
-    source_actor: &ActorDecl,
-    plan: &OutputPhysicalTypePlan,
-    lowering: &ContractStateLowering,
-    transition: &CompilerRouteTransition,
-    model: &Model<'_>,
+pub(in crate::compiler::codegen) fn output_state_target(
+    source_actor: DeclId,
+    plan: &OutputTargetPlan,
+    model: &AppCompilationContext<'_>,
 ) -> Result<OutputStateTarget> {
-    let physical =
-        lowering.target(plan.target()).ok_or_else(|| ArgentError::new("output target has no physical layout plan"))?.clone();
+    let lowering = model.state_lowering_by_id(source_actor)?;
+    let physical = plan.physical.clone();
     let authored_sil_type = lowering
         .source_representation(physical.source())
         .ok_or_else(|| ArgentError::new("output target source has no authored representation plan"))
         .and_then(|representation| render_sil_state_type(representation.sil_type()))?;
-    let named_physical_layout = match plan.sil_type() {
+    let named_physical_layout = match &plan.sil_type {
         SilStateType::State | SilStateType::Source(_) => None,
         SilStateType::StoragePhysical(_) | SilStateType::TargetPhysical(_) => Some(
             lowering
-                .target(plan.canonical_target())
+                .target(&plan.canonical_target)
                 .ok_or_else(|| ArgentError::new("output type owner has no physical target layout"))?
                 .physical()
                 .clone(),
         ),
     };
-    let generated_fields = plan_generated_fields(source_actor, &physical, transition, model)?;
+    let generated_field_asts = plan_generated_fields(plan, model)?;
     Ok(OutputStateTarget {
-        #[cfg(test)]
-        canonical_target: plan.canonical_target().clone(),
-        sil_type: render_sil_state_type(plan.sil_type())?,
+        sil_type: render_sil_state_type(&plan.sil_type)?,
         authored_sil_type,
         named_physical_layout,
         physical,
-        generated_fields,
+        generated_field_asts,
     })
 }
 
 fn plan_generated_fields(
-    source_actor: &ActorDecl,
-    target: &TargetPhysicalPlan,
-    transition: &CompilerRouteTransition,
-    model: &Model<'_>,
-) -> Result<BTreeMap<GeneratedFieldId, String>> {
-    let source_generated_fields = model
-        .state_lowering(&source_actor.name)?
-        .active()
-        .physical()
-        .fields()
+    plan: &OutputTargetPlan,
+    model: &AppCompilationContext<'_>,
+) -> Result<BTreeMap<GeneratedFieldId, SilExpr<'static>>> {
+    let fields = plan
+        .generated_fields
         .iter()
-        .filter_map(|field| match field.id() {
-            PhysicalFieldId::Generated(id) => Some(id.clone()),
-            PhysicalFieldId::Storage(_) => None,
-        })
-        .collect::<BTreeSet<_>>();
-    let mut families_to_pack = transition.families_to_pack.clone();
-    let generated = target
-        .storage_to_physical()
-        .generated_fields()
-        .iter()
-        .map(|id| {
-            let field = target
+        .map(|(id, source)| {
+            let field = plan
+                .physical
                 .physical()
                 .field(&PhysicalFieldId::Generated(id.clone()))
                 .ok_or_else(|| ArgentError::new("generated output field is missing from its physical layout"))?;
-            let expr = match id {
-                GeneratedFieldId::Template(_) => field.sil_name().to_string(),
-                GeneratedFieldId::RouteFamilyTable { actors, .. }
-                    if !source_generated_fields.contains(id)
-                        && actors.iter().all(|actor| source_generated_fields.contains(&GeneratedFieldId::Template(actor.clone()))) =>
-                {
-                    let templates = actors.iter().map(|actor| hidden_template_name(actor.actor())).collect::<Vec<_>>().join(" + ");
-                    format!("{}({templates})", field.sil_type())
+            let span = SilSpan::default();
+            let concat = |parts: Vec<SilExpr<'static>>| {
+                parts
+                    .into_iter()
+                    .reduce(|left, right| {
+                        SilExpr::new(
+                            SilExprKind::Binary {
+                                op: silverscript_lang::ast::BinaryOp::Add,
+                                left: Box::new(left),
+                                right: Box::new(right),
+                            },
+                            span,
+                        )
+                    })
+                    .unwrap_or_else(|| SilExpr::bytes(Vec::new()))
+            };
+            let ast = match source {
+                GeneratedFieldSource::Carried | GeneratedFieldSource::TemplateField => SilExpr::identifier(field.sil_name()),
+                GeneratedFieldSource::TableFromTemplates(actors) => {
+                    let ast = concat(
+                        actors
+                            .iter()
+                            .map(|actor| {
+                                model
+                                    .app_actors
+                                    .name(*actor)
+                                    .map(|name| SilExpr::identifier(hidden_template_name(name)))
+                                    .ok_or_else(|| ArgentError::new("output route table references an unknown selected actor"))
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    );
+                    SilExpr::call(field.sil_type(), vec![ast])
                 }
-                GeneratedFieldId::RouteFamilyTable { .. } => field.sil_name().to_string(),
-                GeneratedFieldId::RouteFamilyDigest { family, .. } => {
-                    let Some(index) = families_to_pack.iter().position(|candidate| candidate == family) else {
-                        return Ok((id.clone(), field.sil_name().to_string()));
-                    };
-                    families_to_pack.remove(index);
-                    let family = model
-                        .route_family(family)
-                        .ok_or_else(|| ArgentError::new(format!("output transition references unknown route family `{family}`")))?;
-                    if model.route_family_for_actor(&source_actor.name).is_some_and(|source_family| source_family.id == family.id) {
-                        format!("blake3(byte[]({}))", hidden_route_family_table_name(family))
-                    } else {
-                        let preimage =
-                            family.table_actors().iter().map(|actor| hidden_template_name(actor)).collect::<Vec<_>>().join(" + ");
-                        format!("blake3(byte[]({preimage}))")
-                    }
+                GeneratedFieldSource::DigestFromTable(family) => {
+                    let table = hidden_route_family_table_name_by_id(family);
+                    SilExpr::call("blake3", vec![SilExpr::call("byte[]", vec![SilExpr::identifier(table)])])
+                }
+                GeneratedFieldSource::DigestFromTemplates(actors) => {
+                    let ast = concat(
+                        actors
+                            .iter()
+                            .map(|actor| {
+                                model
+                                    .app_actors
+                                    .name(*actor)
+                                    .map(|name| SilExpr::identifier(hidden_template_name(name)))
+                                    .ok_or_else(|| ArgentError::new("output digest references an unknown selected actor"))
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    );
+                    SilExpr::call("blake3", vec![SilExpr::call("byte[]", vec![ast])])
                 }
             };
-            Ok((id.clone(), expr))
+            Ok((id.clone(), ast))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    if let Some(family) = families_to_pack.first() {
-        return Err(ArgentError::new(format!("output transition packs route family `{family}` without a generated target field")));
-    }
-    Ok(generated)
+    Ok(fields)
 }
 
 #[derive(Clone)]
 enum InputTemplateProof {
     CovenantDomain,
-    Template { prefix_len: String, suffix_len: String, template: String },
+    Template { prefix_len: InputTemplateLength, suffix_len: InputTemplateLength, template_ast: Box<SilExpr<'static>> },
+}
+
+#[derive(Clone)]
+enum InputTemplateLength {
+    IntWitness(String),
+    BytesWitness(String),
+}
+
+impl InputTemplateLength {
+    fn expr(&self) -> SilExpr<'static> {
+        match self {
+            Self::IntWitness(name) => SilExpr::identifier(name.clone()),
+            Self::BytesWitness(name) => {
+                let span = SilSpan::default();
+                SilExpr::new(
+                    SilExprKind::UnarySuffix {
+                        source: Box::new(SilExpr::identifier(name.clone())),
+                        kind: SilUnarySuffixKind::Length,
+                        span,
+                    },
+                    span,
+                )
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
 struct AuthenticatedPhysicalInput {
     expr: String,
     sil_type: String,
-    input_index: String,
+    input_index: InputIndexExpr,
     proof: InputTemplateProof,
 }
 
 impl AuthenticatedPhysicalInput {
-    fn emit_read(&self, out: &mut String, indent: usize) {
-        let mut args = vec![self.input_index.clone()];
+    fn read_statement(&self) -> SilStatement<'static> {
+        let mut args = vec![self.input_index.ast()];
         let builtin = match &self.proof {
             InputTemplateProof::CovenantDomain => "readInputState",
-            InputTemplateProof::Template { prefix_len, suffix_len, template } => {
-                args.extend([prefix_len.clone(), suffix_len.clone(), template.clone()]);
+            InputTemplateProof::Template { prefix_len, suffix_len, template_ast, .. } => {
+                args.extend([prefix_len.expr(), suffix_len.expr(), template_ast.as_ref().clone()]);
                 "readInputStateWithTemplate"
             }
         };
-        push_generated_call(out, indent, &format!("{} {} = ", self.sil_type, self.expr), builtin, &args);
-    }
-}
-
-#[derive(Clone)]
-enum PlannedSourceExpr {
-    Value(String),
-    Struct { sil_type: String, fields: Vec<(String, String)> },
-}
-
-struct PlannedSourceStorageExpr {
-    authored: PlannedSourceExpr,
-    trusted_storage: Option<String>,
-}
-
-impl PlannedSourceExpr {
-    fn render(&self, indent: usize) -> String {
-        match self {
-            Self::Value(expr) => expr.clone(),
-            Self::Struct { sil_type, fields } => {
-                let field_indent = " ".repeat(indent + 4);
-                let close_indent = " ".repeat(indent);
-                let mut out = format!("{sil_type} {{\n");
-                if !fields.is_empty() {
-                    out.push_str(&format!("{field_indent}// :: user declared fields\n"));
-                }
-                for (field, expr) in fields {
-                    out.push_str(&format!("{field_indent}{field}: {expr},\n"));
-                }
-                out.push_str(&close_indent);
-                out.push('}');
-                out
-            }
-        }
-    }
-
-    fn payload_digest_in_contract(
-        &self,
-        state: &SourceStateId,
-        lowering: &ContractStateLowering,
-        model: &Model<'_>,
-    ) -> Result<String> {
-        let relation = lowering
-            .source_representation(state)
-            .ok_or_else(|| ArgentError::new(format!("state `{}` has no source-to-storage plan", state.as_str())))?
-            .source_to_storage();
-        source_storage_payload_digest(state, relation, lowering, model, |field| {
-            Ok(PlannedSourceStorageExpr { authored: self.project_field(field)?, trusted_storage: None })
-        })
-    }
-
-    fn project_field(&self, field_name: &str) -> Result<Self> {
-        match self {
-            Self::Value(expr) => Ok(Self::Value(format!("{expr}.{field_name}"))),
-            Self::Struct { fields, .. } => fields
-                .iter()
-                .find_map(|(name, value)| (name == field_name).then(|| Self::Value(value.clone())))
-                .ok_or_else(|| ArgentError::new(format!("validated state value is missing field `{field_name}`"))),
+        let span = SilSpan::default();
+        SilStatement::VariableDefinition {
+            type_ref: SilTypeRef { base: SilTypeBase::Custom(self.sil_type.clone()), array_dims: Vec::new() },
+            modifiers: Vec::new(),
+            name: self.expr.clone(),
+            expr: Some(SilExpr::call(builtin, args)),
+            span,
+            type_span: span,
+            modifier_spans: Vec::new(),
+            name_span: span,
         }
     }
 }
 
-/// Pack one authored value through its typed storage relation, then hash it.
-fn source_storage_payload_digest(
+fn packed_field_ast<'a>(ty: &TypeRef, value: SilExpr<'a>) -> Option<SilExpr<'a>> {
+    let cast = |name: &str, value| SilExpr::call(name, vec![value]);
+    if ty.is_actor_type() {
+        return Some(cast("byte[]", value));
+    }
+    match (ty.name.as_str(), ty.array) {
+        ("int", None) => Some(cast("__as_cast_byte[8]", value)),
+        ("temporal", None) => Some(cast("__as_cast_byte[8]", cast("int", value))),
+        ("bool", None) => Some(cast("__as_cast_byte[1]", cast("__as_cast_int", value))),
+        ("byte", None | Some(crate::compiler::syntax::ArrayDim::Fixed(_)))
+        | ("pubkey" | "sig" | "datasig" | word::COVENANT_ID, None) => Some(cast("byte[]", value)),
+        _ => None,
+    }
+}
+
+pub(in crate::compiler::codegen) fn authored_state_payload_digest_ast<'a>(
     state: &SourceStateId,
-    relation: &SourceStorageRelation,
+    value: SilExpr<'a>,
     lowering: &ContractStateLowering,
-    model: &Model<'_>,
-    mut source_field: impl FnMut(&str) -> Result<PlannedSourceStorageExpr>,
-) -> Result<String> {
-    let storage = model.storage_state(state.as_str())?;
+    model: &AppCompilationContext<'_>,
+) -> Option<SilExpr<'a>> {
+    let relation = lowering.source_representation(state)?.source_to_storage();
+    let storage = model.storage_state_by_source(state).ok()?;
+    let span = SilSpan::default();
     let mut parts = Vec::with_capacity(relation.fields().len());
     for field in relation.fields() {
-        let storage_field = storage
-            .fields
-            .iter()
-            .find(|candidate| candidate.name == field.storage().field())
-            .ok_or_else(|| ArgentError::new("planned source field has no storage field"))?;
-        let PlannedSourceStorageExpr { authored, trusted_storage } = source_field(field.source().field())?;
-        let stored = match (field.expanded_state(), trusted_storage) {
-            (Some(_), Some(storage)) => storage,
-            (Some(expanded), None) => authored.payload_digest_in_contract(expanded, lowering, model)?,
-            (None, _) => authored.render(0),
+        let storage_field = storage.fields.iter().find(|candidate| candidate.name == field.storage().field())?;
+        let source_field = SilExpr::new(
+            SilExprKind::FieldAccess { source: Box::new(value.clone()), field: field.source().field().to_string(), field_span: span },
+            span,
+        );
+        let stored = match field.expanded_state() {
+            Some(expanded) => authored_state_payload_digest_ast(expanded, source_field, lowering, model)?,
+            None => source_field,
         };
-        parts.push(packed_field_expr(&storage_field.ty, &stored)?);
+        parts.push(packed_field_ast(&storage_field.ty, stored)?);
     }
-    let bytes = if parts.is_empty() { "0x".to_string() } else { parts.join(" + ") };
-    Ok(format!("blake3(byte[]({bytes}))"))
-}
-
-/// Hash a named or previously stabilized authored expression.
-pub(in crate::compiler::codegen) fn authored_state_payload_digest_expr(
-    state: &SourceStateId,
-    value_expr: &str,
-    lowering: &ContractStateLowering,
-    model: &Model<'_>,
-) -> Result<String> {
-    PlannedSourceExpr::Value(value_expr.to_string()).payload_digest_in_contract(state, lowering, model)
+    let bytes = parts
+        .into_iter()
+        .reduce(|left, right| {
+            SilExpr::new(
+                SilExprKind::Binary { op: silverscript_lang::ast::BinaryOp::Add, left: Box::new(left), right: Box::new(right) },
+                span,
+            )
+        })
+        .unwrap_or_else(|| SilExpr::bytes(Vec::new()));
+    Some(SilExpr::call("blake3", vec![SilExpr::call("byte[]", vec![bytes])]))
 }
 
 #[derive(Clone)]
 struct PlannedSourceField {
     name: String,
-    sil_type: String,
-    value: Option<PlannedSourceExpr>,
+    sil_type_ref: SilTypeRef,
+    ast_value: Option<SilExpr<'static>>,
     trusted_storage: Option<String>,
 }
 
@@ -392,406 +497,219 @@ struct SourceStateAccess {
     target: PhysicalTargetId,
 }
 
-/// A complete expression in one nominal authored state representation.
-#[derive(Debug)]
-pub(in crate::compiler::codegen) struct AuthoredStateExpr {
-    source: SourceStateId,
-    sil_type: String,
-    sil: String,
-}
-
-impl AuthoredStateExpr {
-    pub(in crate::compiler::codegen) fn source(&self) -> &SourceStateId {
-        &self.source
-    }
-
-    pub(in crate::compiler::codegen) fn into_sil(self) -> String {
-        self.sil
-    }
-
-    pub(in crate::compiler::codegen) fn sil(&self) -> &str {
-        &self.sil
-    }
-
-    pub(in crate::compiler::codegen) fn rebound(mut self, sil: impl Into<String>) -> Self {
-        self.sil = sil.into();
-        self
-    }
-}
-
-/// A complete physical value accepted by an output-state builtin.
-pub(in crate::compiler::codegen) struct PhysicalStateExpr {
-    sil_type: String,
-    sil: String,
-    materialized: bool,
-}
-
-impl PhysicalStateExpr {
-    fn into_argument(self, out: &mut String, indent: usize, binding: impl AsRef<str>) -> String {
-        if !self.materialized {
-            return self.sil;
-        }
-        let binding = binding.as_ref();
-        push_indent(out, indent);
-        out.push_str(&format!("{} {binding} = {};\n", self.sil_type, self.sil));
-        binding.to_string()
-    }
-}
-
 enum OutputTemplateProof {
     Current,
-    BoundInput { input_index: String, prefix_len: String, suffix_len: String, template: String },
-    Witnessed { prefix: String, suffix: String, template: String },
+    BoundInput { input_index_ast: SilExpr<'static>, prefix_len: String, suffix_len: String },
+    Witnessed { prefix: String, suffix: String },
 }
 
 /// Physical output and template proof planned as independent validation inputs.
 pub(in crate::compiler::codegen) struct PlannedOutputValidation {
-    output_index: String,
-    physical: PhysicalStateExpr,
     state_binding: String,
     proof: OutputTemplateProof,
-}
-
-/// Output validation whose physical value has already been stabilized.
-pub(in crate::compiler::codegen) struct StabilizedOutputValidation {
-    output_index: String,
-    state_argument: String,
-    proof: OutputTemplateProof,
+    template_ast: SilExpr<'static>,
 }
 
 impl PlannedOutputValidation {
-    pub(in crate::compiler::codegen) fn stabilize(self, out: &mut String, indent: usize) -> StabilizedOutputValidation {
-        StabilizedOutputValidation {
-            output_index: self.output_index,
-            state_argument: self.physical.into_argument(out, indent, self.state_binding),
-            proof: self.proof,
-        }
-    }
-}
-
-impl StabilizedOutputValidation {
-    pub(in crate::compiler::codegen) fn emit(self, out: &mut String, indent: usize) {
-        let mut args = vec![self.output_index, self.state_argument];
+    pub(in crate::compiler::codegen) fn direct_ast_statements(
+        self,
+        target: &OutputStateTarget,
+        output_index: SilExpr<'static>,
+        state: SilExpr<'static>,
+    ) -> Option<Vec<SilStatement<'static>>> {
+        let span = SilSpan::default();
+        let mut statements = Vec::new();
+        let state = if !target.is_unwrapped_authored_value() {
+            statements.push(SilStatement::VariableDefinition {
+                type_ref: SilTypeRef { base: SilTypeBase::Custom(target.sil_type.clone()), array_dims: Vec::new() },
+                modifiers: Vec::new(),
+                name: self.state_binding.clone(),
+                expr: Some(state),
+                span,
+                type_span: span,
+                modifier_spans: Vec::new(),
+                name_span: span,
+            });
+            SilExpr::identifier(self.state_binding)
+        } else {
+            state
+        };
+        let mut args = vec![output_index, state];
         let builtin = match self.proof {
             OutputTemplateProof::Current => "validateOutputState",
-            OutputTemplateProof::BoundInput { input_index, prefix_len, suffix_len, template } => {
-                args.extend([input_index, prefix_len, suffix_len, template]);
+            OutputTemplateProof::BoundInput { input_index_ast, prefix_len, suffix_len, .. } => {
+                args.push(input_index_ast);
+                args.extend([prefix_len, suffix_len].map(SilExpr::identifier));
+                args.push(self.template_ast);
                 "validateOutputStateWithInputTemplate"
             }
-            OutputTemplateProof::Witnessed { prefix, suffix, template } => {
-                args.extend([prefix, suffix, template]);
+            OutputTemplateProof::Witnessed { prefix, suffix, .. } => {
+                args.extend([prefix, suffix].map(SilExpr::identifier));
+                args.push(self.template_ast);
                 "validateOutputStateWithTemplate"
             }
         };
-        push_generated_call(out, indent, "", builtin, &args);
+        statements.push(SilStatement::FunctionCall { name: builtin.to_string(), args, span, name_span: span });
+        Some(statements)
     }
-}
-
-/// Lower one complete authored value through storage into its target layout.
-pub(in crate::compiler::codegen) fn materialize_output_state(
-    target: &OutputStateTarget,
-    authored: AuthoredStateExpr,
-    lowering: &ContractStateLowering,
-    model: &Model<'_>,
-    indent: usize,
-) -> Result<PhysicalStateExpr> {
-    if authored.source != *target.physical.source() {
-        return Err(ArgentError::new(format!(
-            "authored state `{}` cannot initialize physical target `{}`",
-            authored.source.as_str(),
-            target.physical.source().as_str()
-        )));
-    }
-    if target.physical.source_to_storage().is_identity()
-        && target.physical.storage_to_physical().is_identity()
-        && target.sil_type == authored.sil_type
-    {
-        return Ok(PhysicalStateExpr { sil_type: target.sil_type.clone(), sil: authored.sil, materialized: false });
-    }
-
-    let mut physical_fields = BTreeMap::new();
-    for field in target.physical.source_to_storage().fields() {
-        let physical = target
-            .physical
-            .storage_to_physical()
-            .physical_field(field.storage())
-            .ok_or_else(|| ArgentError::new("authored output field has no physical target mapping"))?
-            .clone();
-        let source_expr = format!("{}.{}", authored.sil, field.source().field());
-        let storage_expr = match field.expanded_state() {
-            Some(expanded) => authored_state_payload_digest_expr(expanded, &source_expr, lowering, model)?,
-            None => source_expr,
-        };
-        if physical_fields.insert(physical, storage_expr).is_some() {
-            return Err(ArgentError::new("authored output fields map to the same physical target field"));
-        }
-    }
-    for (id, expr) in &target.generated_fields {
-        if physical_fields.insert(PhysicalFieldId::Generated(id.clone()), expr.clone()).is_some() {
-            return Err(ArgentError::new("generated output field overlaps an authored storage field"));
-        }
-    }
-
-    let field_indent = " ".repeat(indent + 4);
-    let close_indent = " ".repeat(indent);
-    let mut out = format!("{} {{\n", target.sil_type);
-    let mut emitted_generated_header = false;
-    let mut emitted_storage_header = false;
-    for field in target.physical.physical().fields() {
-        match field.id() {
-            PhysicalFieldId::Generated(_) if !emitted_generated_header => {
-                out.push_str(&format!("{field_indent}// :: generated fields\n"));
-                emitted_generated_header = true;
-            }
-            PhysicalFieldId::Storage(_) if !emitted_storage_header => {
-                out.push_str(&format!("{field_indent}// :: user declared fields\n"));
-                emitted_storage_header = true;
-            }
-            PhysicalFieldId::Generated(_) | PhysicalFieldId::Storage(_) => {}
-        }
-        let expr = physical_fields
-            .remove(field.id())
-            .ok_or_else(|| ArgentError::new(format!("physical output field `{}` has no materialization source", field.sil_name())))?;
-        out.push_str(&format!("{field_indent}{}: {expr},\n", field.sil_name()));
-    }
-    if !physical_fields.is_empty() {
-        return Err(ArgentError::new("output materialization contains fields outside its physical target layout"));
-    }
-    out.push_str(&close_indent);
-    out.push('}');
-    Ok(PhysicalStateExpr { sil_type: target.sil_type.clone(), sil: out, materialized: true })
 }
 
 /// Resolved route context from which output authentication is planned.
-pub(in crate::compiler::codegen) enum OutputValidationContext<'a, 'm> {
-    Actor {
-        target: &'a str,
-    },
-    Selector {
-        selector: &'a str,
-        template: String,
-    },
-    Observed {
-        observe: &'a ObserveDecl,
-        output: &'a ObservedActorDecl,
-        static_target: Option<StaticActorTarget<'m>>,
-        witness: &'a ObservedActorWitnessSpec,
-        template: String,
-    },
-    Spawned {
-        static_target: Option<StaticActorTarget<'m>>,
-        witness: &'a SpawnActorWitnessSpec,
-        template: String,
-    },
+pub(in crate::compiler::codegen) enum OutputValidationContext<'a> {
+    Actor { target: StaticActorId },
+    Selector { selector: &'a TemplateSelector, template: String },
+    Observed { id: InteractionId, template: String, template_ast: Option<Box<SilExpr<'static>>> },
+    Spawned { id: InteractionId, template: String, template_ast: Option<Box<SilExpr<'static>>> },
 }
 
 pub(in crate::compiler::codegen) fn plan_output_validation(
-    actor: &ActorDecl,
+    entry_id: EntryId,
     entry: &EntryDecl,
-    context: OutputValidationContext<'_, '_>,
-    output_index: impl Into<String>,
-    physical: PhysicalStateExpr,
+    context: OutputValidationContext<'_>,
     state_binding: impl Into<String>,
-    model: &Model<'_>,
+    model: &AppCompilationContext<'_>,
 ) -> Result<PlannedOutputValidation> {
-    let proof = match context {
-        OutputValidationContext::Actor { target } => {
-            if target == actor.name {
-                OutputTemplateProof::Current
-            } else if let Some(input_index) = template_input_index_for_actor(actor, entry, target, model)? {
-                OutputTemplateProof::BoundInput {
-                    input_index,
-                    prefix_len: hidden_witness_prefix_len_name(target),
-                    suffix_len: hidden_witness_suffix_len_name(target),
-                    template: hidden_template_name(target),
+    let outputs = model.entry_output_plan_by_id(entry_id)?;
+    let requirement = match &context {
+        OutputValidationContext::Actor { target } => outputs.actor(target)?,
+        OutputValidationContext::Selector { selector, .. } => outputs.selector(selector)?,
+        OutputValidationContext::Observed { id, .. } => outputs.observed(*id)?,
+        OutputValidationContext::Spawned { id, .. } => outputs.spawned(*id)?,
+    };
+    let template = match &context {
+        OutputValidationContext::Actor { target } => hidden_template_name(&model.static_actor_reference(target)?),
+        OutputValidationContext::Selector { template, .. }
+        | OutputValidationContext::Observed { template, .. }
+        | OutputValidationContext::Spawned { template, .. } => template.clone(),
+    };
+    let template_ast = match &context {
+        OutputValidationContext::Observed { template_ast: Some(expr), .. }
+        | OutputValidationContext::Spawned { template_ast: Some(expr), .. } => expr.as_ref().clone(),
+        _ => SilExpr::identifier(template.clone()),
+    };
+    let proof = match requirement {
+        OutputProofRequirement::Current => OutputTemplateProof::Current,
+        OutputProofRequirement::BoundInput { input, target } => {
+            let target = model.static_actor_reference(target)?;
+            let reference = model
+                .input_plan_by_id(entry_id)?
+                .reference(*input)
+                .ok_or_else(|| ArgentError::new("output proof references an unknown authenticated input"))?;
+            let input_index_ast = match reference.origin {
+                InputReferenceOrigin::Consumed(_) => {
+                    let path = reference.origin.source_path(entry)?;
+                    let [name] = path.as_slice() else { return Err(ArgentError::new("consumed output proof has no input handle")) };
+                    match reference.location {
+                        Some(crate::compiler::model::InteractionLocation::Range { .. }) => {
+                            let position = reference
+                                .ranged_proof_input_position
+                                .ok_or_else(|| ArgentError::new("ranged consumed output proof has no planned input position"))?;
+                            SilExpr::call(
+                                "OpCovInputIdx",
+                                vec![SilExpr::identifier(hidden_cov_id_name()), SilExpr::int(position as i64)],
+                            )
+                        }
+                        Some(_) => {
+                            let index = hidden_input_idx_name(name);
+                            SilExpr::identifier(index)
+                        }
+                        None => return Err(ArgentError::new("consumed output proof has no input location")),
+                    }
                 }
-            } else {
-                OutputTemplateProof::Witnessed {
-                    prefix: hidden_witness_prefix_name(target),
-                    suffix: hidden_witness_suffix_name(target),
-                    template: hidden_template_name(target),
+                InputReferenceOrigin::Observed(_) => {
+                    let path = reference.origin.source_path(entry)?;
+                    let [observe, _, handle] = path.as_slice() else {
+                        return Err(ArgentError::new("observed output proof has no input handle"));
+                    };
+                    let index = hidden_observed_input_idx_name(observe, handle);
+                    SilExpr::identifier(index)
                 }
+                InputReferenceOrigin::Active => return Err(ArgentError::new("active input cannot prove a foreign output template")),
+            };
+            OutputTemplateProof::BoundInput {
+                input_index_ast,
+                prefix_len: hidden_witness_prefix_len_name(&target),
+                suffix_len: hidden_witness_suffix_len_name(&target),
             }
         }
-        OutputValidationContext::Selector { selector, template } => OutputTemplateProof::Witnessed {
-            prefix: hidden_template_selector_prefix_name(selector),
-            suffix: hidden_template_selector_suffix_name(selector),
-            template,
-        },
-        OutputValidationContext::Observed { observe, output, static_target, witness, template } => {
-            if let Some(proof) = fixed_output_template_proof(actor, entry, static_target, &template, model)? {
-                proof
-            } else if observed_reuses_input_template(observe, output) {
-                let input = first_observed_input_for_actor(observe, &output.actor)
-                    .expect("input-template reuse requires a matching observed input");
-                let input_spec = observed_input_spec(actor, entry, observe, input, model)?;
-                OutputTemplateProof::BoundInput {
-                    input_index: hidden_observed_input_idx_name(&observe.name, &input.name),
-                    prefix_len: hidden_observed_actor_prefix_len_name(&input_spec),
-                    suffix_len: hidden_observed_actor_suffix_len_name(&input_spec),
-                    template,
-                }
-            } else {
-                OutputTemplateProof::Witnessed {
-                    prefix: hidden_observed_actor_prefix_name(witness),
-                    suffix: hidden_observed_actor_suffix_name(witness),
-                    template,
-                }
+        OutputProofRequirement::WitnessedActor(target) => {
+            let target = model.static_actor_reference(target)?;
+            OutputTemplateProof::Witnessed { prefix: hidden_witness_prefix_name(&target), suffix: hidden_witness_suffix_name(&target) }
+        }
+        OutputProofRequirement::Selector(id) => {
+            let OutputValidationContext::Selector { selector, .. } = &context else {
+                return Err(ArgentError::new("selector output proof has no selector context"));
+            };
+            if selector.binding != Some(*id) {
+                return Err(ArgentError::new("selector output proof references the wrong binding"));
+            }
+            OutputTemplateProof::Witnessed {
+                prefix: hidden_template_selector_prefix_name(&selector.name),
+                suffix: hidden_template_selector_suffix_name(&selector.name),
             }
         }
-        OutputValidationContext::Spawned { static_target, witness, template } => {
-            fixed_output_template_proof(actor, entry, static_target, &template, model)?.unwrap_or_else(|| {
-                OutputTemplateProof::Witnessed {
-                    prefix: hidden_spawn_actor_prefix_name(witness),
-                    suffix: hidden_spawn_actor_suffix_name(witness),
-                    template,
-                }
-            })
-        }
-    };
-    Ok(planned_output_validation(output_index, physical, state_binding, proof))
-}
-
-fn fixed_output_template_proof(
-    actor: &ActorDecl,
-    entry: &EntryDecl,
-    target: Option<StaticActorTarget<'_>>,
-    template: &str,
-    model: &Model<'_>,
-) -> Result<Option<OutputTemplateProof>> {
-    let Some(target) = target else {
-        return Ok(None);
-    };
-    if target.in_app_actor().is_some_and(|target| target.name == actor.name) {
-        return Ok(Some(OutputTemplateProof::Current));
-    }
-    let Some(input_index) = template_input_index_for_target(actor, entry, target, model)? else {
-        let target_reference = target.artifact_reference();
-        return Ok(Some(OutputTemplateProof::Witnessed {
-            prefix: hidden_witness_prefix_name(&target_reference),
-            suffix: hidden_witness_suffix_name(&target_reference),
-            template: template.to_string(),
-        }));
-    };
-    let target_reference = target.artifact_reference();
-    Ok(Some(OutputTemplateProof::BoundInput {
-        input_index,
-        prefix_len: hidden_witness_prefix_len_name(&target_reference),
-        suffix_len: hidden_witness_suffix_len_name(&target_reference),
-        template: template.to_string(),
-    }))
-}
-
-fn planned_output_validation(
-    output_index: impl Into<String>,
-    physical: PhysicalStateExpr,
-    state_binding: impl Into<String>,
-    proof: OutputTemplateProof,
-) -> PlannedOutputValidation {
-    PlannedOutputValidation { output_index: output_index.into(), physical, state_binding: state_binding.into(), proof }
-}
-
-pub(in crate::compiler::codegen) fn preserve_exact_self(out: &mut String, indent: usize, output_index: &str) {
-    push_generated_binary_require(
-        out,
-        indent,
-        &format!("tx.outputs[{output_index}].scriptPubKey"),
-        "==",
-        "tx.inputs[this.activeInputIndex].scriptPubKey",
-    );
-}
-
-impl SourceStateAccess {
-    fn source_identity(&self) -> &str {
-        self.source.as_str()
-    }
-
-    #[cfg(test)]
-    fn authored_sil_type(&self) -> &str {
-        &self.authored_sil_type
-    }
-
-    #[cfg(test)]
-    fn is_complete(&self) -> bool {
-        self.complete.is_some()
-    }
-
-    fn projected_replacements(&self, source_ref: &str, indent: usize) -> Result<Vec<(String, String)>> {
-        self.fields
-            .iter()
-            .filter_map(|field| field.value.as_ref().map(|_| field))
-            .map(|field| Ok((format!("{source_ref}.{}", field.name), self.project_field(&field.name, indent)?)))
-            .collect()
-    }
-
-    fn project_field(&self, field_name: &str, indent: usize) -> Result<String> {
-        Ok(self.planned_field(field_name)?.render(indent))
-    }
-
-    fn planned_field(&self, field_name: &str) -> Result<&PlannedSourceExpr> {
-        let field = self
-            .fields
-            .iter()
-            .find(|field| field.name == field_name)
-            .ok_or_else(|| ArgentError::new(format!("state `{}` has no field `{field_name}`", self.source.as_str())))?;
-        field.value.as_ref().ok_or_else(|| {
-            ArgentError::new(format!(
-                "expanded input field `{field_name}` cannot be projected from authenticated physical state without its validated preimage"
-            ))
-        })
-    }
-
-    fn planned_storage_field(&self, field_name: &str) -> Result<PlannedSourceStorageExpr> {
-        let authored = self.planned_field(field_name)?.clone();
-        let trusted_storage =
-            self.fields.iter().find(|field| field.name == field_name).and_then(|field| field.trusted_storage.clone());
-        Ok(PlannedSourceStorageExpr { authored, trusted_storage })
-    }
-
-    fn reject_unavailable_field_refs(&self, source_ref: &str, input: &str) -> Result<()> {
-        let tokens = crate::compiler::syntax::lexer::lex(input)?;
-        for field in self.fields.iter().filter(|field| field.value.is_none()) {
-            let reference = format!("{source_ref}.{}", field.name);
-            if count_qualified_ref(&tokens, &reference) > 0 {
-                return Err(ArgentError::new(format!(
-                    "expanded input field `{}` cannot be projected from authenticated physical state without its validated preimage",
-                    field.name
-                )));
+        OutputProofRequirement::BoundObserved(input) => {
+            let reference = model
+                .input_plan_by_id(entry_id)?
+                .reference(*input)
+                .ok_or_else(|| ArgentError::new("observed output proof references an unknown authenticated input"))?;
+            let InputReferenceOrigin::Observed(_) = reference.origin else {
+                return Err(ArgentError::new("observed output proof references the wrong input"));
+            };
+            let path = reference.origin.source_path(entry)?;
+            let [observe, _, handle] = path.as_slice() else {
+                return Err(ArgentError::new("observed output proof has no input handle"));
+            };
+            let input_spec = reference
+                .observed_witness
+                .as_ref()
+                .ok_or_else(|| ArgentError::new("observed output proof has no planned observed input witness"))?;
+            OutputTemplateProof::BoundInput {
+                input_index_ast: SilExpr::identifier(hidden_observed_input_idx_name(observe, handle)),
+                prefix_len: hidden_observed_actor_prefix_len_name(input_spec),
+                suffix_len: hidden_observed_actor_suffix_len_name(input_spec),
             }
         }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::compiler::codegen) struct EntryInputReferenceId(usize);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::compiler::codegen) struct EntryInputScopeId(usize);
-
-#[derive(Clone, Copy)]
-enum EntryInputReferenceKind {
-    Active,
-    Consumed,
-    Observed,
+        OutputProofRequirement::ObservedWitness => {
+            let OutputValidationContext::Observed { id, .. } = &context else {
+                return Err(ArgentError::new("observed output proof has no observed witness"));
+            };
+            let witness = outputs.observed_witness(*id)?;
+            OutputTemplateProof::Witnessed {
+                prefix: hidden_observed_actor_prefix_name(witness),
+                suffix: hidden_observed_actor_suffix_name(witness),
+            }
+        }
+        OutputProofRequirement::SpawnWitness => {
+            let OutputValidationContext::Spawned { id, .. } = &context else {
+                return Err(ArgentError::new("spawn output proof has no spawn witness"));
+            };
+            let witness = model.witness_plan_by_id(entry_id)?.spawn_output(*id)?;
+            OutputTemplateProof::Witnessed {
+                prefix: hidden_spawn_actor_prefix_name(witness),
+                suffix: hidden_spawn_actor_suffix_name(witness),
+            }
+        }
+    };
+    Ok(PlannedOutputValidation { state_binding: state_binding.into(), proof, template_ast })
 }
 
 struct InputReferenceSpec {
     id: EntryInputReferenceId,
-    scope: EntryInputScopeId,
-    kind: EntryInputReferenceKind,
     reference: String,
-    lexical_root: String,
     physical_expr: String,
-    input_index: String,
+    input_index: InputIndexExpr,
+    direct_authored_state: bool,
 }
 
 #[derive(Clone)]
-struct InputIndexExpr(String);
+struct InputIndexExpr {
+    expr: SilExpr<'static>,
+}
 
 impl InputIndexExpr {
-    fn as_str(&self) -> &str {
-        &self.0
+    fn ast(&self) -> SilExpr<'static> {
+        self.expr.clone()
     }
 }
 
@@ -799,221 +717,259 @@ impl InputIndexExpr {
 #[derive(Clone)]
 pub(in crate::compiler::codegen) struct PlannedEntryInputReference {
     id: EntryInputReferenceId,
-    scope: EntryInputScopeId,
-    kind: EntryInputReferenceKind,
     reference: String,
-    lexical_root: String,
     input_index: InputIndexExpr,
-    lowered_sil_type: String,
     access: SourceStateAccess,
     physical: Option<AuthenticatedPhysicalInput>,
-    additional_replacements: Vec<(String, String)>,
 }
 
 impl PlannedEntryInputReference {
-    pub(in crate::compiler::codegen) fn scope(&self) -> EntryInputScopeId {
-        self.scope
-    }
-
-    pub(in crate::compiler::codegen) fn lexical_root(&self) -> &str {
-        &self.lexical_root
-    }
-
     pub(in crate::compiler::codegen) fn reference(&self) -> &str {
         &self.reference
-    }
-
-    pub(in crate::compiler::codegen) fn is_active(&self) -> bool {
-        matches!(self.kind, EntryInputReferenceKind::Active)
-    }
-
-    #[cfg(test)]
-    pub(in crate::compiler::codegen) fn authored_sil_type(&self) -> &str {
-        self.access.authored_sil_type()
-    }
-
-    #[cfg(test)]
-    fn is_direct_authored(&self) -> bool {
-        self.access.is_complete()
-    }
-
-    pub(in crate::compiler::codegen) fn source_identity(&self) -> &str {
-        self.access.source_identity()
-    }
-
-    pub(in crate::compiler::codegen) fn physical_type(&self) -> &str {
-        &self.lowered_sil_type
     }
 
     pub(in crate::compiler::codegen) fn physical_target(&self) -> &PhysicalTargetId {
         &self.access.target
     }
 
-    pub(in crate::compiler::codegen) fn emit_read(&self, out: &mut String, indent: usize) {
-        self.physical.as_ref().expect("only authenticated external references are emitted as reads").emit_read(out, indent);
+    pub(in crate::compiler::codegen) fn read_statement(&self) -> SilStatement<'static> {
+        self.physical.as_ref().expect("only authenticated external references are emitted as reads").read_statement()
     }
 
-    pub(in crate::compiler::codegen) fn uses_covenant_domain_proof(&self) -> bool {
-        self.physical.as_ref().is_some_and(|physical| matches!(physical.proof, InputTemplateProof::CovenantDomain))
+    pub(in crate::compiler::codegen) fn native_value_ast(&self) -> SilExpr<'static> {
+        let span = SilSpan::default();
+        let index = self.input_index.ast();
+        SilExpr::new(
+            SilExprKind::IndexedIntrospection {
+                kind: SilIndexedIntrospectionKind::InputValue,
+                index: Box::new(index),
+                field_span: span,
+            },
+            span,
+        )
     }
 
-    pub(in crate::compiler::codegen) fn native_value(&self) -> String {
-        format!("tx.inputs[{}].value", self.input_index.as_str())
+    pub(in crate::compiler::codegen) fn covenant_id_ast(&self) -> SilExpr<'static> {
+        SilExpr::call("OpInputCovenantId", vec![self.input_index.ast()])
     }
 
-    pub(in crate::compiler::codegen) fn covenant_id(&self) -> String {
-        format!("OpInputCovenantId({})", self.input_index.as_str())
+    pub(in crate::compiler::codegen) fn project_field_ast(&self, field_name: &str) -> Option<SilExpr<'static>> {
+        self.access.fields.iter().find(|field| field.name == field_name)?.ast_value.clone()
     }
 
-    pub(in crate::compiler::codegen) fn project_field(&self, field_name: &str, indent: usize) -> Result<String> {
-        self.access.project_field(field_name, indent)
-    }
-
-    pub(in crate::compiler::codegen) fn complete_authored_state(&self, indent: usize) -> Result<AuthoredStateExpr> {
-        if let Some(sil) = &self.access.complete {
-            return Ok(AuthoredStateExpr {
-                source: self.access.source.clone(),
-                sil_type: self.access.authored_sil_type.clone(),
-                sil: sil.clone(),
-            });
-        }
-        if let Some(field) = self.access.fields.iter().find(|field| field.value.is_none()) {
-            return Err(ArgentError::new(format!(
+    pub(in crate::compiler::codegen) fn unavailable_authored_state(&self) -> ArgentError {
+        if let Some(field) = self.access.fields.iter().find(|field| field.ast_value.is_none()) {
+            ArgentError::new(format!(
                 "expanded input state `{}` from target `{:?}` cannot be materialized without a validated preimage for field `{}`",
                 self.access.source.as_str(),
                 self.access.target,
                 field.name
-            )));
+            ))
+        } else {
+            ArgentError::new(format!("cannot lower authored state for `{}`", self.reference))
         }
-        let field_indent = " ".repeat(indent + 4);
-        let close_indent = " ".repeat(indent);
-        let mut out = format!("{} {{\n", self.access.authored_sil_type);
-        if !self.access.fields.is_empty() {
-            out.push_str(&format!("{field_indent}// :: user declared fields\n"));
-        }
-        for field in &self.access.fields {
-            let value = self.project_field(&field.name, indent + 4)?;
-            out.push_str(&format!("{field_indent}{}: {value},\n", field.name));
-        }
-        out.push_str(&close_indent);
-        out.push('}');
-        Ok(AuthoredStateExpr { source: self.access.source.clone(), sil_type: self.access.authored_sil_type.clone(), sil: out })
     }
 
-    pub(in crate::compiler::codegen) fn authored_payload_digest(
+    pub(in crate::compiler::codegen) fn unavailable_field(&self, field_name: &str) -> ArgentError {
+        if self.access.fields.iter().any(|field| field.name == field_name) {
+            ArgentError::new(format!(
+                "expanded input field `{field_name}` cannot be projected from authenticated physical state without its validated preimage"
+            ))
+        } else {
+            ArgentError::new(format!("state `{}` has no field `{field_name}`", self.access.source.as_str()))
+        }
+    }
+
+    pub(in crate::compiler::codegen) fn expanded_field_ast(&self, field_name: &str, component_name: &str) -> Option<SilExpr<'static>> {
+        let source = self.access.fields.iter().find(|field| field.name == field_name && field.trusted_storage.is_some())?;
+        let SilExprKind::StructLiteral { fields, .. } = &source.ast_value.as_ref()?.kind else { return None };
+        fields.iter().find(|field| field.name == component_name).map(|field| field.expr.clone())
+    }
+
+    pub(in crate::compiler::codegen) fn range_field_ast<'i>(
         &self,
-        lowering: &ContractStateLowering,
-        model: &Model<'_>,
-    ) -> Result<String> {
-        // Validate complete reconstruction even though the digest can project
-        // stable fields directly from the authenticated input.
-        self.complete_authored_state(0)?;
-        source_storage_payload_digest(&self.access.source, &self.access.source_to_storage, lowering, model, |field| {
-            self.access.planned_storage_field(field)
-        })
-    }
-
-    pub(in crate::compiler::codegen) fn operation_replacements(&self, indent: usize) -> Result<Vec<(String, String)>> {
-        let mut replacements = self.access.projected_replacements(&self.reference, indent)?;
-        replacements.extend(self.additional_replacements.clone());
-        replacements.push((format!("{}.{}", self.reference, word::VALUE), self.native_value()));
-        replacements.push((format!("{}.{}", self.reference, word::COVENANT_ID), self.covenant_id()));
-        Ok(replacements)
-    }
-
-    pub(in crate::compiler::codegen) fn reject_unavailable_field_refs(&self, input: &str) -> Result<()> {
-        let legacy = format!("{}.{}", self.reference, word::STATE);
-        let tokens = crate::compiler::syntax::lexer::lex(input)?;
-        if count_qualified_ref(&tokens, &legacy) > 0 {
-            return Err(ArgentError::new(format!(
-                "input reference `{}` has no `.state` member; use `{}({})` for complete authored state or project a field directly",
-                self.reference,
-                word::STATE,
-                self.reference
-            )));
-        }
-        self.access.reject_unavailable_field_refs(&self.reference, input)
-    }
-
-    fn has_complete_range_cache(&self) -> bool {
-        self.access.fields.iter().all(|field| field.value.is_some())
-    }
-
-    pub(in crate::compiler::codegen) fn emit_range_cache_declarations(&self, out: &mut String, indent: usize, handle: &str) {
-        let prefix = " ".repeat(indent);
+        handle: &str,
+        index: SilExpr<'i>,
+        field_name: &str,
+    ) -> Option<SilExpr<'i>> {
+        self.access.fields.iter().find(|field| field.name == field_name && field.ast_value.is_some())?;
+        let span = SilSpan::default();
         if self.has_complete_range_cache() {
-            out.push_str(&format!(
-                "{prefix}{}[] {};\n",
-                self.access.authored_sil_type,
-                hidden_consumed_input_authored_cache_name(handle)
-            ));
+            let item = SilExpr::new(
+                SilExprKind::ArrayIndex {
+                    source: Box::new(SilExpr::identifier(hidden_consumed_input_authored_cache_name(handle))),
+                    index: Box::new(index),
+                },
+                span,
+            );
+            Some(SilExpr::new(
+                SilExprKind::FieldAccess { source: Box::new(item), field: field_name.to_string(), field_span: span },
+                span,
+            ))
         } else {
-            for field in self.access.fields.iter().filter(|field| field.value.is_some()) {
-                out.push_str(&format!(
-                    "{prefix}{}[] {};\n",
-                    field.sil_type,
-                    hidden_consumed_input_field_cache_name(handle, &field.name)
-                ));
-            }
+            Some(SilExpr::new(
+                SilExprKind::ArrayIndex {
+                    source: Box::new(SilExpr::identifier(hidden_consumed_input_field_cache_name(handle, field_name))),
+                    index: Box::new(index),
+                },
+                span,
+            ))
         }
     }
 
-    pub(in crate::compiler::codegen) fn emit_range_cache_append(&self, out: &mut String, indent: usize, handle: &str) -> Result<()> {
-        let prefix = " ".repeat(indent);
-        if self.has_complete_range_cache() {
-            let cache = hidden_consumed_input_authored_cache_name(handle);
-            let authored = self.complete_authored_state(indent)?;
-            out.push_str(&format!("{prefix}{cache} = {cache}.append({});\n", authored.sil()));
-        } else {
-            for field in self.access.fields.iter().filter(|field| field.value.is_some()) {
-                let cache = hidden_consumed_input_field_cache_name(handle, &field.name);
-                let value = self.project_field(&field.name, indent)?;
-                out.push_str(&format!("{prefix}{cache} = {cache}.append({value});\n"));
-            }
+    pub(in crate::compiler::codegen) fn complete_authored_ast(&self) -> Option<SilExpr<'static>> {
+        if let Some(complete) = &self.access.complete {
+            return crate::compiler::naming::is_identifier(complete).then(|| SilExpr::identifier(complete.clone()));
         }
-        Ok(())
-    }
-
-    fn ranged_item(&self, reference: String, lexical_root: String, handle: &str, index: &str, input_index: String) -> Result<Self> {
-        let has_complete_cache = self.has_complete_range_cache();
-        let complete = has_complete_cache.then(|| format!("{}[{index}]", hidden_consumed_input_authored_cache_name(handle)));
+        let span = SilSpan::default();
         let fields = self
             .access
             .fields
             .iter()
+            .map(|field| Some(SilStateFieldExpr { name: field.name.clone(), expr: field.ast_value.clone()?, span, name_span: span }))
+            .collect::<Option<Vec<_>>>()?;
+        Some(SilExpr::new(SilExprKind::StructLiteral { name: self.access.authored_sil_type.clone(), fields, name_span: span }, span))
+    }
+
+    pub(in crate::compiler::codegen) fn complete_range_item_ast<'i>(&self, handle: &str, index: SilExpr<'i>) -> Option<SilExpr<'i>> {
+        self.has_complete_range_cache().then(|| {
+            SilExpr::new(
+                SilExprKind::ArrayIndex {
+                    source: Box::new(SilExpr::identifier(hidden_consumed_input_authored_cache_name(handle))),
+                    index: Box::new(index),
+                },
+                SilSpan::default(),
+            )
+        })
+    }
+
+    pub(in crate::compiler::codegen) fn authored_payload_digest_ast(
+        &self,
+        model: &AppCompilationContext<'_>,
+    ) -> Option<SilExpr<'static>> {
+        let storage = model.storage_state_by_source(&self.access.source).ok()?;
+        let mut parts = Vec::new();
+        for field in self.access.source_to_storage.fields() {
+            let stored = storage.fields.iter().find(|candidate| candidate.name == field.storage().field())?;
+            let source = self.access.fields.iter().find(|candidate| candidate.name == field.source().field())?;
+            let value = match field.expanded_state() {
+                Some(_) => SilExpr::identifier(
+                    source.trusted_storage.as_ref().filter(|value| crate::compiler::naming::is_identifier(value))?.clone(),
+                ),
+                None => source.ast_value.clone()?,
+            };
+            parts.push(packed_field_ast(&stored.ty, value)?);
+        }
+        let span = SilSpan::default();
+        let bytes = parts
+            .into_iter()
+            .reduce(|left, right| {
+                SilExpr::new(
+                    SilExprKind::Binary { op: silverscript_lang::ast::BinaryOp::Add, left: Box::new(left), right: Box::new(right) },
+                    span,
+                )
+            })
+            .unwrap_or_else(|| SilExpr::bytes(Vec::new()));
+        Some(SilExpr::call("blake3", vec![SilExpr::call("byte[]", vec![bytes])]))
+    }
+
+    fn has_complete_range_cache(&self) -> bool {
+        self.access.fields.iter().all(|field| field.ast_value.is_some())
+    }
+
+    pub(in crate::compiler::codegen) fn range_cache_declarations(&self, handle: &str) -> Vec<SilStatement<'static>> {
+        let span = SilSpan::default();
+        if self.has_complete_range_cache() {
+            return vec![SilStatement::VariableDefinition {
+                type_ref: SilTypeRef {
+                    base: SilTypeBase::Custom(self.access.authored_sil_type.clone()),
+                    array_dims: vec![SilArrayDim::Dynamic],
+                },
+                modifiers: Vec::new(),
+                name: hidden_consumed_input_authored_cache_name(handle),
+                expr: None,
+                span,
+                type_span: span,
+                modifier_spans: Vec::new(),
+                name_span: span,
+            }];
+        }
+        self.access
+            .fields
+            .iter()
+            .filter(|field| field.ast_value.is_some())
             .map(|field| {
-                let value = field.value.as_ref().map(|_| {
-                    let expr = if has_complete_cache {
-                        format!("{}[{index}].{}", hidden_consumed_input_authored_cache_name(handle), field.name)
-                    } else {
-                        format!("{}[{index}]", hidden_consumed_input_field_cache_name(handle, &field.name))
-                    };
-                    PlannedSourceExpr::Value(expr)
-                });
-                PlannedSourceField {
-                    name: field.name.clone(),
-                    sil_type: field.sil_type.clone(),
-                    value,
-                    trusted_storage: field.trusted_storage.clone(),
+                let mut type_ref = field.sil_type_ref.clone();
+                type_ref.array_dims.push(SilArrayDim::Dynamic);
+                SilStatement::VariableDefinition {
+                    type_ref,
+                    modifiers: Vec::new(),
+                    name: hidden_consumed_input_field_cache_name(handle, &field.name),
+                    expr: None,
+                    span,
+                    type_span: span,
+                    modifier_spans: Vec::new(),
+                    name_span: span,
                 }
             })
-            .collect();
-        let access = SourceStateAccess { complete, fields, ..self.access.clone() };
-        Ok(Self {
-            id: self.id,
-            scope: self.scope,
-            kind: self.kind,
-            reference,
-            lexical_root,
-            input_index: InputIndexExpr(input_index),
-            lowered_sil_type: self.lowered_sil_type.clone(),
-            access,
-            // The range prelude already authenticated and cached this item.
-            // Keeping an emit-capable physical read plan here would make it
-            // possible to read the same transaction input a second time.
-            physical: None,
-            additional_replacements: Vec::new(),
-        })
+            .collect()
+    }
+
+    pub(in crate::compiler::codegen) fn range_cache_append(&self, handle: &str) -> Result<Vec<SilStatement<'static>>> {
+        let span = SilSpan::default();
+        if self.has_complete_range_cache() {
+            let cache = hidden_consumed_input_authored_cache_name(handle);
+            let value = if let Some(complete) = &self.access.complete {
+                SilExpr::identifier(complete.clone())
+            } else {
+                let fields = self
+                    .access
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        Ok(SilStateFieldExpr {
+                            name: field.name.clone(),
+                            expr: field.ast_value.clone().ok_or_else(|| {
+                                ArgentError::new(format!("authenticated range field `{}` has no AST projection", field.name))
+                            })?,
+                            span,
+                            name_span: span,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                SilExpr::new(SilExprKind::StructLiteral { name: self.access.authored_sil_type.clone(), fields, name_span: span }, span)
+            };
+            return Ok(vec![SilStatement::Assign {
+                name: cache.clone(),
+                expr: SilExpr::new(
+                    SilExprKind::Append { source: Box::new(SilExpr::identifier(cache)), args: vec![value], span },
+                    span,
+                ),
+                span,
+                name_span: span,
+            }]);
+        }
+        self.access
+            .fields
+            .iter()
+            .filter(|field| field.ast_value.is_some())
+            .map(|field| {
+                let cache = hidden_consumed_input_field_cache_name(handle, &field.name);
+                let value = field
+                    .ast_value
+                    .clone()
+                    .ok_or_else(|| ArgentError::new(format!("authenticated range field `{}` has no AST projection", field.name)))?;
+                Ok(SilStatement::Assign {
+                    name: cache.clone(),
+                    expr: SilExpr::new(
+                        SilExprKind::Append { source: Box::new(SilExpr::identifier(cache)), args: vec![value], span },
+                        span,
+                    ),
+                    span,
+                    name_span: span,
+                })
+            })
+            .collect()
     }
 }
 
@@ -1021,74 +977,19 @@ impl PlannedEntryInputReference {
 pub(in crate::compiler::codegen) struct EntryInputReferencePlan {
     references: Vec<PlannedEntryInputReference>,
     active: EntryInputReferenceId,
-    consumed: BTreeMap<String, EntryInputReferenceId>,
-    consumed_ranges: BTreeSet<String>,
-    observed: BTreeMap<(String, String), EntryInputReferenceId>,
-}
-
-/// External input references available at one entry-lowering phase.
-#[derive(Clone, Copy)]
-pub(in crate::compiler::codegen) enum EntryInputReferenceView<'a> {
-    None,
-    Complete(&'a EntryInputReferencePlan),
-}
-
-impl<'a> EntryInputReferenceView<'a> {
-    pub(in crate::compiler::codegen) fn active(
-        self,
-        actor: &ActorDecl,
-        model: &Model<'_>,
-        state_values: &ContractStateValuePlan,
-    ) -> Result<PlannedEntryInputReference> {
-        match self {
-            Self::None => active_input_reference(actor, model, model.state_lowering(&actor.name)?, state_values),
-            Self::Complete(plan) => Ok(plan.active().clone()),
-        }
-    }
-
-    pub(in crate::compiler::codegen) fn consumed(self, name: &str) -> Result<Option<&'a PlannedEntryInputReference>> {
-        match self {
-            Self::None => Ok(None),
-            Self::Complete(plan) => plan.consumed(name).map(Some),
-        }
-    }
-
-    pub(in crate::compiler::codegen) fn observed(self, observe: &str, handle: &str) -> Result<Option<&'a PlannedEntryInputReference>> {
-        match self {
-            Self::Complete(plan) => plan.observed(observe, handle).map(Some),
-            Self::None => Ok(None),
-        }
-    }
-
-    pub(in crate::compiler::codegen) fn external_references(self) -> &'a [PlannedEntryInputReference] {
-        match self {
-            Self::None => &[],
-            Self::Complete(plan) => plan.external_references(),
-        }
-    }
-
-    pub(in crate::compiler::codegen) fn reference(self, expr: &str) -> Option<&'a PlannedEntryInputReference> {
-        match self {
-            Self::None => None,
-            Self::Complete(plan) => plan.references().iter().find(|reference| reference.reference == expr),
-        }
-    }
-
-    pub(in crate::compiler::codegen) fn consumed_range_item(
-        self,
-        name: &str,
-        reference: String,
-        index: String,
-        input_index: String,
-    ) -> Result<Option<PlannedEntryInputReference>> {
-        match self {
-            Self::None => Ok(None),
-            Self::Complete(plan) => plan.consumed_range_item(name, reference, index, input_index).map(Some),
-        }
-    }
+    consumed: BTreeMap<InteractionId, EntryInputReferenceId>,
+    observed: BTreeMap<InteractionId, EntryInputReferenceId>,
+    reference_uses: BTreeMap<(usize, usize), EntryInputReferenceId>,
 }
 
 impl EntryInputReferencePlan {
+    pub(in crate::compiler::codegen) fn reference_ast(&self, expr: &SilExpr<'_>) -> Option<&PlannedEntryInputReference> {
+        if !matches!(expr.kind, SilExprKind::Identifier(_) | SilExprKind::FieldAccess { .. }) {
+            return None;
+        }
+        self.reference_uses.get(&(expr.span.start(), expr.span.end())).and_then(|id| self.reference(*id))
+    }
+
     fn reference(&self, id: EntryInputReferenceId) -> Option<&PlannedEntryInputReference> {
         self.references.get(id.0).filter(|reference| reference.id == id)
     }
@@ -1097,199 +998,258 @@ impl EntryInputReferencePlan {
         self.reference(self.active).expect("entry input reference plan retains its active input")
     }
 
-    pub(in crate::compiler::codegen) fn consumed(&self, name: &str) -> Result<&PlannedEntryInputReference> {
+    pub(in crate::compiler::codegen) fn consumed(&self, interaction: InteractionId) -> Result<&PlannedEntryInputReference> {
         self.consumed
-            .get(name)
+            .get(&interaction)
             .and_then(|id| self.reference(*id))
-            .ok_or_else(|| ArgentError::new(format!("missing consumed input reference `{name}`")))
+            .ok_or_else(|| ArgentError::new(format!("missing consumed input reference `{interaction:?}`")))
     }
 
-    pub(in crate::compiler::codegen) fn consumed_range_item(
-        &self,
-        name: &str,
-        reference: String,
-        index: String,
-        input_index: String,
-    ) -> Result<PlannedEntryInputReference> {
-        if !self.consumed_ranges.contains(name) {
-            return Err(ArgentError::new(format!("consumed input `{name}` is not ranged")));
-        }
-        self.consumed(name)?.ranged_item(reference, name.to_string(), name, &index, input_index)
-    }
-
-    pub(in crate::compiler::codegen) fn observed(&self, observe: &str, handle: &str) -> Result<&PlannedEntryInputReference> {
+    pub(in crate::compiler::codegen) fn observed(&self, interaction: InteractionId) -> Result<&PlannedEntryInputReference> {
         self.observed
-            .get(&(observe.to_string(), handle.to_string()))
+            .get(&interaction)
             .and_then(|id| self.reference(*id))
-            .ok_or_else(|| ArgentError::new(format!("missing observed input reference `{observe}.{handle}`")))
-    }
-
-    pub(in crate::compiler::codegen) fn external_references(&self) -> &[PlannedEntryInputReference] {
-        &self.references[1..]
-    }
-
-    fn references(&self) -> &[PlannedEntryInputReference] {
-        &self.references
+            .ok_or_else(|| ArgentError::new(format!("missing observed input reference `{interaction:?}`")))
     }
 }
 
 pub(in crate::compiler::codegen) fn plan_entry_input_references(
+    entry_id: EntryId,
     actor: &ActorDecl,
     entry: &EntryDecl,
-    model: &Model<'_>,
-    state_values: &ContractStateValuePlan,
+    model: &AppCompilationContext<'_>,
+    state_values: &StateValueTypes,
 ) -> Result<EntryInputReferencePlan> {
-    let lowering = model.state_lowering(&actor.name)?;
-    let active = active_input_reference(actor, model, lowering, state_values)?;
+    let actor_id = entry_id.actor;
+    let lowering = model.state_lowering_by_id(actor_id)?;
+    let semantic = model.input_plan_by_id(entry_id)?;
+    if semantic.active().origin != InputReferenceOrigin::Active {
+        return Err(ArgentError::new("active input materialization has the wrong semantic origin"));
+    }
+    let active = active_input_reference(actor_id, actor, semantic.active(), model, lowering, state_values)?;
+    if active.physical_target() != &semantic.active().target {
+        return Err(ArgentError::new("active input materialization differs from its semantic target"));
+    }
     let mut references = vec![active];
     let mut consumed = BTreeMap::new();
-    let consumed_ranges = entry
-        .consumes
-        .iter()
-        .filter(|consume| matches!(consume.cardinality, crate::compiler::syntax::Cardinality::Range { .. }))
-        .map(|consume| consume.name.clone())
-        .collect();
-    let mut next_scope = 1usize;
-    for consume in &entry.consumes {
-        let target = lowering.target_for_actor(&consume.actor).ok_or_else(|| {
-            ArgentError::new(format!("actor `{}` has no input state target plan for `{}`", actor.name, consume.actor))
-        })?;
-        let proof = if model.app_actors.is_singleton_actor_self_target(&actor.name, &consume.actor) {
+    for interaction in model.entry_model_by_id(entry_id)?.current().inputs() {
+        let InteractionSource::Consume(consume) = interaction.source() else { unreachable!("current input has consume source") };
+        let requirement = semantic.consumed(interaction.id())?;
+        if requirement.origin != InputReferenceOrigin::Consumed(interaction.id()) {
+            return Err(ArgentError::new("consumed input materialization differs from its semantic origin"));
+        }
+        let target =
+            lowering.target(&requirement.target).ok_or_else(|| ArgentError::new("input requirement has no physical target"))?;
+        let proof = if requirement.authentication == InputAuthentication::CovenantDomain {
             InputTemplateProof::CovenantDomain
         } else {
-            let (prefix_len, suffix_len) = if entry_template_witness_uses_bytes(actor, entry, &consume.actor, model)? {
+            let target_id = interaction
+                .target()
+                .single_static_actor()
+                .ok_or_else(|| ArgentError::new("consumed input has no bound actor identity"))?;
+            let witness = model.witness_plan_by_id(entry_id)?.template(target_id).ok_or_else(|| {
+                ArgentError::new(format!(
+                    "entry `{}::{}` has no template witness plan for consumed actor `{}`",
+                    actor.name, entry.name, consume.actor
+                ))
+            })?;
+            let (prefix_len, suffix_len) = if witness.form == TemplateWitnessForm::Bytes {
                 (
-                    format!("{}.length", hidden_witness_prefix_name(&consume.actor)),
-                    format!("{}.length", hidden_witness_suffix_name(&consume.actor)),
+                    InputTemplateLength::BytesWitness(hidden_witness_prefix_name(&witness.actor)),
+                    InputTemplateLength::BytesWitness(hidden_witness_suffix_name(&witness.actor)),
                 )
             } else {
-                (hidden_witness_prefix_len_name(&consume.actor), hidden_witness_suffix_len_name(&consume.actor))
+                (
+                    InputTemplateLength::IntWitness(hidden_witness_prefix_len_name(&witness.actor)),
+                    InputTemplateLength::IntWitness(hidden_witness_suffix_len_name(&witness.actor)),
+                )
             };
-            InputTemplateProof::Template { prefix_len, suffix_len, template: hidden_template_name(&consume.actor) }
+            let template = hidden_template_name(&witness.actor);
+            InputTemplateProof::Template { prefix_len, suffix_len, template_ast: Box::new(SilExpr::identifier(template.clone())) }
         };
-        let id = EntryInputReferenceId(references.len());
-        let scope = EntryInputScopeId(next_scope);
-        next_scope += 1;
+        if requirement.id.0 != references.len() {
+            return Err(ArgentError::new("consumed input materialization differs from the planned reference order"));
+        }
+        let id = requirement.id;
         references.push(input_reference(
             InputReferenceSpec {
                 id,
-                scope,
-                kind: EntryInputReferenceKind::Consumed,
                 reference: consume.name.clone(),
-                lexical_root: consume.name.clone(),
                 physical_expr: hidden_consumed_input_state_name(&consume.name),
-                input_index: hidden_input_idx_name(&consume.name),
+                input_index: InputIndexExpr { expr: SilExpr::identifier(hidden_input_idx_name(&consume.name)) },
+                direct_authored_state: requirement.direct_authored_state,
             },
             proof,
             target,
             lowering,
             state_values,
             model,
+            &requirement.fields,
         )?);
-        consumed.insert(consume.name.clone(), id);
+        consumed.insert(interaction.id(), id);
     }
 
     let mut observed = BTreeMap::new();
-    for observe in &entry.observes {
-        let scope = EntryInputScopeId(next_scope);
-        next_scope += 1;
-        for input in &observe.inputs {
+    for group in model.entry_model_by_id(entry_id)?.existing_groups() {
+        let observe = group.observe().expect("existing group has observe declaration");
+        for interaction in group.inputs() {
+            let InteractionSource::ObserveInput(input) = interaction.source() else {
+                unreachable!("observed input has its source declaration")
+            };
             let reference = format!("{}.inputs.{}", observe.name, input.name);
             let physical_expr = hidden_observed_input_state_name(&observe.name, &input.name);
-            let input_index = hidden_observed_input_idx_name(&observe.name, &input.name);
-            let open_state = crate::compiler::model::observed_open_state_for_decl(actor, entry, observe, input, model)?;
-            let target = match open_state {
-                Some(state) => lowering.open_state_target(&SourceStateId::new(state)).ok_or_else(|| {
-                    ArgentError::new(format!("actor `{}` has no open input state target plan for `{}`", actor.name, input.actor))
-                })?,
-                None => lowering.target_for_actor(&input.actor).ok_or_else(|| {
-                    ArgentError::new(format!("actor `{}` has no observed input state target plan for `{}`", actor.name, input.actor))
-                })?,
-            };
-            let static_target = static_observed_actor_target(actor, entry, observe, input, model)?;
-            let in_app_target = static_target.and_then(|target| target.in_app_actor());
-            let proof =
-                if in_app_target.is_some_and(|target| model.app_actors.is_singleton_actor_self_target(&actor.name, &target.name)) {
-                    InputTemplateProof::CovenantDomain
-                } else {
-                    let spec = observed_input_spec(actor, entry, observe, input, model)?;
-                    let target_reference = static_target.map(|target| target.artifact_reference());
-                    InputTemplateProof::Template {
-                        prefix_len: target_reference
-                            .as_deref()
-                            .map_or_else(|| hidden_observed_actor_prefix_len_name(&spec), hidden_witness_prefix_len_name),
-                        suffix_len: target_reference
-                            .as_deref()
-                            .map_or_else(|| hidden_observed_actor_suffix_len_name(&spec), hidden_witness_suffix_len_name),
-                        template: observed_actor_template_expr_for_entry(actor, entry, model, observe, input, &spec)?,
-                    }
+            let requirement = semantic.observed(interaction.id())?;
+            if requirement.origin != InputReferenceOrigin::Observed(interaction.id()) {
+                return Err(ArgentError::new("observed input materialization differs from its semantic origin"));
+            }
+            let target = lowering
+                .target(&requirement.target)
+                .ok_or_else(|| ArgentError::new("observed input requirement has no physical target"))?;
+            let proof = if requirement.authentication == InputAuthentication::CovenantDomain {
+                InputTemplateProof::CovenantDomain
+            } else {
+                let spec = requirement
+                    .observed_witness
+                    .as_ref()
+                    .ok_or_else(|| ArgentError::new("observed input requirement has no witness descriptor"))?;
+                let target_reference = match &spec.template_source {
+                    ObservedTemplateSource::FixedInApp(id) => Some(model.types.display_names[id].clone()),
+                    ObservedTemplateSource::FixedLinked(id) => Some(format!("{}::{}", id.app, id.actor)),
+                    _ => None,
                 };
-            let id = EntryInputReferenceId(references.len());
+                let template_ast = match &spec.template_source {
+                    ObservedTemplateSource::FixedInApp(id) => {
+                        SilExpr::identifier(hidden_template_name(&model.types.display_names[id]))
+                    }
+                    ObservedTemplateSource::FixedLinked(id) => {
+                        SilExpr::identifier(hidden_imported_template_name(&ImportedTemplateSpec::from_linked(
+                            model
+                                .linked_actors
+                                .get(id)
+                                .ok_or_else(|| ArgentError::new("observed input has no planned fixed template target"))?,
+                        )))
+                    }
+                    ObservedTemplateSource::DynamicBinding => SilExpr::identifier(input.actor.clone()),
+                    ObservedTemplateSource::ActorTypeValue => match spec.source.as_ref() {
+                        Some(ClauseActorTypeRef::StateField { field, .. }) => {
+                            references[0].project_field_ast(field.field()).ok_or_else(|| {
+                                ArgentError::new(format!("observed actor type has no authenticated active field `{}`", field.field()))
+                            })?
+                        }
+                        Some(ClauseActorTypeRef::EntryArgument { name, .. }) => SilExpr::identifier(name.clone()),
+                        None => return Err(ArgentError::new("observed actor type has no planned value source")),
+                    },
+                    ObservedTemplateSource::Witness => SilExpr::identifier(hidden_observed_actor_template_name(spec)),
+                };
+                InputTemplateProof::Template {
+                    prefix_len: InputTemplateLength::IntWitness(
+                        target_reference
+                            .as_deref()
+                            .map_or_else(|| hidden_observed_actor_prefix_len_name(spec), hidden_witness_prefix_len_name),
+                    ),
+                    suffix_len: InputTemplateLength::IntWitness(
+                        target_reference
+                            .as_deref()
+                            .map_or_else(|| hidden_observed_actor_suffix_len_name(spec), hidden_witness_suffix_len_name),
+                    ),
+                    template_ast: Box::new(template_ast),
+                }
+            };
+            if requirement.id.0 != references.len() {
+                return Err(ArgentError::new("observed input materialization differs from the planned reference order"));
+            }
+            let id = requirement.id;
             references.push(input_reference(
                 InputReferenceSpec {
                     id,
-                    scope,
-                    kind: EntryInputReferenceKind::Observed,
                     reference,
-                    lexical_root: observe.name.clone(),
                     physical_expr,
-                    input_index,
+                    input_index: InputIndexExpr {
+                        expr: SilExpr::identifier(hidden_observed_input_idx_name(&observe.name, &input.name)),
+                    },
+                    direct_authored_state: requirement.direct_authored_state,
                 },
                 proof,
                 target,
                 lowering,
                 state_values,
                 model,
+                &requirement.fields,
             )?);
-            observed.insert((observe.name.clone(), input.name.clone()), id);
+            observed.insert(interaction.id(), id);
         }
     }
-    Ok(EntryInputReferencePlan { references, active: EntryInputReferenceId(0), consumed, consumed_ranges, observed })
+    Ok(EntryInputReferencePlan {
+        references,
+        active: EntryInputReferenceId(0),
+        consumed,
+        observed,
+        reference_uses: semantic.reference_uses.clone(),
+    })
 }
 
 fn active_input_reference(
+    actor_id: DeclId,
     actor: &ActorDecl,
-    model: &Model<'_>,
+    requirement: &InputReferenceRequirement,
+    model: &AppCompilationContext<'_>,
     lowering: &ContractStateLowering,
-    state_values: &ContractStateValuePlan,
+    state_values: &StateValueTypes,
 ) -> Result<PlannedEntryInputReference> {
     let target = lowering
-        .target_for_actor(&actor.name)
+        .target(&requirement.target)
         .ok_or_else(|| ArgentError::new(format!("actor `{}` has no active input reference target", actor.name)))?;
     let authored_sil_type = lowering
         .source_representation(target.source())
         .ok_or_else(|| ArgentError::new("active input source has no authored representation plan"))
         .and_then(|representation| render_sil_state_type(representation.sil_type()))?;
-    let expansion_specs = state_expansion_witness_specs_for_actor(actor, model);
+    let expansion_specs = model.state_expansion_witnesses_by_id(actor_id)?;
     let fields = target
         .source_fields()?
         .into_iter()
         .map(|field| {
             let name = field.source().field().to_string();
-            let sil_type = source_field_sil_type(target.source(), &name, state_values, model)?;
-            let (value, trusted_storage) = if field.is_identity() {
-                (PlannedSourceExpr::Value(name.clone()), None)
-            } else {
-                let spec = expansion_specs
-                    .iter()
-                    .find(|spec| spec.state == actor.state && spec.field == name)
-                    .ok_or_else(|| ArgentError::new(format!("active expanded field `{name}` has no validated opening plan")))?;
-                let memory_source = SourceStateId::new(&spec.memory_state);
-                let sil_type = lowering
-                    .source_representation(&memory_source)
-                    .ok_or_else(|| {
-                        ArgentError::new(format!("expanded state `{}` has no authored representation plan", spec.memory_state))
-                    })
-                    .and_then(|representation| render_sil_state_type(representation.sil_type()))?;
-                let fields = model
-                    .state(&spec.memory_state)?
-                    .fields
-                    .iter()
-                    .map(|field| (field.name.clone(), hidden_state_expansion_field_name(spec, &field.name)))
-                    .collect();
-                (PlannedSourceExpr::Struct { sil_type, fields }, Some(name.clone()))
+            let sil_type_ref = source_field_sil_type(field.source(), state_values, model)?;
+            let availability = requirement.fields.get(field.source());
+            let (ast_value, trusted_storage) = match availability {
+                Some(InputFieldAvailability::Direct) if field.is_identity() => (Some(SilExpr::identifier(name.clone())), None),
+                Some(InputFieldAvailability::CheckedPreimage) if !field.is_identity() => {
+                    let spec = expansion_specs
+                        .iter()
+                        .find(|spec| spec.field_id == *field.source())
+                        .ok_or_else(|| ArgentError::new(format!("active expanded field `{name}` has no validated opening plan")))?;
+                    let sil_type = lowering
+                        .source_representation(&spec.memory_source)
+                        .ok_or_else(|| {
+                            ArgentError::new(format!("expanded state `{}` has no authored representation plan", spec.memory_state))
+                        })
+                        .and_then(|representation| render_sil_state_type(representation.sil_type()))?;
+                    let fields = model
+                        .state_by_source(&spec.memory_source)?
+                        .fields
+                        .iter()
+                        .map(|field| (field.name.clone(), hidden_state_expansion_field_name(spec, &field.name)))
+                        .collect::<Vec<_>>();
+                    let span = SilSpan::default();
+                    let ast_fields = fields
+                        .iter()
+                        .map(|(name, binding)| SilStateFieldExpr {
+                            name: name.clone(),
+                            expr: SilExpr::identifier(binding.clone()),
+                            span,
+                            name_span: span,
+                        })
+                        .collect();
+                    let ast_value =
+                        SilExpr::new(SilExprKind::StructLiteral { name: sil_type.clone(), fields: ast_fields, name_span: span }, span);
+                    (Some(ast_value), Some(name.clone()))
+                }
+                Some(InputFieldAvailability::Unavailable) => (None, None),
+                Some(_) | None => {
+                    return Err(ArgentError::new(format!("active input field `{name}` differs from its completed availability plan")));
+                }
             };
-            Ok(PlannedSourceField { name, sil_type, value: Some(value), trusted_storage })
+            Ok(PlannedSourceField { name, sil_type_ref, ast_value, trusted_storage })
         })
         .collect::<Result<Vec<_>>>()?;
     let access = SourceStateAccess {
@@ -1300,26 +1260,14 @@ fn active_input_reference(
         fields,
         target: target.id().clone(),
     };
-    let input_index = "this.activeInputIndex".to_string();
-    let mut additional_replacements = Vec::new();
-    for spec in &expansion_specs {
-        for field in &model.state(&spec.memory_state)?.fields {
-            let local = hidden_state_expansion_field_name(spec, &field.name);
-            additional_replacements.push((format!("{}.{}.{}", word::SELF, spec.field, field.name), local.clone()));
-            additional_replacements.push((format!("{}.{}", spec.field, field.name), local));
-        }
-    }
     Ok(PlannedEntryInputReference {
         id: EntryInputReferenceId(0),
-        scope: EntryInputScopeId(0),
-        kind: EntryInputReferenceKind::Active,
         reference: word::SELF.to_string(),
-        lexical_root: word::SELF.to_string(),
-        input_index: InputIndexExpr(input_index),
-        lowered_sil_type: "State".to_string(),
+        input_index: InputIndexExpr {
+            expr: SilExpr::new(SilExprKind::Introspection(SilIntrospectionKind::ActiveInputIndex), SilSpan::default()),
+        },
         access,
         physical: None,
-        additional_replacements,
     })
 }
 
@@ -1328,14 +1276,12 @@ fn input_reference(
     proof: InputTemplateProof,
     target: &TargetPhysicalPlan,
     lowering: &ContractStateLowering,
-    state_values: &ContractStateValuePlan,
-    model: &Model<'_>,
+    state_values: &StateValueTypes,
+    model: &AppCompilationContext<'_>,
+    field_availability: &BTreeMap<SourceFieldId, InputFieldAvailability>,
 ) -> Result<PlannedEntryInputReference> {
-    let InputReferenceSpec { id, scope, kind, reference, lexical_root, physical_expr, input_index } = spec;
+    let InputReferenceSpec { id, reference, physical_expr, input_index, direct_authored_state } = spec;
     let fields = target.source_fields()?;
-    if fields.iter().any(|field| !matches!(field.physical(), PhysicalFieldId::Storage(_))) {
-        return Err(ArgentError::new("authored input fields cannot map to compiler-generated route fields"));
-    }
     let physical_sil_type = render_sil_state_type(target.sil_type())?;
     let authored_sil_type = lowering
         .source_representation(target.source())
@@ -1347,18 +1293,37 @@ fn input_reference(
         input_index: input_index.clone(),
         proof,
     };
-    let direct_authored = target.source_to_storage().is_identity()
-        && target.storage_to_physical().is_identity()
-        && physical_sil_type == authored_sil_type;
+    if direct_authored_state && physical_sil_type != authored_sil_type {
+        return Err(ArgentError::new("direct authored input type differs from its completed model plan"));
+    }
     let planned_fields = fields
         .iter()
         .map(|field| {
             let name = field.source().field().to_string();
-            let sil_type = source_field_sil_type(target.source(), &name, state_values, model)?;
+            let sil_type_ref = source_field_sil_type(field.source(), state_values, model)?;
+            let availability = field_availability
+                .get(field.source())
+                .ok_or_else(|| ArgentError::new(format!("input field `{name}` has no completed availability plan")))?;
+            let direct = match availability {
+                InputFieldAvailability::Direct if field.is_identity() => true,
+                InputFieldAvailability::Unavailable => false,
+                InputFieldAvailability::Direct | InputFieldAvailability::CheckedPreimage => {
+                    return Err(ArgentError::new(format!("input field `{name}` differs from its completed availability plan")));
+                }
+            };
             Ok(PlannedSourceField {
                 name,
-                sil_type,
-                value: field.is_identity().then(|| PlannedSourceExpr::Value(format!("{physical_expr}.{}", field.sil_name()))),
+                sil_type_ref,
+                ast_value: direct.then(|| {
+                    SilExpr::new(
+                        SilExprKind::FieldAccess {
+                            source: Box::new(SilExpr::identifier(physical_expr.clone())),
+                            field: field.sil_name().to_string(),
+                            field_span: SilSpan::default(),
+                        },
+                        SilSpan::default(),
+                    )
+                }),
                 trusted_storage: None,
             })
         })
@@ -1367,48 +1332,51 @@ fn input_reference(
         source: target.source().clone(),
         source_to_storage: target.source_to_storage().clone(),
         authored_sil_type,
-        complete: direct_authored.then(|| physical_expr.clone()),
+        complete: direct_authored_state.then(|| physical_expr.clone()),
         fields: planned_fields,
         target: target.id().clone(),
     };
-    Ok(PlannedEntryInputReference {
-        id,
-        scope,
-        kind,
-        reference,
-        lexical_root,
-        input_index: InputIndexExpr(input_index),
-        lowered_sil_type: physical_sil_type,
-        access,
-        physical: Some(physical),
-        additional_replacements: Vec::new(),
-    })
+    Ok(PlannedEntryInputReference { id, reference, input_index, access, physical: Some(physical) })
 }
 
 fn source_field_sil_type(
-    source: &SourceStateId,
-    field_name: &str,
-    state_values: &ContractStateValuePlan,
-    model: &Model<'_>,
-) -> Result<String> {
-    let source_state = model.state(source.as_str())?;
-    let storage_field = model
-        .storage_state(source.as_str())?
+    field: &SourceFieldId,
+    state_values: &StateValueTypes,
+    model: &AppCompilationContext<'_>,
+) -> Result<SilTypeRef> {
+    let source = field.state();
+    let field_name = field.field();
+    let storage_source = model.storage_source_id(source);
+    let storage_state = model.state_by_source(storage_source)?;
+    let (field_index, storage_field) = storage_state
         .fields
         .iter()
-        .find(|field| field.name == field_name)
+        .enumerate()
+        .find(|(_, field)| field.name == field_name)
         .ok_or_else(|| ArgentError::new(format!("state `{}` has no source field `{field_name}`", source.as_str())))?;
-    Ok(source_state
-        .expansion
-        .as_ref()
-        .and_then(|expansion| expansion.digests.iter().find(|digest| digest.field == field_name))
-        .and_then(|digest| state_values.authored_sil_type_for_name(&digest.state))
-        .map(str::to_string)
-        .or_else(|| state_values.sil_type_for_type_ref(&storage_field.ty))
-        .unwrap_or_else(|| lower_type_ref(&storage_field.ty, model)))
+    let type_ref = if let Some(value) = state_values.field_value(field) {
+        state_values.sil_type_ref(value)
+    } else if let Some(storage_id) = model.state_decl_id_by_source(storage_source) {
+        let resolved =
+            model.types.state_fields.get(&(storage_id, field_index)).ok_or_else(|| {
+                ArgentError::new(format!("state `{}` field `{field_name}` has no resolved type", storage_state.name))
+            })?;
+        if matches!(resolved.base, ResolvedTypeBase::State(_)) {
+            return Err(ArgentError::new(format!(
+                "state `{}` field `{field_name}` has no completed state-value plan",
+                source.as_str()
+            )));
+        }
+        super::state_types::lower_bound_type(&storage_field.ty, resolved)
+    } else if model.linked_field_sources.contains_key(&SourceFieldId::new(storage_source.clone(), field_name)) {
+        return Err(ArgentError::new(format!("state `{}` field `{field_name}` has no completed state-value plan", source.as_str())));
+    } else {
+        super::state_types::lower_planned_type(&storage_field.ty, false)
+    };
+    Ok(type_ref)
 }
 
-fn render_sil_state_type(ty: &SilStateType) -> Result<String> {
+pub(in crate::compiler::codegen) fn render_sil_state_type(ty: &SilStateType) -> Result<String> {
     Ok(match ty {
         SilStateType::State => "State".to_string(),
         SilStateType::Source(source) => source.as_str().to_string(),

@@ -4,196 +4,144 @@
 //! belong to the isolated global-function namespace.
 
 use std::collections::BTreeSet;
-use std::ops::Range;
 
-use crate::compiler::model::Model;
-use crate::compiler::syntax::{ActorDecl, FunctionDecl, TypeRef};
+use crate::compiler::model::{AppCompilationContext, CallableId, ResolvedTypeBase};
+use crate::compiler::syntax::node::{DeclId, SymbolKind};
+use crate::compiler::syntax::{ActorDecl, FunctionDecl, word};
+use crate::error::ArgentError;
 use crate::error::Result;
+use silverscript_lang::ast::visit::AstVisitorMut;
+use silverscript_lang::ast::{self as sil, FunctionAst, ParamAst};
 
-use self::bindings::{prefix_ranges, reject_expanded_field_captures};
+use super::expr::HelperExpressionLowerer;
+use super::state_types::StateValueTypes;
+use super::state_types::lower_bound_type;
 
-mod bindings;
-
-const VARIABLE_PREFIX: &str = "gen__glob_";
-
-pub(in crate::compiler::codegen) fn validate_actor_function_captures(actor: &ActorDecl, model: &Model<'_>) -> Result<()> {
-    let Some(expansion) = model.state(&actor.state)?.expansion.as_ref() else {
-        return Ok(());
-    };
-    let expanded_fields = expansion.digests.iter().map(|digest| digest.field.clone()).collect::<BTreeSet<_>>();
-    for function in &actor.functions {
-        let (source, body_span) = standalone_sil_function(function);
-        reject_expanded_field_captures(&source, body_span, &expanded_fields, &actor.name, &function.name)?;
-    }
-    Ok(())
+/// Turns retained authored helper statements into the function AST used by Sil.
+pub(in crate::compiler::codegen) struct FunctionAstLowerer<'m, 'v, 'src> {
+    model: &'m AppCompilationContext<'src>,
+    state_values: &'v StateValueTypes<'m>,
 }
 
-pub(in crate::compiler::codegen) struct GlobalFunctionLowerer {
-    constants: BTreeSet<String>,
-    actor_functions: BTreeSet<String>,
-}
-
-pub(in crate::compiler::codegen) struct LoweredFunction<'a> {
-    pub(in crate::compiler::codegen) name: &'a str,
-    pub(in crate::compiler::codegen) params: Vec<LoweredParam<'a>>,
-    pub(in crate::compiler::codegen) return_ty: Option<&'a TypeRef>,
-    pub(in crate::compiler::codegen) body: String,
-}
-
-pub(in crate::compiler::codegen) struct LoweredParam<'a> {
-    pub(in crate::compiler::codegen) ty: &'a TypeRef,
-    pub(in crate::compiler::codegen) name: String,
-}
-
-impl GlobalFunctionLowerer {
-    pub(in crate::compiler::codegen) fn new(model: &Model<'_>) -> Self {
-        let constants = model.consts.iter().map(|ct| ct.name.clone()).collect();
-        let actor_functions =
-            model.actor_models.values().flat_map(|actor| actor.functions()).map(|function| function.name.clone()).collect();
-        Self { constants, actor_functions }
+impl<'m, 'v, 'src> FunctionAstLowerer<'m, 'v, 'src> {
+    pub(in crate::compiler::codegen) fn new(model: &'m AppCompilationContext<'src>, state_values: &'v StateValueTypes<'m>) -> Self {
+        Self { model, state_values }
     }
 
-    pub(in crate::compiler::codegen) fn lower<'a>(&self, function: &'a FunctionDecl) -> Result<LoweredFunction<'a>> {
-        lower_global_function(function, &self.constants, &self.actor_functions)
-    }
-}
-
-fn lower_global_function<'a>(
-    function: &'a FunctionDecl,
-    constants: &BTreeSet<String>,
-    actor_functions: &BTreeSet<String>,
-) -> Result<LoweredFunction<'a>> {
-    let (source, body_span) = standalone_sil_function(function);
-    let ranges = prefix_ranges(&source, body_span, constants, actor_functions, &function.name)?;
-    let params = function.params.iter().map(|param| LoweredParam { ty: &param.ty, name: prefixed(&param.name) }).collect();
-    let body = apply_prefix(&function.body, &ranges);
-    Ok(LoweredFunction { name: &function.name, params, return_ty: function.return_ty.as_ref(), body })
-}
-
-pub(super) fn standalone_sil_function(function: &FunctionDecl) -> (String, Range<usize>) {
-    let params = function.params.iter().map(|param| format!("{} {}", param.ty.to_sil(), param.name)).collect::<Vec<_>>().join(", ");
-    let return_type = function.return_ty.as_ref().map(|ty| format!(" : {}", ty.to_sil())).unwrap_or_default();
-    let mut source = format!("function {}({params}){return_type} {{", function.name);
-    let body_start = source.len();
-    source.push_str(&function.body);
-    let body_end = source.len();
-    source.push('}');
-    (source, body_start..body_end)
-}
-
-fn apply_prefix(body: &str, ranges: &[Range<usize>]) -> String {
-    let mut out = String::with_capacity(body.len() + ranges.len() * VARIABLE_PREFIX.len());
-    let mut cursor = 0;
-    for range in ranges {
-        debug_assert!(cursor <= range.start && range.start <= range.end);
-        out.push_str(&body[cursor..range.start]);
-        out.push_str(VARIABLE_PREFIX);
-        out.push_str(&body[range.clone()]);
-        cursor = range.end;
-    }
-    out.push_str(&body[cursor..]);
-    out
-}
-
-fn prefixed(name: &str) -> String {
-    format!("{VARIABLE_PREFIX}{name}")
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use crate::compiler::syntax::parser::parse_module;
-
-    use super::*;
-
-    #[test]
-    fn prefixes_only_global_function_variable_identifiers() {
-        let source = r#"
-            const int LIMIT = 4;
-
-            state Turn {
-                int cycles;
-            }
-
-            fn summarize(Turn turn, int index, int[] values, int seconds, int tx) -> int {
-                /** result and values remain unchanged in documentation. */
-                int result = helper(turn.cycles, LIMIT);
-                Turn snapshot = Turn { cycles: result };
-                byte[2] marker = byte[_](0xaabb);
-                int grouped = 1_000;
-                temporal delay = 5 seconds;
-                int left, int right = pair();
-                (int total) = sum(left, right);
-                Turn { cycles: int copied } = snapshot;
-                result = values[index] + snapshot.cycles;
-                result = result + seconds + tx + total + copied;
-                int Turn = result;
-                result = Turn;
-                string note = "turn, result, values"; // values[index]
-                for (i, 0, values.length, LIMIT) {
-                    result = result + i;
-                }
-                return result + tx.inputs[index].value;
-            }
-        "#;
-        let module = parse_module(PathBuf::from("test.ag"), source.to_string()).expect("module parses");
-        let function = &module.functions[0];
-        let constants = ["LIMIT".to_string()].into_iter().collect();
-        let lowered = lower_global_function(function, &constants, &BTreeSet::new()).expect("variables prefix");
-
-        assert_eq!(lowered.params[0].name, "gen__glob_turn");
-        assert_eq!(lowered.params[1].name, "gen__glob_index");
-        assert_eq!(lowered.params[2].name, "gen__glob_values");
-        assert_eq!(lowered.params[3].name, "gen__glob_seconds");
-        assert_eq!(lowered.params[4].name, "gen__glob_tx");
-        assert_eq!(
-            lowered.body,
-            r#"
-                /** result and values remain unchanged in documentation. */
-                int gen__glob_result = helper(gen__glob_turn.cycles, LIMIT);
-                Turn gen__glob_snapshot = Turn { cycles: gen__glob_result };
-                byte[2] gen__glob_marker = byte[_](0xaabb);
-                int gen__glob_grouped = 1_000;
-                temporal gen__glob_delay = 5 seconds;
-                int gen__glob_left, int gen__glob_right = pair();
-                (int gen__glob_total) = sum(gen__glob_left, gen__glob_right);
-                Turn { cycles: int gen__glob_copied } = gen__glob_snapshot;
-                gen__glob_result = gen__glob_values[gen__glob_index] + gen__glob_snapshot.cycles;
-                gen__glob_result = gen__glob_result + gen__glob_seconds + gen__glob_tx + gen__glob_total + gen__glob_copied;
-                int gen__glob_Turn = gen__glob_result;
-                gen__glob_result = gen__glob_Turn;
-                string gen__glob_note = "turn, result, values"; // values[index]
-                for (gen__glob_i, 0, gen__glob_values.length, LIMIT) {
-                    gen__glob_result = gen__glob_result + gen__glob_i;
-                }
-                return gen__glob_result + tx.inputs[gen__glob_index].value;
-            "#
-        );
-    }
-
-    #[test]
-    fn rejects_bindings_that_shadow_shared_constants() {
-        let source = r#"
-            fn invalid_param(int LIMIT) -> int {
-                return LIMIT;
-            }
-
-            fn invalid_local() -> int {
-                int LIMIT = 2;
-                return LIMIT;
-            }
-        "#;
-        let module = parse_module(PathBuf::from("test.ag"), source.to_string()).expect("module parses");
-        let constants = ["LIMIT".to_string()].into_iter().collect();
-
-        for function in &module.functions {
-            let err =
-                lower_global_function(function, &constants, &BTreeSet::new()).err().expect("constant shadowing must be rejected");
-            assert!(
-                err.to_string().contains(&format!("global function `{}` binding `LIMIT` shadows a shared constant", function.name)),
-                "unexpected error: {err}"
-            );
+    pub(in crate::compiler::codegen) fn lower(
+        &self,
+        owner: DeclId,
+        member: Option<usize>,
+        function: &FunctionDecl,
+        actor: Option<&ActorDecl>,
+    ) -> Result<FunctionAst<'m>> {
+        let source_body = self.model.resolution.function_body(owner, member)?;
+        let global = owner.kind() == SymbolKind::Function;
+        let mut actor_fields = BTreeSet::new();
+        if actor.is_some() {
+            actor_fields.extend(self.model.storage_state_for_actor(owner)?.fields.iter().map(|field| field.name.clone()));
         }
+        let equivalent_states = self.state_values.equivalent_state_sources().map(|id| id.as_str().to_string()).collect();
+        let shared_constants = if global {
+            self.model.consts.iter().map(|(id, _)| self.model.types.display_names[id].clone()).collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        if global {
+            for param in &function.params {
+                if shared_constants.contains(&param.name) {
+                    return Err(ArgentError::new(format!(
+                        "global function `{}` binding `{}` shadows a shared constant with the same name",
+                        function.name, param.name,
+                    )));
+                }
+            }
+        }
+        let mut lowerer = HelperExpressionLowerer::new(self.model, owner, member, actor_fields, equivalent_states, shared_constants);
+        let callable_id = CallableId { owner, member };
+        let signature = self
+            .state_values
+            .signature_id(callable_id)
+            .ok_or_else(|| ArgentError::new(format!("missing contract-local signature for helper `{}`", function.name)))?;
+        let resolved = self
+            .model
+            .types
+            .callables
+            .get(&callable_id)
+            .ok_or_else(|| ArgentError::new(format!("missing resolved signature for helper `{}`", function.name)))?;
+        let params = function
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| {
+                let resolved_param = resolved
+                    .params
+                    .get(index)
+                    .ok_or_else(|| ArgentError::new(format!("missing resolved parameter {index} for helper `{}`", function.name)))?;
+                let mut type_ref = if let Some(value) = signature.param(index) {
+                    self.state_values.sil_type_ref(value)
+                } else if param.ty.name == word::COVENANT_ID
+                    || param.ty.is_actor_type()
+                    || matches!(resolved_param.base, ResolvedTypeBase::ActorEnum(_))
+                {
+                    sil::TypeRef { base: sil::TypeBase::Byte, array_dims: vec![sil::ArrayDim::Fixed(32)] }
+                } else {
+                    lower_bound_type(&param.ty, resolved_param)
+                };
+                lowerer.lower_type(&mut type_ref, sil::Span::default());
+                Ok(ParamAst {
+                    type_ref,
+                    name: lowerer
+                        .parameter_name(index)
+                        .ok_or_else(|| ArgentError::new(format!("missing bound parameter {index} for helper `{}`", function.name)))?
+                        .to_string(),
+                    span: sil::Span::default(),
+                    type_span: sil::Span::default(),
+                    name_span: sil::Span::default(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let return_types = function
+            .return_ty
+            .as_ref()
+            .map(|ty| {
+                let resolved_result = resolved
+                    .result
+                    .as_ref()
+                    .ok_or_else(|| ArgentError::new(format!("missing resolved result for helper `{}`", function.name)))?;
+                let mut type_ref = if let Some(value) = signature.result() {
+                    self.state_values.sil_type_ref(value)
+                } else if ty.name == word::COVENANT_ID
+                    || ty.is_actor_type()
+                    || matches!(resolved_result.base, ResolvedTypeBase::ActorEnum(_))
+                {
+                    sil::TypeRef { base: sil::TypeBase::Byte, array_dims: vec![sil::ArrayDim::Fixed(32)] }
+                } else {
+                    lower_bound_type(ty, resolved_result)
+                };
+                lowerer.lower_type(&mut type_ref, sil::Span::default());
+                Ok::<_, ArgentError>(type_ref)
+            })
+            .transpose()?
+            .into_iter()
+            .collect();
+        let mut body = source_body.to_vec();
+        for statement in &mut body {
+            lowerer.visit_statement(statement);
+        }
+        lowerer.finish()?;
+        Ok(FunctionAst {
+            name: if global { self.model.types.display_names[&owner].clone() } else { function.name.clone() },
+            attributes: Vec::new(),
+            params,
+            entrypoint: false,
+            return_types,
+            returns_tuple: false,
+            body,
+            return_type_spans: Vec::new(),
+            span: sil::Span::default(),
+            name_span: sil::Span::default(),
+            body_span: sil::Span::default(),
+        })
     }
 }

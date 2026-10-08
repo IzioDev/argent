@@ -1,82 +1,115 @@
-//! Source-backed compiler models shared by validation, planning, and code generation.
+//! Selected-app semantic context and domain models shared by planning and code generation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::artifact::{AppDependencyArtifact, EntryRefArtifact};
-use crate::compiler::naming::to_snake;
-use crate::compiler::syntax::{ActorDecl, ConstDecl, EntryDecl, FunctionDecl, StateDecl, TypeRef};
+use crate::compiler::resolve::{Binding, ResolvedModules, ResolvedName};
+use crate::compiler::syntax::node::{DeclId, EntryId, RootSlot, SourceNodeCursor, SymbolKind};
+use crate::compiler::syntax::{ActorDecl, ConstDecl, EntryDecl, FunctionDecl, ObserveDecl, ObservedActorDecl, StateDecl};
 use crate::error::{ArgentError, Result};
-use crate::routing::{CommitmentNode, RouteGraph, RoutePlan as PlannerRoutePlan, SelectorRequirement, route_plan};
 
-use self::link::LinkedActor;
+use self::link::{LinkedActor, LinkedActorId};
 
 mod actor;
 mod build;
 mod consts;
 mod entry;
+mod inputs;
 mod layout;
 pub(crate) mod link;
-mod source;
+mod outputs;
+mod routes;
+mod types;
 mod validate;
-pub(crate) use source::ModelSource;
-
-#[cfg(test)]
-mod tests;
+mod witnesses;
 
 pub(crate) use actor::ActorModel;
 pub(crate) use consts::{ConstIntError, ConstResolver};
 pub(crate) use entry::{
-    ActorTarget, ActorTemplateUses, ClauseActorTypeRef, CovenantGroup, CovenantIdSource, EntryInteraction, EntryModel,
-    InteractionLocation, InteractionSource, ResolvedRoute, ResolvedSuccessor, TemplateSelector, actor_enum_variant_const_expr,
+    ActorTarget, ActorTemplateUses, ClauseActorTypeRef, CovenantGroup, CovenantGroupId, CovenantIdSource, EntryInteraction,
+    EntryModel, InteractionId, InteractionLocation, InteractionSource, ResolvedRoute, ResolvedSuccessor, TemplateSelector,
     clause_actor_type_ref, observed_is_dynamic_binding, observed_open_bindings, observed_open_state_for_decl,
-    parse_actor_enum_selector, parse_actor_enum_variant, resolve_observe_covenant_id_source, source_actor_type_state_for_expr,
-    spawn_target_state,
+    resolve_observe_covenant_id_source, spawn_target_state,
+};
+pub(crate) use inputs::{
+    CurrentInputGroupPolicy, EntryInputPlan, EntryInputReferenceId, InputAuthentication, InputFieldAvailability, InputReferenceOrigin,
+    InputReferenceRequirement,
 };
 pub(crate) use layout::{
     ContractStateLowering, GeneratedFieldId, OutputPhysicalTypePlan, PhysicalFieldId, PhysicalStateLayout, PhysicalTargetId,
-    SilStateType, SourceStateId, SourceStorageRelation, TargetPhysicalPlan, build_contract_state_lowerings, packed_field_len,
+    SilStateType, SourceFieldId, SourceStateId, SourceStorageRelation, TargetPhysicalPlan, build_contract_state_lowerings,
+    packed_field_len,
+};
+pub(crate) use outputs::{ActorOutputPlan, EntryOutputPlan, GeneratedFieldSource, OutputProofRequirement, OutputTargetPlan};
+pub(crate) use routes::{
+    CompilerRoutePlan, CompilerRoutePlanner, CompilerRouteTransition, RouteFamily, RouteRootLeaf, default_route_planner,
+    infer_direct_routes,
+};
+pub(crate) use types::BoundRouteActor;
+pub(crate) use types::{
+    ActorValuePlan, CallableId, CallableSignaturePlan, FixedArrayLength, PlannedStateValue, ResolvedType, ResolvedTypeBase,
+    StateValueShape, TypeTable,
+};
+pub(crate) use witnesses::{
+    ActorTypeSourceWitnessProvider, ObservedActorSide, ObservedActorWitnessSpec, ObservedOutputFieldWitnessSpec,
+    ObservedTemplateSource, SpawnActorWitnessSpec, StateExpansionWitnessSpec, TemplateWitnessForm, TemplateWitnessSource,
+    WitnessAbiType, WitnessComponent, WitnessPlan, WitnessRole,
 };
 
-/// The selected application's compiler-wide source and routing model.
+/// The selected application's source declarations, linked dependencies, routes, and state plans.
 #[derive(Debug)]
-pub(crate) struct Model<'a> {
+pub(crate) struct AppCompilationContext<'a> {
+    pub(crate) resolution: &'a ResolvedModules<'a>,
     pub(crate) app_name: String,
+    pub(crate) types: TypeTable,
     pub(crate) declaration_origins: BTreeMap<String, link::DeclarationOrigin>,
     /// Direct artifacts used to link the selected app.
     pub(crate) app_dependencies: Vec<AppDependencyArtifact>,
     pub(crate) app_actors: AppActors,
     pub(crate) route_families: Vec<RouteFamily>,
-    pub(crate) consts: Vec<&'a ConstDecl>,
-    pub(crate) functions: Vec<&'a FunctionDecl>,
+    pub(crate) consts: Vec<(DeclId, &'a ConstDecl)>,
+    pub(crate) functions: Vec<(DeclId, &'a FunctionDecl)>,
     pub(crate) states: BTreeMap<String, &'a StateDecl>,
     pub(crate) linked_states: BTreeMap<String, StateDecl>,
+    state_names_by_source: BTreeMap<SourceStateId, String>,
+    state_decl_ids_by_source: BTreeMap<SourceStateId, DeclId>,
+    storage_source_by_source: BTreeMap<SourceStateId, SourceStateId>,
+    pub(crate) linked_field_sources: BTreeMap<SourceFieldId, SourceStateId>,
     pub(crate) actors_by_name: BTreeMap<String, &'a ActorDecl>,
-    pub(crate) linked_actor_decls: BTreeMap<String, ActorDecl>,
-    pub(crate) linked_actors: BTreeMap<String, LinkedActor>,
+    pub(crate) linked_actors: BTreeMap<LinkedActorId, LinkedActor>,
+    pub(crate) linked_actor_names: BTreeMap<String, LinkedActorId>,
     pub(crate) actor_enums: BTreeMap<String, ActorEnumInfo>,
-    pub(crate) actors: Vec<&'a ActorDecl>,
-    pub(crate) actor_models: BTreeMap<&'a str, ActorModel<'a>>,
+    pub(crate) actor_models: BTreeMap<DeclId, ActorModel<'a>>,
+    pub(crate) actor_value_plans: BTreeMap<DeclId, ActorValuePlan>,
+    pub(crate) input_plans: BTreeMap<EntryId, EntryInputPlan>,
+    pub(crate) output_plans: BTreeMap<DeclId, ActorOutputPlan>,
+    pub(crate) entry_output_plans: BTreeMap<EntryId, EntryOutputPlan>,
+    pub(crate) witness_plans: BTreeMap<EntryId, WitnessPlan>,
+    pub(crate) state_expansion_witnesses_by_actor: BTreeMap<DeclId, Vec<StateExpansionWitnessSpec>>,
     /// Delegate entries that establish each actor as a leader actor.
-    pub(crate) leader_for: BTreeMap<String, Vec<EntryRefArtifact>>,
+    pub(crate) leader_for: BTreeMap<DeclId, Vec<EntryRefArtifact>>,
     /// The planned route commitment cut carried by each app actor.
-    pub(crate) route_leaves_by_actor: BTreeMap<String, Vec<RouteRootLeaf>>,
-    pub(crate) route_transitions: BTreeMap<(String, String), CompilerRouteTransition>,
+    pub(crate) route_leaves_by_actor: BTreeMap<DeclId, Vec<RouteRootLeaf>>,
+    pub(crate) route_transitions: BTreeMap<(DeclId, DeclId), CompilerRouteTransition>,
     /// Contract-local state representation plans built after route planning.
-    pub(crate) state_lowering_by_actor: BTreeMap<String, ContractStateLowering>,
+    pub(crate) state_lowering_by_actor: BTreeMap<DeclId, ContractStateLowering>,
 }
 
 /// Ordered membership of the selected application's actor domain.
 #[derive(Debug)]
 pub(crate) struct AppActors {
     actors: Vec<String>,
-    members: BTreeSet<String>,
+    ids: Vec<DeclId>,
+    by_name: BTreeMap<String, DeclId>,
 }
 
 impl AppActors {
     /// Build ordered and membership views of the selected app's actors.
-    pub(crate) fn new(actors: Vec<String>) -> Self {
-        let members = actors.iter().cloned().collect();
-        Self { actors, members }
+    pub(crate) fn new(actors: Vec<(DeclId, String)>) -> Self {
+        let ids = actors.iter().map(|(id, _)| *id).collect();
+        let by_name = actors.iter().map(|(id, name)| (name.clone(), *id)).collect();
+        let actors = actors.into_iter().map(|(_, name)| name).collect::<Vec<_>>();
+        Self { actors, ids, by_name }
     }
 
     /// Iterate actors in app declaration order.
@@ -84,19 +117,23 @@ impl AppActors {
         self.actors.iter()
     }
 
-    /// Return whether an actor belongs to the selected app.
-    pub(crate) fn contains(&self, actor: &str) -> bool {
-        self.members.contains(actor)
+    /// Iterate selected actor identities with their artifact names in app order.
+    pub(crate) fn iter_with_ids(&self) -> impl Iterator<Item = (DeclId, &str)> {
+        self.ids.iter().copied().zip(self.actors.iter().map(String::as_str))
     }
 
-    /// Return the selected app's actor set.
-    pub(crate) fn members(&self) -> &BTreeSet<String> {
-        &self.members
+    /// Return whether an actor belongs to the selected app.
+    pub(crate) fn contains(&self, actor: &str) -> bool {
+        self.by_name.contains_key(actor)
+    }
+
+    pub(crate) fn name(&self, id: DeclId) -> Option<&str> {
+        self.ids.iter().position(|candidate| *candidate == id).map(|index| self.actors[index].as_str())
     }
 
     /// Return whether `target` is the source actor in a singleton app.
-    pub(crate) fn is_singleton_actor_self_target(&self, source_actor: &str, target: &str) -> bool {
-        self.actors.len() == 1 && self.actors[0] == source_actor && target == source_actor
+    pub(crate) fn is_singleton_actor_self_target(&self, source_actor: DeclId, target: DeclId) -> bool {
+        self.ids.as_slice() == [source_actor] && source_actor == target
     }
 }
 
@@ -108,98 +145,38 @@ pub(crate) struct ActorEnumInfo {
     pub(crate) variants: Vec<String>,
 }
 
-/// A state-local actor family represented by one ordered route table.
-///
-/// Entry actors remain direct while table actors are committed in table order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RouteFamily {
-    pub(crate) id: String,
-    pub(crate) state: String,
-    pub(crate) rep: String,
-    pub(crate) actors: Vec<String>,
-    pub(crate) entry_actors: Vec<String>,
-    pub(crate) table_actors: Vec<String>,
-}
-
-impl RouteFamily {
-    /// Return the actor representing this family.
-    pub(crate) fn rep(&self) -> &str {
-        &self.rep
-    }
-
-    /// Return family actors whose templates remain direct.
-    pub(crate) fn direct_template_actors(&self) -> &[String] {
-        &self.entry_actors
-    }
-
-    /// Return family actors committed in the route table.
-    pub(crate) fn table_actors(&self) -> &[String] {
-        &self.table_actors
-    }
-
-    /// Return the serialized byte length of the route table.
-    pub(crate) fn table_byte_len(&self) -> usize {
-        self.table_actors().len() * 32
-    }
-}
-
-/// One selected root in an actor-carried route commitment.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum RouteRootLeaf {
-    Actor(String),
-    Family(String),
-}
-
 /// A compiler-known actor target resolved without changing route membership.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum StaticActorTarget<'m> {
     /// An actor in the selected application's routing domain.
-    InApp(&'m ActorDecl),
+    InApp(DeclId),
     /// An imported actor whose template stays outside the local route graph.
     CrossApp(&'m LinkedActor),
 }
 
+/// Semantic identity of a fixed actor used by input and output plans.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum StaticActorId {
+    InApp(DeclId),
+    Linked(LinkedActorId),
+}
+
 impl<'m> StaticActorTarget<'m> {
-    /// Return the target's source state.
-    pub(crate) fn state(&self) -> &str {
+    pub(crate) fn id(self) -> StaticActorId {
         match self {
-            Self::InApp(actor) => &actor.state,
-            Self::CrossApp(actor) => &actor.state,
-        }
-    }
-
-    /// Return the stable artifact reference used by shared template witnesses.
-    pub(crate) fn artifact_reference(&self) -> String {
-        match self {
-            Self::InApp(actor) => actor.name.clone(),
-            Self::CrossApp(actor) => format!("{}::{}", actor.app, actor.actor),
-        }
-    }
-
-    /// Return the selected-app actor, if this target belongs to it.
-    pub(crate) fn in_app_actor(self) -> Option<&'m ActorDecl> {
-        match self {
-            Self::InApp(actor) => Some(actor),
-            Self::CrossApp(_) => None,
-        }
-    }
-
-    /// Compare canonical actor identity across local and imported spellings.
-    pub(crate) fn same_actor(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::InApp(left), Self::InApp(right)) => left.name == right.name,
-            (Self::CrossApp(left), Self::CrossApp(right)) => left.app == right.app && left.actor == right.actor,
-            (Self::InApp(_), Self::CrossApp(_)) | (Self::CrossApp(_), Self::InApp(_)) => false,
+            Self::InApp(id) => StaticActorId::InApp(id),
+            Self::CrossApp(actor) => StaticActorId::Linked(LinkedActorId { app: actor.app.clone(), actor: actor.actor.clone() }),
         }
     }
 }
 
-impl Model<'_> {
-    /// Return the immutable state lowering environment for one emitted actor.
-    pub(crate) fn state_lowering(&self, actor: &str) -> Result<&ContractStateLowering> {
-        self.state_lowering_by_actor
-            .get(actor)
-            .ok_or_else(|| ArgentError::new(format!("missing state lowering environment for actor `{actor}`")))
+impl AppCompilationContext<'_> {
+    /// Look up a selected actor's state lowering by its bound declaration.
+    pub(crate) fn state_lowering_by_id(&self, actor: DeclId) -> Result<&ContractStateLowering> {
+        self.state_lowering_by_actor.get(&actor).ok_or_else(|| {
+            let name = self.app_actors.name(actor).unwrap_or("<unknown>");
+            ArgentError::new(format!("missing state lowering environment for actor `{name}`"))
+        })
     }
 
     /// Resolve a local or linked state declaration.
@@ -211,45 +188,94 @@ impl Model<'_> {
             .ok_or_else(|| ArgentError::new(format!("unknown state `{name}`")))
     }
 
-    /// Resolve the physical state stored for a source state.
-    pub(crate) fn storage_state_name(&self, name: &str) -> Result<String> {
-        let state = self.state(name)?;
-        Ok(state.expansion.as_ref().map_or_else(|| name.to_string(), |expansion| expansion.base.clone()))
-    }
-
-    /// Return the physical state declaration stored for a source state.
-    pub(crate) fn storage_state(&self, name: &str) -> Result<&StateDecl> {
-        self.state(&self.storage_state_name(name)?)
-    }
-
-    /// Return whether a local or linked state is available.
-    pub(crate) fn has_state(&self, name: &str) -> bool {
-        self.states.contains_key(name) || self.linked_states.contains_key(name)
-    }
-
-    /// Iterate local followed by linked state declarations.
-    pub(crate) fn all_states(&self) -> impl Iterator<Item = &StateDecl> {
-        self.states.values().copied().chain(self.linked_states.values())
-    }
-
-    /// Resolve a local or linked actor declaration.
-    pub(crate) fn actor(&self, name: &str) -> Result<&ActorDecl> {
-        self.actors_by_name
+    /// Resolve a local or linked state to its verified declaration provenance.
+    pub(crate) fn source_state_id(&self, name: &str) -> Result<SourceStateId> {
+        self.state(name)?;
+        let origin = self
+            .declaration_origins
             .get(name)
-            .copied()
-            .or_else(|| self.linked_actor_decls.get(name))
-            .ok_or_else(|| ArgentError::new(format!("unknown actor `{name}`")))
+            .ok_or_else(|| ArgentError::new(format!("missing declaration identity for state `{name}`")))?;
+        Ok(SourceStateId::from_origin(name, origin.clone()))
     }
 
-    /// Return the physical state carried by an actor template.
-    pub(crate) fn actor_state(&self, name: &str) -> Result<&StateDecl> {
-        let actor = self.actor(name)?;
-        self.storage_state(&actor.state)
+    /// Convert a resolved source declaration to its nominal state identity.
+    pub(crate) fn source_state_id_by_decl(&self, id: DeclId) -> Result<SourceStateId> {
+        if id.kind() != SymbolKind::State {
+            return Err(ArgentError::new("resolved source identity is not a state declaration"));
+        }
+        let origin = link::DeclarationOrigin::Source {
+            path: self.resolution.declaration_path(id).to_path_buf(),
+            kind: SymbolKind::State,
+            index: id.index,
+        };
+        let source = SourceStateId::from_origin(String::new(), origin.clone());
+        let name = self
+            .state_names_by_source
+            .get(&source)
+            .ok_or_else(|| ArgentError::new("resolved state has no selected source identity"))?;
+        Ok(SourceStateId::from_origin(name, origin))
+    }
+
+    /// Read a state reference already bound at a declaration site.
+    pub(crate) fn bound_state_use(&self, owner: DeclId, slot: RootSlot) -> Result<DeclId> {
+        let cursor = SourceNodeCursor::new(owner, slot);
+        let site = self
+            .resolution
+            .nodes()
+            .find(&cursor.address)
+            .ok_or_else(|| ArgentError::new("state reference has no indexed source site"))?;
+        match self.resolution.bindings(owner).sites.get(&site) {
+            Some(Binding::Source(ResolvedName::Declaration(state))) if state.kind() == SymbolKind::State => Ok(*state),
+            _ => Err(ArgentError::new("state reference has no bound source declaration")),
+        }
+    }
+
+    /// Resolve a state through its nominal provenance, not only its display name.
+    pub(crate) fn state_by_source(&self, source: &SourceStateId) -> Result<&StateDecl> {
+        if let Some(name) = self.state_names_by_source.get(source) {
+            return self.state(name);
+        }
+        self.state(source.as_str())?;
+        Err(ArgentError::new(format!("state `{}` has conflicting source identity", source.as_str())))
+    }
+
+    pub(crate) fn storage_state_by_source(&self, source: &SourceStateId) -> Result<&StateDecl> {
+        self.state_by_source(self.storage_source_id(source))
+    }
+
+    /// Resolve a selected actor's storage state through its bound declaration.
+    pub(crate) fn storage_state_for_actor(&self, actor: DeclId) -> Result<&StateDecl> {
+        let state = *self.types.actor_states.get(&actor).ok_or_else(|| ArgentError::new("selected actor has no bound state"))?;
+        let source = self.source_state_id_by_decl(state)?;
+        self.storage_state_by_source(&source)
+    }
+
+    /// Follow a completed expansion relation by nominal source identity.
+    pub(crate) fn storage_source_id<'s>(&'s self, source: &'s SourceStateId) -> &'s SourceStateId {
+        self.storage_source_by_source.get(source).unwrap_or(source)
+    }
+
+    /// Return a selected source declaration ID when the state belongs to this build.
+    pub(crate) fn state_decl_id_by_source(&self, source: &SourceStateId) -> Option<DeclId> {
+        self.state_decl_ids_by_source.get(source).copied()
+    }
+
+    /// Iterate the verified nominal identities of local and linked states.
+    pub(crate) fn state_sources(&self) -> impl Iterator<Item = &SourceStateId> {
+        self.state_names_by_source.keys()
+    }
+
+    /// Retrieve a selected actor through its resolved declaration identity.
+    pub(crate) fn actor_by_decl(&self, id: DeclId) -> Result<&ActorDecl> {
+        self.actor_models
+            .get(&id)
+            .map(ActorModel::source)
+            .ok_or_else(|| ArgentError::new("unknown selected actor declaration identity"))
     }
 
     /// Return the route family containing an actor.
-    pub(crate) fn route_family_for_actor(&self, actor: &str) -> Option<&RouteFamily> {
-        self.route_families.iter().find(|family| family.actors.iter().any(|member| member == actor))
+    pub(crate) fn route_family_for_actor_id(&self, actor: DeclId) -> Option<&RouteFamily> {
+        self.route_families.iter().find(|family| family.actor_ids.contains(&actor))
     }
 
     /// Resolve a route family by its artifact ID.
@@ -257,78 +283,118 @@ impl Model<'_> {
         self.route_families.iter().find(|family| family.id == family_id)
     }
 
-    /// Resolve the planned cut transition between two app actors.
-    pub(crate) fn route_transition(&self, source: &str, target: &str) -> Option<&CompilerRouteTransition> {
-        self.route_transitions.get(&(source.to_string(), target.to_string()))
-    }
-
-    /// Return route families whose actors carry one state type.
-    pub(crate) fn route_families_for_state(&self, state: &str) -> Vec<&RouteFamily> {
-        self.route_families.iter().filter(|family| family.state == state).collect()
-    }
-
     /// Return delegate entries for which an actor is the leader.
-    pub(crate) fn leader_for(&self, actor: &str) -> &[EntryRefArtifact] {
-        self.leader_for.get(actor).map(Vec::as_slice).unwrap_or(&[])
+    pub(crate) fn leader_for(&self, actor: DeclId) -> &[EntryRefArtifact] {
+        self.leader_for.get(&actor).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Return whether an actor leads at least one delegate entry.
-    pub(crate) fn is_leader_actor(&self, actor: &str) -> bool {
+    pub(crate) fn is_leader_actor(&self, actor: DeclId) -> bool {
         !self.leader_for(actor).is_empty()
-    }
-
-    /// Return whether a type names an actor enum.
-    pub(crate) fn is_actor_enum_type(&self, ty: &TypeRef) -> bool {
-        ty.array.is_none() && self.actor_enums.contains_key(&ty.name)
-    }
-
-    /// Expand fixed actors and actor-enum domains to concrete actor names.
-    pub(crate) fn expand_actor_refs(&self, refs: &[String]) -> Vec<String> {
-        refs.iter()
-            .flat_map(|actor| {
-                self.actor_enums.get(actor).map_or_else(|| vec![actor.clone()], |actor_enum| actor_enum.variants.clone())
-            })
-            .collect()
     }
 
     /// Resolve a fixed selected-app or linked actor without changing routing.
     pub(crate) fn static_actor_target(&self, expression: &str) -> Option<StaticActorTarget<'_>> {
         let reference = expression.trim();
         self.app_actors
-            .contains(reference)
-            .then(|| self.actors_by_name.get(reference).copied())
-            .flatten()
+            .by_name
+            .get(reference)
+            .copied()
             .map(StaticActorTarget::InApp)
-            .or_else(|| self.linked_actors.get(reference).map(StaticActorTarget::CrossApp))
+            .or_else(|| self.linked_actor(reference).map(StaticActorTarget::CrossApp))
+    }
+
+    /// Render a bound fixed actor for contract-local witness naming.
+    pub(crate) fn static_actor_reference(&self, id: &StaticActorId) -> Result<String> {
+        match id {
+            StaticActorId::InApp(id) => self
+                .app_actors
+                .name(*id)
+                .map(str::to_string)
+                .ok_or_else(|| ArgentError::new("output proof references an unknown selected-app actor")),
+            StaticActorId::Linked(id) => self
+                .linked_actors
+                .get(id)
+                .map(|actor| format!("{}::{}", actor.app, actor.actor))
+                .ok_or_else(|| ArgentError::new("output proof references an unknown linked actor")),
+        }
+    }
+
+    /// Iterate selected and linked fixed actors by their bound identities.
+    pub(crate) fn static_actor_ids(&self) -> impl Iterator<Item = StaticActorId> + '_ {
+        self.app_actors
+            .ids
+            .iter()
+            .copied()
+            .map(StaticActorId::InApp)
+            .chain(self.linked_actors.keys().cloned().map(StaticActorId::Linked))
+    }
+
+    /// Resolve a bound actor target to its authored state identity.
+    pub(crate) fn static_actor_source_state(&self, id: &StaticActorId) -> Result<SourceStateId> {
+        match id {
+            StaticActorId::InApp(id) => {
+                let state =
+                    self.types.actor_states.get(id).ok_or_else(|| ArgentError::new("unknown selected-app actor state identity"))?;
+                self.source_state_id_by_decl(*state)
+            }
+            StaticActorId::Linked(id) => {
+                let state = &self.linked_actors.get(id).ok_or_else(|| ArgentError::new("unknown linked actor identity"))?.state;
+                self.source_state_id(state)
+            }
+        }
+    }
+
+    /// An open observed actor requires a runtime template rather than a fixed actor target.
+    pub(crate) fn static_observed_actor_target(
+        &self,
+        entry_id: EntryId,
+        actor: &ActorDecl,
+        entry: &EntryDecl,
+        observe: &ObserveDecl,
+        observed: &ObservedActorDecl,
+    ) -> Result<Option<StaticActorTarget<'_>>> {
+        if observed_open_state_for_decl(entry_id, actor, entry, observe, observed, self)?.is_some() {
+            return Ok(None);
+        }
+        let entry_model = self.entry_model_by_id(entry_id)?;
+        let id = entry_model.observed_interaction_id(observe, observed)?;
+        let interaction = entry_model
+            .existing_groups()
+            .flat_map(|group| group.inputs().iter().chain(group.outputs()))
+            .find(|interaction| interaction.id() == id)
+            .ok_or_else(|| ArgentError::new("observed actor has no normalized interaction"))?;
+        Ok(self.resolve_static_actor_target(interaction.target()))
     }
 
     /// Resolve a normalized singleton static target.
     pub(crate) fn resolve_static_actor_target(&self, target: &ActorTarget) -> Option<StaticActorTarget<'_>> {
-        target.single_static_actor().and_then(|actor| self.static_actor_target(actor))
+        match target.single_static_actor()? {
+            StaticActorId::InApp(id) => self.actor_by_decl(*id).ok().map(|_| StaticActorTarget::InApp(*id)),
+            StaticActorId::Linked(id) => self.linked_actors.get(id).map(StaticActorTarget::CrossApp),
+        }
     }
 
     /// Collect shared local and imported actor-template uses for one entry.
-    pub(crate) fn entry_template_uses(&self, actor: &ActorDecl, entry: &EntryDecl) -> Result<ActorTemplateUses> {
-        let entry_model = self.entry_model(actor, entry)?;
-        let mut uses = entry_model.actor_template_uses(&actor.name, &self.app_actors);
-
-        let insert_linked = |target: &str, actors: &mut BTreeSet<String>| {
-            if let Some(target @ StaticActorTarget::CrossApp(_)) = self.static_actor_target(target) {
-                actors.insert(target.artifact_reference());
-            }
-        };
+    pub(crate) fn entry_template_uses(&self, id: EntryId) -> Result<ActorTemplateUses> {
+        let entry_model = self.entry_model_by_id(id)?;
+        let mut uses = entry_model.actor_template_uses(entry_model.id.actor, &self.app_actors);
 
         // Current interactions are restricted to the selected app; only external
         // covenant groups can reference imported actors.
         for group in entry_model.existing_groups().chain(entry_model.genesis_groups()) {
             for interaction in group.inputs() {
                 for target in interaction.target().static_actors() {
-                    insert_linked(target, &mut uses.reads);
+                    if matches!(target, StaticActorId::Linked(_)) {
+                        uses.reads.insert(target.clone());
+                    }
                 }
             }
             for interaction in group.outputs() {
                 for target in interaction.target().static_actors() {
-                    insert_linked(target, &mut uses.writes);
+                    if matches!(target, StaticActorId::Linked(_)) {
+                        uses.writes.insert(target.clone());
+                    }
                 }
             }
         }
@@ -336,200 +402,158 @@ impl Model<'_> {
     }
 }
 
-impl<'a> Model<'a> {
-    /// Resolve an actor model in the selected application.
-    pub(crate) fn actor_model(&self, actor: &str) -> Result<&ActorModel<'a>> {
-        self.actor_models.get(actor).ok_or_else(|| ArgentError::new(format!("unknown app actor `{actor}`")))
+impl<'a> AppCompilationContext<'a> {
+    /// Visit completed entries in the selected app's declared actor order.
+    pub(crate) fn entries_in_app_order(&self) -> impl Iterator<Item = (&ActorDecl, &EntryModel<'a>)> {
+        self.app_actors.ids.iter().flat_map(|id| {
+            let actor = &self.actor_models[id];
+            actor.entries().map(move |entry| (actor.source(), entry))
+        })
+    }
+
+    /// Look up a selected actor's state-value requirements by declaration.
+    pub(crate) fn actor_value_plan_by_id(&self, actor: DeclId) -> Result<&ActorValuePlan> {
+        self.actor_value_plans.get(&actor).ok_or_else(|| {
+            let name = self.app_actors.name(actor).unwrap_or("<unknown>");
+            ArgentError::new(format!("missing value plan for actor `{name}`"))
+        })
+    }
+
+    pub(crate) fn input_plan_by_id(&self, id: EntryId) -> Result<&EntryInputPlan> {
+        self.input_plans.get(&id).ok_or_else(|| ArgentError::new(format!("missing input plan for entry `{id:?}`")))
+    }
+
+    pub(crate) fn output_plan_by_id(&self, actor: DeclId) -> Result<&ActorOutputPlan> {
+        self.output_plans.get(&actor).ok_or_else(|| {
+            let name = self.app_actors.name(actor).unwrap_or("<unknown>");
+            ArgentError::new(format!("missing output plan for actor `{name}`"))
+        })
+    }
+
+    pub(crate) fn witness_plan_by_id(&self, id: EntryId) -> Result<&WitnessPlan> {
+        self.witness_plans.get(&id).ok_or_else(|| ArgentError::new(format!("missing witness plan for entry `{id:?}`")))
+    }
+
+    pub(crate) fn entry_output_plan_by_id(&self, id: EntryId) -> Result<&EntryOutputPlan> {
+        self.entry_output_plans.get(&id).ok_or_else(|| ArgentError::new(format!("missing output proof plan for entry `{id:?}`")))
+    }
+
+    pub(crate) fn state_expansion_witnesses_by_id(&self, actor: DeclId) -> Result<&[StateExpansionWitnessSpec]> {
+        self.state_expansion_witnesses_by_actor.get(&actor).map(Vec::as_slice).ok_or_else(|| {
+            let name = self.app_actors.name(actor).unwrap_or("<unknown>");
+            ArgentError::new(format!("missing state expansion witness plan for actor `{name}`"))
+        })
     }
 
     /// Resolve the normalized model for one source entry.
-    pub(crate) fn entry_model(&self, actor: &ActorDecl, entry: &EntryDecl) -> Result<&EntryModel<'a>> {
-        self.actor_model(&actor.name)?
-            .entry(&entry.name)
-            .ok_or_else(|| ArgentError::new(format!("unknown entry model `{}::{}`", actor.name, entry.name)))
+    pub(crate) fn entry_model_by_id(&self, id: EntryId) -> Result<&EntryModel<'a>> {
+        self.actor_models
+            .get(&id.actor)
+            .and_then(|actor| actor.entry_by_id(id))
+            .ok_or_else(|| ArgentError::new("unknown selected entry identity"))
     }
 
     /// Return a linked actor by its source reference.
     pub(crate) fn linked_actor(&self, name: &str) -> Option<&LinkedActor> {
-        self.linked_actors.get(name)
+        self.linked_actors.get(self.linked_actor_names.get(name)?)
     }
 
-    /// Return selector routes visible to one entry.
-    pub(crate) fn template_selectors_for_entry(
-        &self,
-        actor: &ActorDecl,
-        entry: &EntryDecl,
-    ) -> Result<BTreeMap<String, TemplateSelector>> {
-        Ok(self.entry_model(actor, entry)?.template_selectors().clone())
+    /// Expand selector routes from a bound entry identity.
+    pub(crate) fn expanded_routes_by_id(&self, id: EntryId) -> Result<Vec<ResolvedRoute>> {
+        let entry_model = self.entry_model_by_id(id)?;
+        let mut expanded = Vec::new();
+        for route in entry_model.routes() {
+            let ResolvedSuccessor::Constructed { arity, bound, .. } = &route.successor else {
+                expanded.push(route.clone());
+                continue;
+            };
+            let selector = match bound.map(|value| value.actor_target) {
+                Some(types::BoundRouteActor::Local(local)) => entry_model.selector_for_local(local),
+                Some(types::BoundRouteActor::Selector(_)) | None => None,
+                Some(types::BoundRouteActor::Fixed(_) | types::BoundRouteActor::Linked(_) | types::BoundRouteActor::Expression(_)) => {
+                    None
+                }
+            };
+            if let Some(selector) = selector {
+                for id in selector.route_actor_ids()? {
+                    expanded.push(ResolvedRoute {
+                        id: route.id,
+                        output: route.output.clone(),
+                        successor: ResolvedSuccessor::Constructed {
+                            actor: entry::RouteActorSource::Expanded(id.clone()),
+                            arity: *arity,
+                            bound: *bound,
+                        },
+                    });
+                }
+            } else {
+                expanded.push(route.clone());
+            }
+        }
+        Ok(expanded)
     }
 
-    /// Expand one body-selected route to its concrete targets.
-    pub(crate) fn route_targets(&self, actor: &ActorDecl, entry: &EntryDecl, route: &ResolvedRoute) -> Result<Vec<String>> {
-        let ResolvedSuccessor::Constructed { actor: target, .. } = &route.successor else {
-            return Ok(vec![actor.name.clone()]);
+    /// Resolve a fixed constructed route to its semantic actor identity.
+    pub(crate) fn route_static_target_id(&self, route: &ResolvedRoute) -> Result<StaticActorId> {
+        let ResolvedSuccessor::Constructed { bound: Some(bound), .. } = &route.successor else {
+            return Err(ArgentError::new("output proof has no bound constructed route"));
         };
-        let selectors = self.template_selectors_for_entry(actor, entry)?;
-        Ok(selectors.get(target).map_or_else(|| vec![target.clone()], TemplateSelector::route_actors))
-    }
-}
-
-/// Operations that transform one actor's route cut into another's.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct CompilerRouteTransition {
-    pub(crate) families_to_open: Vec<String>,
-    pub(crate) families_to_pack: Vec<String>,
-}
-
-/// Compiler route families, actor cuts, and transitions derived for one app.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompilerRoutePlan {
-    pub(crate) families: Vec<RouteFamily>,
-    pub(crate) leaves_by_actor: BTreeMap<String, Vec<RouteRootLeaf>>,
-    pub(crate) transitions: BTreeMap<(String, String), CompilerRouteTransition>,
-}
-
-/// Injection point between compiler route modeling and generic route planning.
-pub(crate) type CompilerRoutePlanner =
-    dyn Fn(&RouteGraph, &BTreeMap<String, Vec<String>>, &[SelectorRequirement]) -> Result<PlannerRoutePlan>;
-
-pub(crate) fn default_route_planner(
-    graph: &RouteGraph,
-    domains: &BTreeMap<String, Vec<String>>,
-    selectors: &[SelectorRequirement],
-) -> Result<PlannerRoutePlan> {
-    route_plan(graph, domains, selectors).map_err(|err| ArgentError::new(err.to_string()))
-}
-
-pub(crate) fn infer_direct_routes<'a>(
-    actor_models: &BTreeMap<&'a str, ActorModel<'a>>,
-    app_actors: &AppActors,
-    route_planner: &CompilerRoutePlanner,
-) -> Result<CompilerRoutePlan> {
-    let mut graph = RouteGraph::default();
-    let mut domains = BTreeMap::<String, Vec<String>>::new();
-    let mut selector_requirements = Vec::new();
-    let mut transition_pairs = BTreeSet::new();
-
-    for actor_name in app_actors.iter() {
-        let actor_model = actor_models.get(actor_name.as_str()).expect("selected app actor has a model");
-        let actor = actor_model.source();
-        // Route-isolated actors still need an empty cut in the final plan.
-        graph.add_actor(actor.name.clone());
-        domains.entry(actor.state.clone()).or_default().push(actor.name.clone());
-        for entry_model in actor_model.entries() {
-            // Selectors constrain the table shape independently of concrete
-            // relations contributed by this entry's interaction groups.
-            selector_requirements.extend(entry_model.template_selectors().values().map(|selector| SelectorRequirement {
-                domain: selector.state.clone(),
-                source: actor.name.clone(),
-                variants: selector.variants.clone(),
-            }));
-            for group in entry_model.groups() {
-                for interaction in group.inputs() {
-                    for target in interaction.target().static_actors() {
-                        // A single-actor covenant already authenticates its only
-                        // possible template, so its self-input needs no route leaf.
-                        if app_actors.contains(target) && !app_actors.is_singleton_actor_self_target(&actor.name, target) {
-                            graph.add_consume(actor.name.clone(), target.to_string());
-                        }
-                    }
-                }
-                for interaction in group.outputs() {
-                    for target_name in interaction.target().static_actors() {
-                        if !app_actors.contains(target_name) {
-                            continue;
-                        }
-                        // A self-output adds no dependency edge. Still plan its no-op
-                        // cut transition so an actor-enum output may select the current actor.
-                        if actor.name != target_name {
-                            graph.add_emit(actor.name.clone(), target_name.to_string());
-                        }
-                        transition_pairs.insert((actor.name.clone(), target_name.to_string()));
-                    }
-                }
+        match bound.actor_target {
+            types::BoundRouteActor::Fixed(id) => Ok(StaticActorId::InApp(id)),
+            types::BoundRouteActor::Linked(member) => {
+                let id = LinkedActorId::from_member(member, self.resolution);
+                self.linked_actors
+                    .contains_key(&id)
+                    .then_some(StaticActorId::Linked(id))
+                    .ok_or_else(|| ArgentError::new("linked route has no actor identity"))
+            }
+            types::BoundRouteActor::Selector(_) | types::BoundRouteActor::Local(_) | types::BoundRouteActor::Expression(_) => {
+                Err(ArgentError::new("output proof requires one fixed actor target"))
             }
         }
     }
 
-    let plan = route_planner(&graph, &domains, &selector_requirements)?;
-    let leaves_by_actor = compiler_route_leaves(&plan)?;
-    let transitions = transition_pairs
-        .into_iter()
-        .map(|(source, target)| {
-            let transition = compiler_route_transition(&plan, &source, &target)?;
-            Ok(((source, target), transition))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let families = plan
-        .families
-        .into_iter()
-        .map(|family| {
-            let table_actors = family.table.iter().cloned().collect::<BTreeSet<_>>();
-            let entry_actors = family.members.iter().filter(|actor| !table_actors.contains(*actor)).cloned().collect();
-            RouteFamily {
-                id: route_template_family_receipt_id(&family.domain, &family.rep),
-                state: family.domain,
-                actors: family.members,
-                entry_actors,
-                rep: family.rep,
-                table_actors: family.table,
+    /// Expand a bound entry route to its concrete targets.
+    pub(crate) fn route_target_ids_by_id(&self, id: EntryId, route: &ResolvedRoute) -> Result<Vec<StaticActorId>> {
+        let entry_model = self.entry_model_by_id(id)?;
+        let actor = self.actor_by_decl(id.actor)?;
+        let entry = entry_model.source();
+        let ResolvedSuccessor::Constructed { bound, .. } = &route.successor else {
+            return Ok(vec![StaticActorId::InApp(entry_model.id.actor)]);
+        };
+        let bound = bound
+            .ok_or_else(|| ArgentError::new(format!("entry `{}::{}` has an unbound constructed successor", actor.name, entry.name)))?;
+        match bound.actor_target {
+            types::BoundRouteActor::Fixed(id) => Ok(vec![StaticActorId::InApp(id)]),
+            types::BoundRouteActor::Linked(member) => {
+                let id = LinkedActorId::from_member(member, self.resolution);
+                self.linked_actors
+                    .contains_key(&id)
+                    .then_some(id)
+                    .map(StaticActorId::Linked)
+                    .map(|id| vec![id])
+                    .ok_or_else(|| ArgentError::new("linked route has no actor identity"))
             }
-        })
-        .collect();
-
-    Ok(CompilerRoutePlan { families, leaves_by_actor, transitions })
-}
-
-fn compiler_route_leaves(plan: &PlannerRoutePlan) -> Result<BTreeMap<String, Vec<RouteRootLeaf>>> {
-    let mut leaves_by_actor = BTreeMap::new();
-    for actor in plan.commitments.cuts.keys() {
-        let nodes = plan.commitments.cut_nodes(actor).expect("an actor with a planned cut must resolve its cut nodes");
-        let mut leaves = Vec::new();
-        for node in nodes {
-            leaves.push(compiler_route_leaf(plan, node)?);
-        }
-        leaves_by_actor.insert(actor.clone(), leaves);
-    }
-    Ok(leaves_by_actor)
-}
-
-fn compiler_route_transition(plan: &PlannerRoutePlan, source: &str, target: &str) -> Result<CompilerRouteTransition> {
-    let transition = plan.commitments.cut_transition(source, target).map_err(|err| ArgentError::new(err.to_string()))?;
-    let families_to_open =
-        transition.branches_to_open.into_iter().map(|branch| compiler_route_family_id(plan, branch)).collect::<Result<Vec<_>>>()?;
-    let families_to_pack =
-        transition.branches_to_pack.into_iter().map(|branch| compiler_route_family_id(plan, branch)).collect::<Result<Vec<_>>>()?;
-    Ok(CompilerRouteTransition { families_to_open, families_to_pack })
-}
-
-fn compiler_route_family_id(plan: &PlannerRoutePlan, branch: &CommitmentNode) -> Result<String> {
-    let RouteRootLeaf::Family(id) = compiler_route_leaf(plan, branch)? else {
-        return Err(ArgentError::new("commitment transition operation must reference a route family branch"));
-    };
-    Ok(id)
-}
-
-fn compiler_route_leaf(plan: &PlannerRoutePlan, node: &CommitmentNode) -> Result<RouteRootLeaf> {
-    match node {
-        CommitmentNode::Leaf { actor } => Ok(RouteRootLeaf::Actor(actor.clone())),
-        CommitmentNode::Branch { children } => {
-            let mut table = Vec::new();
-            for child in children {
-                let CommitmentNode::Leaf { actor } = child else {
-                    return Err(ArgentError::new("nested commitment families cannot be lowered by the compiler"));
-                };
-                table.push(actor.clone());
-            }
-            let family = plan
-                .families
-                .iter()
-                .find(|family| family.table == table)
-                .ok_or_else(|| ArgentError::new(format!("commitment branch {:?} has no matching route family", table)))?;
-            Ok(RouteRootLeaf::Family(route_template_family_receipt_id(&family.domain, &family.rep)))
+            types::BoundRouteActor::Selector(id) => self
+                .types
+                .enum_variants
+                .get(&id)
+                .map(|variants| variants.iter().copied().map(StaticActorId::InApp).collect())
+                .ok_or_else(|| ArgentError::new(format!("entry `{}::{}` has an unbound route selector", actor.name, entry.name))),
+            types::BoundRouteActor::Local(local) => entry_model
+                .selector_for_local(local)
+                .ok_or_else(|| {
+                    ArgentError::new(format!(
+                        "entry `{}::{}` routes through a local without an actor selector",
+                        actor.name, entry.name
+                    ))
+                })?
+                .route_actor_ids()
+                .map(<[StaticActorId]>::to_vec),
+            types::BoundRouteActor::Expression(_) => Err(ArgentError::new(format!(
+                "entry `{}::{}` has a route target without a resolved actor or selector",
+                actor.name, entry.name
+            ))),
         }
     }
-}
-
-fn route_template_family_receipt_id(state: &str, rep_actor: &str) -> String {
-    format!("route_family/{state}/{}", to_snake(rep_actor))
 }

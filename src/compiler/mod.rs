@@ -2,8 +2,10 @@
 //!
 //! Each child module owns one stage or shared representation of compilation.
 
+pub(crate) mod app_graph;
 pub(crate) mod codegen;
 pub(crate) mod loader;
 pub(crate) mod model;
 pub(crate) mod naming;
+pub(crate) mod resolve;
 pub(crate) mod syntax;

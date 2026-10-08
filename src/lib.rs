@@ -2,10 +2,7 @@
 //!
 //! Compiler internals remain private behind file and inline build operations.
 
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, path::Path};
 
 use compiler::loader;
 
@@ -81,9 +78,16 @@ pub fn build_inline(
     out_dir: impl AsRef<Path>,
 ) -> Result<artifact::Artifact> {
     let source_label = source_label.as_ref().to_path_buf();
-    let program = inline_program(source_label, source.into())?;
-    compiler::codegen::emit_resolved_build(&program, out_dir.as_ref())?;
-    read_artifact(out_dir.as_ref())
+    loader::SourceSet::discover_inline(source_label, source.into())?.with_resolved(|program| {
+        let model = compiler::model::AppCompilationContext::from_resolved(
+            &program,
+            None,
+            &BTreeMap::new(),
+            &compiler::model::default_route_planner,
+        )?;
+        compiler::codegen::emit_build_model(&program, &model, out_dir.as_ref())?;
+        read_artifact(out_dir.as_ref())
+    })
 }
 
 /// Build a file-backed Argent app into `out_dir` and return its artifact.
@@ -93,14 +97,21 @@ pub fn build_inline(
 pub fn build_file(input: impl AsRef<Path>, out_dir: impl AsRef<Path>) -> Result<artifact::Artifact> {
     let input = input.as_ref();
     let out_dir = out_dir.as_ref();
-    let program = loader::load_program(input)?;
-    let root = program.root_module();
-    if let [app] = root.apps.as_slice() {
-        let app_name = app.name.clone();
-        return Ok(build_app_graph(loader::plan_app_graph(program, &app_name)?, &app_name, out_dir)?.into_primary());
-    }
-    compiler::codegen::emit_resolved_build(&program, out_dir)?;
-    read_artifact(out_dir)
+    loader::SourceSet::discover_file(input)?.with_resolved(|program| {
+        let root = program.root_module();
+        if let [app] = root.apps.as_slice() {
+            let app_name = app.name.clone();
+            return Ok(build_app_graph(loader::plan_app_graph(program, &app_name)?, &app_name, out_dir)?.into_primary());
+        }
+        let model = compiler::model::AppCompilationContext::from_resolved(
+            &program,
+            None,
+            &BTreeMap::new(),
+            &compiler::model::default_route_planner,
+        )?;
+        compiler::codegen::emit_build_model(&program, &model, out_dir)?;
+        read_artifact(out_dir)
+    })
 }
 
 /// Build one named app from a file that declares multiple apps.
@@ -119,8 +130,8 @@ pub fn build_file_app(input: impl AsRef<Path>, app_name: &str, out_dir: impl AsR
 /// are written below `out_dir/apps/<AppName>`. The selected app keeps the
 /// existing `out_dir` layout.
 pub fn build_file_app_bundle(input: impl AsRef<Path>, app_name: &str, out_dir: impl AsRef<Path>) -> Result<CompiledAppBundle> {
-    let apps = loader::load_app_graph(input.as_ref(), app_name)?;
-    build_app_graph(apps, app_name, out_dir.as_ref())
+    loader::SourceSet::discover_file(input.as_ref())?
+        .with_resolved(|program| build_app_graph(loader::plan_app_graph(program, app_name)?, app_name, out_dir.as_ref()))
 }
 
 /// Compile the only app declared in a source file, including its dependencies.
@@ -128,20 +139,16 @@ pub fn build_file_app_bundle(input: impl AsRef<Path>, app_name: &str, out_dir: i
 /// Use [`build_file_app_bundle`] when the file declares more than one app.
 pub fn build_file_bundle(input: impl AsRef<Path>, out_dir: impl AsRef<Path>) -> Result<CompiledAppBundle> {
     let input = input.as_ref();
-    let program = loader::load_program(input)?;
-    let [app] = program.root_module().apps.as_slice() else {
-        return Err(ArgentError::at(input, "expected exactly one app in the source file; select an app with --app"));
-    };
-    let app_name = app.name.clone();
-    let apps = loader::plan_app_graph(program, &app_name)?;
-    build_app_graph(apps, &app_name, out_dir.as_ref())
+    loader::SourceSet::discover_file(input)?.with_resolved(|program| {
+        let [app] = program.root_module().apps.as_slice() else {
+            return Err(ArgentError::at(input, "expected exactly one app in the source file; select an app with --app"));
+        };
+        let app_name = app.name.clone();
+        build_app_graph(loader::plan_app_graph(program, &app_name)?, &app_name, out_dir.as_ref())
+    })
 }
 
-fn build_app_graph(
-    apps: Vec<(loader::SourceApp, Vec<loader::SourceApp>, loader::ResolvedModules)>,
-    app_name: &str,
-    out_dir: &Path,
-) -> Result<CompiledAppBundle> {
+fn build_app_graph(apps: compiler::app_graph::AppGraphPlan<'_>, app_name: &str, out_dir: &Path) -> Result<CompiledAppBundle> {
     let dependency_dir = out_dir.join("apps");
     if dependency_dir.exists() {
         std::fs::remove_dir_all(&dependency_dir)?;
@@ -149,7 +156,10 @@ fn build_app_graph(
 
     let mut artifacts = BTreeMap::<String, artifact::Artifact>::new();
     let mut origins = BTreeMap::new();
-    for (index, (source_app, dependencies, program)) in apps.iter().enumerate() {
+    for (index, unit) in apps.units().iter().enumerate() {
+        let source_app = &unit.source_app;
+        let dependencies = &unit.dependencies;
+        let program = apps.program_for(unit);
         let linked = dependencies
             .iter()
             .map(|dependency| {
@@ -167,8 +177,15 @@ fn build_app_graph(
                     })
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let app_out = if index + 1 == apps.len() { out_dir.to_path_buf() } else { dependency_dir.join(&source_app.app) };
-        let app_origins = compiler::codegen::emit_build_app_linked(program, &source_app.app, &linked, &app_out)?;
+        let app_out = if index + 1 == apps.units().len() { out_dir.to_path_buf() } else { dependency_dir.join(&source_app.app) };
+        let model = compiler::model::AppCompilationContext::from_resolved(
+            &program,
+            Some(&source_app.app),
+            &linked,
+            &compiler::model::default_route_planner,
+        )?;
+        let app_origins = model.declaration_origins.clone();
+        compiler::codegen::emit_build_model(&program, &model, &app_out)?;
         origins.insert(source_app.app.clone(), app_origins);
         let artifact = read_artifact(&app_out)?;
         if artifacts.insert(source_app.app.clone(), artifact).is_some() {
@@ -180,10 +197,6 @@ fn build_app_graph(
     }
 
     Ok(CompiledAppBundle { primary_app: app_name.to_string(), artifacts })
-}
-
-fn inline_program(source_label: PathBuf, source: String) -> Result<loader::ResolvedModules> {
-    loader::load_inline_program(source_label, source)
 }
 
 #[cfg(test)]

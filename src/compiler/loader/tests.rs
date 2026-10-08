@@ -1,87 +1,5 @@
 use super::*;
-use crate::compiler::model::Model;
-
-#[test]
-fn source_bindings_respect_lexical_scopes_and_preserve_authored_text() {
-    let program = load_inline_program(
-        PathBuf::from("scopes.ag"),
-        r#"
-        const int LIMIT = 1;
-        const int PARAM = 2;
-        const int INDEX = 3;
-        const int PAIR = 4;
-        state Item { int LIMIT; }
-        fn scoped(int PARAM) -> int {
-            int result = LIMIT;
-            { int LIMIT = 5; result = result + LIMIT; }
-            for (INDEX, 0, 2, 2) { result = result + INDEX; }
-            { int left, int PAIR = pair(); result = result + PAIR; }
-            Item item = Item { LIMIT: result };
-            result = result + item.LIMIT;
-            return result + LIMIT + PARAM + INDEX;
-        }
-    "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let function = program.root_declarations().find(|id| id.kind() == SymbolKind::Function).unwrap();
-    let ResolvedDeclaration::Function(authored) = program.declaration(function) else {
-        panic!("function expected");
-    };
-    let text_before = authored.body.clone();
-    let references = &program.bindings(function).text[&TextSite::Function(0)];
-    let names = references
-        .iter()
-        .map(|reference| {
-            let ResolvedName::Declaration(id) = reference.target else {
-                panic!("declaration expected");
-            };
-            let name = program.declaration(id).name().to_string();
-            // reference span correctness
-            assert_eq!(&authored.body[reference.span.start..reference.span.end], name);
-            name
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(names, ["LIMIT", "Item", "Item", "LIMIT", "INDEX"]);
-    let closure = program.declaration_closure([function]);
-    assert!(!closure.iter().any(|id| matches!(program.declaration(*id).name(), "PARAM" | "PAIR")));
-    assert_eq!(program.root_module().functions[0].body, text_before);
-}
-
-#[test]
-fn source_bindings_distinguish_numeric_units_from_declaration_references() {
-    for unit in ["seconds", "minutes", "hours", "days", "weeks", "litras", "grains", "kas"] {
-        let ty = if matches!(unit, "litras" | "grains" | "kas") { "int" } else { "temporal" };
-        let program = load_inline_program(
-            PathBuf::from("numeric-units.ag"),
-            format!(
-                r#"
-                const int {unit} = 2;
-                state S {{ int count; }}
-                actor A owns S {{
-                    entry inspect() emits none {{
-                        {ty} value = 5 {unit};
-                        require(count + {unit} + int(value) >= 0);
-                    }}
-                }}
-            "#
-            ),
-        )
-        .expect("source resolves");
-        let actor = program.root_declarations().find(|id| id.kind() == SymbolKind::Actor).unwrap();
-        let ResolvedDeclaration::Actor(item) = program.declaration(actor) else {
-            panic!("actor expected");
-        };
-        // all references for the first (only) entry
-        let references = &program.bindings(actor).text[&TextSite::Entry(0)];
-        // should only contains one, at usage (2nd line)
-        assert_eq!(references.len(), 1, "{unit}: only the constant use should bind");
-        let body = item.entries[0].body.text();
-        let reference = &references[0];
-        assert_eq!(&body[reference.span.start..reference.span.end], unit);
-        assert!(body[..reference.span.start].ends_with("count + "));
-    }
-}
+use crate::compiler::model::AppCompilationContext;
 
 #[test]
 fn selected_apps_reject_duplicate_actor_exports_instead_of_renaming_them() {
@@ -98,7 +16,8 @@ fn selected_apps_reject_duplicate_actor_exports_instead_of_renaming_them() {
     )
     .unwrap();
     let program = load_program(temp.join("root.ag")).expect("module namespaces are distinct");
-    let error = crate::compiler::model::ModelSource::new(&program, Some("Test")).expect_err("app exports must be unambiguous");
+    let app = program.root_app(Some("Test")).expect("test app resolves").expect("test app exists");
+    let error = program.app_actor_ids(app).expect_err("app exports must be unambiguous");
     assert!(error.to_string().contains("selected app exports actor name `A` more than once"), "{error}");
     fs::remove_dir_all(temp).unwrap();
 }
@@ -127,14 +46,24 @@ state Wrapper {
     let wrapper = root.states.iter().find(|state| state.name == "Wrapper").expect("wrapper state is loaded");
     assert_eq!(wrapper.fields[0].ty.name, "assets::shared::Stored");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("resolved declarations build the compiler model");
+    let model = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("resolved declarations build the compiler model");
     let imported_name = model
         .states
         .keys()
         .find(|name| name.ends_with("__Stored"))
         .expect("the namespaced state receives a collision-safe internal name");
-    assert_eq!(model.states["Wrapper"].fields[0].ty.name, *imported_name);
+    let wrapper_id = model.types.names["Wrapper"];
+    let imported_id = match program.bindings(wrapper_id).names.get("assets::shared::Stored") {
+        Some(crate::compiler::resolve::ResolvedName::Declaration(id)) => *id,
+        _ => panic!("namespaced field type has a bound declaration"),
+    };
+    assert_eq!(model.types.display_names[&imported_id], *imported_name);
     assert!(model.states.contains_key("Stored"), "the root declaration keeps its source name");
 
     let _ = fs::remove_dir_all(temp);
@@ -168,13 +97,43 @@ fn app_graph_orders_and_deduplicates_diamond_dependencies() {
     );
 
     let graph = load_app_graph(temp.join("root.ag"), "RootApp").expect("app graph loads");
-    assert_eq!(graph.iter().map(|(app, _, _)| app.app.as_str()).collect::<Vec<_>>(), ["SharedApp", "LeftApp", "RightApp", "RootApp"]);
-    assert_eq!(graph.iter().filter(|(app, _, _)| app.app == "SharedApp").count(), 1);
-    let (_, root_dependencies, root_program) = graph.last().unwrap();
-    assert_eq!(root_dependencies.iter().map(|dependency| dependency.app.as_str()).collect::<Vec<_>>(), ["LeftApp", "RightApp"]);
-    assert_eq!(root_program.module_paths().count(), 4, "module imports retain the complete source graph");
+    assert_eq!(
+        graph.units().iter().map(|unit| unit.source_app.app.as_str()).collect::<Vec<_>>(),
+        ["SharedApp", "LeftApp", "RightApp", "RootApp"]
+    );
+    assert_eq!(graph.units().iter().filter(|unit| unit.source_app.app == "SharedApp").count(), 1);
+    let root = graph.units().last().unwrap();
+    assert_eq!(root.dependencies.iter().map(|dependency| dependency.app.as_str()).collect::<Vec<_>>(), ["LeftApp", "RightApp"]);
+    assert_eq!(graph.program_for(root).module_paths().count(), 4, "module imports retain the complete source graph");
+    let left = graph.program_for(&graph.units()[1]);
+    let right = graph.program_for(&graph.units()[2]);
+    assert_eq!(
+        left.module_paths().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        ["left.ag", "shared.ag"],
+    );
+    assert_eq!(
+        right.module_paths().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        ["right.ag", "shared.ag"],
+    );
 
     let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn inline_display_label_cannot_shadow_a_standard_source_identity() {
+    let program = load_inline_program(PathBuf::from("std::core"), "import \"std::core\";".to_string())
+        .expect("inline and standard sources have distinct identities");
+    assert_eq!(program.module_paths().count(), 2);
+}
+
+#[test]
+fn discovery_finds_imports_after_other_top_level_declarations() {
+    let program = load_inline_program(
+        PathBuf::from("late-import.ag"),
+        "const int VALUE = 1; fn helper() { int import = VALUE; } import \"std::core\";".to_string(),
+    )
+    .expect("late standard import is discovered and parsed");
+    assert_eq!(program.module_paths().count(), 2);
 }
 
 #[test]
@@ -206,10 +165,10 @@ app ControllerApp {
     .expect("controller source written");
 
     let graph = load_app_graph(temp.join("controller.ag"), "ControllerApp").expect("module app dependency graph loads");
-    assert_eq!(graph.iter().map(|(app, _, _)| app.app.as_str()).collect::<Vec<_>>(), ["AssetApp", "ControllerApp"]);
-    let (_, dependencies, program) = graph.last().unwrap();
-    assert_eq!(dependencies.iter().map(|dependency| dependency.app.as_str()).collect::<Vec<_>>(), ["AssetApp"]);
-    assert_eq!(program.module_paths().count(), 2, "ordinary imports retain shared source declarations");
+    assert_eq!(graph.units().iter().map(|unit| unit.source_app.app.as_str()).collect::<Vec<_>>(), ["AssetApp", "ControllerApp"]);
+    let root = graph.units().last().unwrap();
+    assert_eq!(root.dependencies.iter().map(|dependency| dependency.app.as_str()).collect::<Vec<_>>(), ["AssetApp"]);
+    assert_eq!(graph.program_for(root).module_paths().count(), 2, "ordinary imports retain shared source declarations");
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -221,9 +180,9 @@ fn module_apps_without_qualified_references_remain_shared_source() {
     write_app(&temp.join("root.ag"), "import \"./shared.ag\";", "RootApp", "Root", &[]);
 
     let graph = load_app_graph(temp.join("root.ag"), "RootApp").expect("shared source module loads");
-    assert_eq!(graph.iter().map(|(app, _, _)| app.app.as_str()).collect::<Vec<_>>(), ["RootApp"]);
-    assert!(graph[0].1.is_empty());
-    assert_eq!(graph[0].2.module_paths().count(), 2);
+    assert_eq!(graph.units().iter().map(|unit| unit.source_app.app.as_str()).collect::<Vec<_>>(), ["RootApp"]);
+    assert!(graph.units()[0].dependencies.is_empty());
+    assert_eq!(graph.program_for(&graph.units()[0]).module_paths().count(), 2);
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -325,51 +284,4 @@ app {app} {{
         ),
     )
     .expect("app source is written");
-}
-
-#[test]
-fn unknown_bare_body_type_is_rejected() {
-    let error = load_inline_program(PathBuf::from("unknown-body-type.ag"), "fn check() { Missing value = { n: 1 }; }".to_string())
-        .expect_err("body types must resolve before modeling");
-    assert!(error.to_string().contains("unknown export `Missing`"), "{error}");
-}
-
-#[test]
-fn unresolved_spawn_target_is_rejected() {
-    let error = load_inline_program(
-        PathBuf::from("unknown-spawn-target.ag"),
-        r#"
-        state S {}
-        actor Root owns S {
-            entry launch() spawns children by id { outputs { child: Missing, } } emits none {}
-        }
-        "#
-        .to_string(),
-    )
-    .expect_err("static spawn targets must resolve before modeling");
-    assert!(error.to_string().contains("unknown export `Missing`"), "{error}");
-}
-
-#[test]
-fn unresolved_qualified_body_reference_is_rejected() {
-    let error = load_inline_program(PathBuf::from("unknown-qualified-reference.ag"), "fn check() { missing::value(); }".to_string())
-        .expect_err("qualified body references must resolve before modeling");
-    assert!(error.to_string().contains("unresolved qualified reference `missing::value`"), "{error}");
-}
-
-#[test]
-fn unknown_actor_enum_variant_is_rejected() {
-    let error = load_inline_program(
-        PathBuf::from("unknown-enum-variant.ag"),
-        r#"
-        state S {}
-        actor A owns S {}
-        actor B owns S {}
-        actor enum Kind { A; B; }
-        fn check() { Kind::Missing; }
-        "#
-        .to_string(),
-    )
-    .expect_err("enum variants must belong to their declared enum");
-    assert!(error.to_string().contains("actor enum `Kind` has no variant `Missing`"), "{error}");
 }

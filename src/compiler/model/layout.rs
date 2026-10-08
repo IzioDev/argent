@@ -4,42 +4,99 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::compiler::naming::to_snake;
 use crate::compiler::syntax::lexer::RESERVED_GENERATED_PREFIX;
+use crate::compiler::syntax::node::{DeclId, EntryId, RootSlot};
 use crate::compiler::syntax::word;
 use crate::compiler::syntax::{ArrayDim, TypeRef};
 use crate::error::{ArgentError, Result};
 
-use super::{InteractionSource, Model, RouteFamily, RouteRootLeaf, observed_open_state_for_decl, spawn_target_state};
+use super::link::DeclarationOrigin;
+use super::types::ResolvedTypeBase;
+use super::{
+    AppCompilationContext, InteractionSource, RouteFamily, RouteRootLeaf, StaticActorId, observed_open_state_for_decl,
+    spawn_target_state,
+};
 
 #[cfg(test)]
 mod tests;
 
-/// Canonical identity of one unqualified source-state type in a compiled model.
-/// Equivalent local or linked declarations with the same name share this ID.
+/// Nominal source-state identity; names are retained for artifact and Sil rendering.
+#[derive(Clone, Debug)]
+pub(crate) struct SourceStateId {
+    identity: StateIdentity,
+    name: String,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct SourceStateId(String);
+enum StateIdentity {
+    Source(DeclarationOrigin),
+}
+
+impl PartialEq for SourceStateId {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for SourceStateId {}
+
+impl PartialOrd for SourceStateId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SourceStateId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.identity.cmp(&other.identity)
+    }
+}
 
 impl SourceStateId {
-    pub(crate) fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
+    pub(crate) fn from_origin(name: impl Into<String>, origin: DeclarationOrigin) -> Self {
+        Self { identity: StateIdentity::Source(origin), name: name.into() }
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        &self.name
     }
 }
 
 /// Identity of one storage payload declaration.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct StorageStateId(String);
+pub(crate) struct StorageStateId(SourceStateId);
 
-/// Canonical actor identity across local and linked source spellings.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+/// A bound actor identity with its stable actor label for Sil and artifacts.
+#[derive(Clone, Debug)]
 pub(crate) struct CompiledActorId {
-    app: String,
+    identity: StaticActorId,
     actor: String,
 }
 
+impl PartialEq for CompiledActorId {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for CompiledActorId {}
+
+impl PartialOrd for CompiledActorId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CompiledActorId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.identity.cmp(&other.identity)
+    }
+}
+
 impl CompiledActorId {
+    pub(crate) fn identity(&self) -> &StaticActorId {
+        &self.identity
+    }
+
     pub(crate) fn actor(&self) -> &str {
         &self.actor
     }
@@ -53,6 +110,10 @@ pub(crate) struct SourceFieldId {
 }
 
 impl SourceFieldId {
+    pub(crate) fn new(state: SourceStateId, field: impl Into<String>) -> Self {
+        Self { state, field: field.into() }
+    }
+
     pub(crate) fn state(&self) -> &SourceStateId {
         &self.state
     }
@@ -116,11 +177,6 @@ impl LayoutField {
     pub(crate) fn sil_type(&self) -> &str {
         &self.sil_type
     }
-
-    #[cfg(test)]
-    fn packed_len(&self) -> usize {
-        self.packed_len
-    }
 }
 
 /// Ordered physical fields accepted by a SIL state builtin.
@@ -156,13 +212,6 @@ pub(crate) struct SourceStateLayout {
     fields: Vec<(SourceFieldId, TypeRef)>,
 }
 
-impl SourceStateLayout {
-    #[cfg(test)]
-    fn field_id(&self, name: &str) -> Option<&SourceFieldId> {
-        self.fields.iter().find_map(|(id, _)| (id.field() == name).then_some(id))
-    }
-}
-
 /// Fixed-width fields stored for one source state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StorageStateLayout {
@@ -186,22 +235,6 @@ pub(crate) enum SourceStorageRelation {
 impl SourceStorageRelation {
     pub(crate) fn is_identity(&self) -> bool {
         matches!(self, Self::Identity { .. })
-    }
-
-    #[cfg(test)]
-    fn storage_field(&self, source: &SourceFieldId) -> Option<&StorageFieldId> {
-        let fields = match self {
-            Self::Identity { fields } | Self::Expanded { fields } => fields,
-        };
-        fields.iter().find_map(|field| match field {
-            SourceFieldLowering::Identity { source: candidate, storage }
-            | SourceFieldLowering::Digest { source: candidate, storage, .. }
-                if candidate == source =>
-            {
-                Some(storage)
-            }
-            SourceFieldLowering::Identity { .. } | SourceFieldLowering::Digest { .. } => None,
-        })
     }
 
     pub(crate) fn fields(&self) -> &[SourceFieldLowering] {
@@ -373,11 +406,6 @@ impl TargetPhysicalPlan {
     }
 
     /// Nominal identity remains separate from physical compatibility.
-    #[cfg(test)]
-    fn has_source_identity(&self, requested: &SourceStateId) -> bool {
-        &self.source == requested
-    }
-
     /// Resolve authored fields through both layout relations without positions.
     pub(crate) fn source_fields(&self) -> Result<Vec<SourcePhysicalField>> {
         self.source_to_storage
@@ -447,21 +475,6 @@ impl ContractStateLayout {
     pub(crate) fn physical(&self) -> &PhysicalStateLayout {
         &self.physical
     }
-
-    #[cfg(test)]
-    fn source(&self) -> &SourceStateLayout {
-        &self.source
-    }
-
-    #[cfg(test)]
-    fn source_to_storage(&self) -> &SourceStorageRelation {
-        &self.source_to_storage
-    }
-
-    #[cfg(test)]
-    fn storage_to_physical(&self) -> &StoragePhysicalRelation {
-        &self.storage_to_physical
-    }
 }
 
 /// Immutable state lowering environment owned by one emitted contract.
@@ -471,7 +484,7 @@ pub(crate) struct ContractStateLowering {
     source_representations: BTreeMap<SourceStateId, SourceRepresentationPlan>,
     target_physical: BTreeMap<PhysicalTargetId, TargetPhysicalPlan>,
     output_physical_types: BTreeMap<PhysicalTargetId, OutputPhysicalTypePlan>,
-    actor_targets: BTreeMap<String, PhysicalTargetId>,
+    actor_targets: BTreeMap<StaticActorId, PhysicalTargetId>,
 }
 
 impl ContractStateLowering {
@@ -487,11 +500,19 @@ impl ContractStateLowering {
         &self.source_representations
     }
 
+    pub(crate) fn output_physical_types(&self) -> impl Iterator<Item = &OutputPhysicalTypePlan> {
+        self.output_physical_types.values()
+    }
+
+    pub(crate) fn target_physical_plans(&self) -> impl Iterator<Item = &TargetPhysicalPlan> {
+        self.target_physical.values()
+    }
+
     pub(crate) fn target(&self, id: &PhysicalTargetId) -> Option<&TargetPhysicalPlan> {
         self.target_physical.get(id)
     }
 
-    pub(crate) fn target_for_actor(&self, actor: &str) -> Option<&TargetPhysicalPlan> {
+    pub(crate) fn target_for_actor(&self, actor: &StaticActorId) -> Option<&TargetPhysicalPlan> {
         self.actor_targets.get(actor).and_then(|id| self.target(id))
     }
 
@@ -499,19 +520,19 @@ impl ContractStateLowering {
         self.target(&PhysicalTargetId::OpenState(state.clone()))
     }
 
-    pub(crate) fn output_type_for_actor(&self, actor: &str) -> Option<&OutputPhysicalTypePlan> {
+    pub(crate) fn output_type_for_actor(&self, actor: &StaticActorId) -> Option<&OutputPhysicalTypePlan> {
         self.actor_targets.get(actor).and_then(|id| self.output_physical_types.get(id))
-    }
-
-    pub(crate) fn output_type_for_compiled_actor(&self, app: &str, actor: &str) -> Option<&OutputPhysicalTypePlan> {
-        self.output_physical_types.get(&PhysicalTargetId::Actor(CompiledActorId { app: app.to_string(), actor: actor.to_string() }))
     }
 
     pub(crate) fn output_type_for_open_state(&self, state: &SourceStateId) -> Option<&OutputPhysicalTypePlan> {
         self.output_physical_types.get(&PhysicalTargetId::OpenState(state.clone()))
     }
 
-    pub(crate) fn output_type_for_actor_domain(&self, state: &SourceStateId, actors: &[String]) -> Option<&OutputPhysicalTypePlan> {
+    pub(crate) fn output_type_for_actor_domain(
+        &self,
+        state: &SourceStateId,
+        actors: &[StaticActorId],
+    ) -> Option<&OutputPhysicalTypePlan> {
         let actors = actors
             .iter()
             .map(|actor| match self.actor_targets.get(actor)? {
@@ -524,17 +545,15 @@ impl ContractStateLowering {
 }
 
 /// Build every emitted contract's plan from validated state and route facts.
-pub(crate) fn build_contract_state_lowerings(model: &Model<'_>) -> Result<BTreeMap<String, ContractStateLowering>> {
-    model
-        .actors
-        .iter()
-        .map(|actor| build_contract_state_lowering(actor.name.as_str(), model).map(|plan| (actor.name.clone(), plan)))
-        .collect()
+pub(crate) fn build_contract_state_lowerings(model: &AppCompilationContext<'_>) -> Result<BTreeMap<DeclId, ContractStateLowering>> {
+    model.app_actors.iter_with_ids().map(|(id, _)| build_contract_state_lowering(id, model).map(|plan| (id, plan))).collect()
 }
 
-fn build_contract_state_lowering(active_actor: &str, model: &Model<'_>) -> Result<ContractStateLowering> {
+fn build_contract_state_lowering(active_actor: DeclId, model: &AppCompilationContext<'_>) -> Result<ContractStateLowering> {
     let active_id = compiled_actor_id(active_actor, model)?;
-    let active_source = source_state_id(&model.actor(active_actor)?.state);
+    let active_state =
+        model.types.actor_states.get(&active_actor).ok_or_else(|| ArgentError::new("selected actor has no bound state"))?;
+    let active_source = model.source_state_id_by_decl(*active_state)?;
     let (active_source_layout, active_storage, active_source_to_storage) = state_layouts(&active_source, model)?;
     let (active_physical, active_storage_to_physical) = actor_physical_layout(active_actor, &active_storage, model)?;
     let active = ContractStateLayout {
@@ -547,26 +566,26 @@ fn build_contract_state_lowering(active_actor: &str, model: &Model<'_>) -> Resul
     };
 
     let mut source_representations = BTreeMap::new();
-    for state in model.all_states() {
-        let source = source_state_id(&state.name);
-        if source_representations.contains_key(&source) {
+    for source in model.state_sources() {
+        if source_representations.contains_key(source) {
             continue;
         }
-        let (_, _, source_to_storage) = state_layouts(&source, model)?;
-        let sil_type = if source == active_source && source_to_storage.is_identity() && active.storage_to_physical.is_identity() {
+        let (_, _, source_to_storage) = state_layouts(source, model)?;
+        let sil_type = if *source == active_source && source_to_storage.is_identity() && active.storage_to_physical.is_identity() {
             SilStateType::State
         } else {
             SilStateType::Source(source.clone())
         };
-        source_representations.insert(source.clone(), SourceRepresentationPlan { source, source_to_storage, sil_type });
+        source_representations
+            .insert(source.clone(), SourceRepresentationPlan { source: source.clone(), source_to_storage, sil_type });
     }
 
     let mut target_physical = BTreeMap::new();
     let mut canonical_domain_targets = BTreeMap::new();
     let mut actor_targets = BTreeMap::new();
-    for actor in model.app_actors.iter().chain(model.linked_actors.keys()) {
-        let plan = concrete_target_plan(actor, active_actor, &active_physical, model)?;
-        actor_targets.insert(actor.clone(), plan.id.clone());
+    for id in model.static_actor_ids() {
+        let plan = concrete_target_plan(&id, active_actor, &active_physical, model)?;
+        actor_targets.insert(id, plan.id.clone());
         target_physical.insert(plan.id.clone(), plan);
     }
 
@@ -575,20 +594,17 @@ fn build_contract_state_lowering(active_actor: &str, model: &Model<'_>) -> Resul
         target_physical.insert(plan.id.clone(), plan);
     }
 
-    let actor = model.actor(active_actor)?;
-    for entry in &actor.entries {
-        for selector in model.entry_model(actor, entry)?.template_selectors().values() {
+    let actor = model.actor_by_decl(active_actor)?;
+    for (index, entry) in actor.entries.iter().enumerate() {
+        for selector in model.entry_model_by_id(EntryId { actor: active_actor, index })?.template_selectors().values() {
             let variant_ids = selector
-                .variants
+                .variant_actor_ids()?
                 .iter()
                 .map(|variant| {
-                    actor_targets
-                        .get(variant)
-                        .cloned()
-                        .ok_or_else(|| ArgentError::new(format!("selector target `{variant}` has no physical state plan")))
+                    actor_targets.get(variant).cloned().ok_or_else(|| ArgentError::new("selector target has no physical state plan"))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let id = PhysicalTargetId::ActorDomain { state: source_state_id(&selector.state), actors: actor_ids(&variant_ids)? };
+            let id = PhysicalTargetId::ActorDomain { state: selector.source_state(model)?, actors: actor_ids(&variant_ids)? };
             if target_physical.contains_key(&id) {
                 continue;
             }
@@ -620,21 +636,9 @@ fn build_contract_state_lowering(active_actor: &str, model: &Model<'_>) -> Resul
     Ok(ContractStateLowering { active, source_representations, target_physical, output_physical_types, actor_targets })
 }
 
-fn source_state_id(state: &str) -> SourceStateId {
-    SourceStateId::new(state)
-}
-
-fn storage_state_id(state: &str) -> StorageStateId {
-    StorageStateId(state.to_string())
-}
-
-fn compiled_actor_id(reference: &str, model: &Model<'_>) -> Result<CompiledActorId> {
-    if let Some(linked) = model.linked_actor(reference) {
-        Ok(CompiledActorId { app: linked.app.clone(), actor: linked.actor.clone() })
-    } else {
-        model.actor(reference)?;
-        Ok(CompiledActorId { app: model.app_name.clone(), actor: reference.to_string() })
-    }
+fn compiled_actor_id(id: DeclId, model: &AppCompilationContext<'_>) -> Result<CompiledActorId> {
+    let actor = model.actor_by_decl(id)?;
+    Ok(CompiledActorId { identity: StaticActorId::InApp(id), actor: actor.name.clone() })
 }
 
 fn actor_ids(targets: &[PhysicalTargetId]) -> Result<Vec<CompiledActorId>> {
@@ -649,32 +653,51 @@ fn actor_ids(targets: &[PhysicalTargetId]) -> Result<Vec<CompiledActorId>> {
         .collect()
 }
 
-fn state_layouts(source: &SourceStateId, model: &Model<'_>) -> Result<(SourceStateLayout, StorageStateLayout, SourceStorageRelation)> {
-    let state = model.state(source.as_str())?;
-    let storage = model.storage_state(source.as_str())?;
-    let storage_id = storage_state_id(&storage.name);
+fn state_layouts(
+    source: &SourceStateId,
+    model: &AppCompilationContext<'_>,
+) -> Result<(SourceStateLayout, StorageStateLayout, SourceStorageRelation)> {
+    let state = model.state_by_source(source)?;
+    let storage = model.storage_state_by_source(source)?;
+    let storage_id = StorageStateId(model.storage_source_id(source).clone());
     let digest_states = state
         .expansion
         .as_ref()
         .map(|expansion| {
-            expansion.digests.iter().map(|digest| (digest.field.as_str(), digest.state.as_str())).collect::<BTreeMap<_, _>>()
+            expansion
+                .digests
+                .iter()
+                .enumerate()
+                .map(|(index, digest)| (digest.field.as_str(), (index, digest.state.as_str())))
+                .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
 
     let mut source_fields = Vec::new();
     let mut storage_fields = Vec::new();
     let mut lowering = Vec::new();
-    for field in &storage.fields {
-        let source_field = SourceFieldId { state: source.clone(), field: field.name.clone() };
+    for (index, field) in storage.fields.iter().enumerate() {
+        let source_field = SourceFieldId::new(source.clone(), field.name.clone());
         let storage_field = StorageFieldId { state: storage_id.clone(), field: field.name.clone() };
-        let source_ty =
-            digest_states.get(field.name.as_str()).map_or_else(|| field.ty.clone(), |expanded| TypeRef::new((*expanded).to_string()));
+        let source_ty = digest_states
+            .get(field.name.as_str())
+            .map_or_else(|| field.ty.clone(), |(_, expanded)| TypeRef::new((*expanded).to_string()));
         source_fields.push((source_field.clone(), source_ty));
-        storage_fields.push((storage_field.clone(), field.ty.clone(), packed_layout_field_len(&field.ty, model)?));
+        storage_fields.push((
+            storage_field.clone(),
+            field.ty.clone(),
+            packed_layout_field_len(&field.ty, &storage_id.0, index, &field.name, model)?,
+        ));
         lowering.push(match digest_states.get(field.name.as_str()) {
-            Some(expanded) => {
-                SourceFieldLowering::Digest { source: source_field, storage: storage_field, expanded_state: source_state_id(expanded) }
-            }
+            Some((digest_index, expanded)) => SourceFieldLowering::Digest {
+                source: source_field,
+                storage: storage_field,
+                expanded_state: if let Some(owner) = model.state_decl_id_by_source(source) {
+                    model.source_state_id_by_decl(model.bound_state_use(owner, RootSlot::DigestState(*digest_index))?)?
+                } else {
+                    model.source_state_id(expanded)?
+                },
+            },
             None => SourceFieldLowering::Identity { source: source_field, storage: storage_field },
         });
     }
@@ -692,17 +715,16 @@ fn state_layouts(source: &SourceStateId, model: &Model<'_>) -> Result<(SourceSta
 }
 
 fn actor_physical_layout(
-    actor: &str,
+    actor: DeclId,
     storage: &StorageStateLayout,
-    model: &Model<'_>,
+    model: &AppCompilationContext<'_>,
 ) -> Result<(PhysicalStateLayout, StoragePhysicalRelation)> {
-    physical_layout(storage, generated_fields_for_actor(actor, model)?, model)
+    physical_layout(storage, generated_fields_for_actor(actor, model)?)
 }
 
 fn physical_layout(
     storage: &StorageStateLayout,
     generated: Vec<(GeneratedFieldId, String, TypeRef)>,
-    model: &Model<'_>,
 ) -> Result<(PhysicalStateLayout, StoragePhysicalRelation)> {
     let generated_ids = generated.iter().map(|(id, _, _)| id.clone()).collect::<Vec<_>>();
     let mut fields = generated
@@ -711,7 +733,7 @@ fn physical_layout(
             Ok(LayoutField {
                 id: PhysicalFieldId::Generated(id),
                 sil_name,
-                sil_type: lower_layout_type(&ty, model),
+                sil_type: lower_layout_type(&ty),
                 packed_len: packed_field_len(&ty)?,
                 ty,
             })
@@ -724,7 +746,7 @@ fn physical_layout(
             id: physical_id.clone(),
             sil_name: storage_id.field.clone(),
             ty: ty.clone(),
-            sil_type: lower_layout_type(ty, model),
+            sil_type: lower_layout_type(ty),
             packed_len: *packed_len,
         });
         storage_to_physical.push(StoragePhysicalField { storage: storage_id.clone(), physical: physical_id });
@@ -738,17 +760,26 @@ fn physical_layout(
 }
 
 fn concrete_target_plan(
-    actor: &str,
-    active_actor: &str,
+    actor: &StaticActorId,
+    active_actor: DeclId,
     active_physical: &PhysicalStateLayout,
-    model: &Model<'_>,
+    model: &AppCompilationContext<'_>,
 ) -> Result<TargetPhysicalPlan> {
-    let actor_id = compiled_actor_id(actor, model)?;
-    let source = source_state_id(&model.actor(actor)?.state);
+    let source = model.static_actor_source_state(actor)?;
     let (_, storage, source_to_storage) = state_layouts(&source, model)?;
-    let (physical, storage_to_physical) = actor_physical_layout(actor, &storage, model)?;
+    let (actor_id, physical, storage_to_physical) = match actor {
+        StaticActorId::InApp(id) => {
+            let name = &model.actor_by_decl(*id)?.name;
+            let (physical, relation) = actor_physical_layout(*id, &storage, model)?;
+            (CompiledActorId { identity: StaticActorId::InApp(*id), actor: name.clone() }, physical, relation)
+        }
+        StaticActorId::Linked(id) => {
+            let (physical, relation) = physical_layout(&storage, Vec::new())?;
+            (CompiledActorId { identity: StaticActorId::Linked(id.clone()), actor: id.actor.clone() }, physical, relation)
+        }
+    };
     let id = PhysicalTargetId::Actor(actor_id);
-    let sil_type = if actor == active_actor {
+    let sil_type = if matches!(actor, StaticActorId::InApp(id) if *id == active_actor) {
         SilStateType::State
     } else {
         conservative_named_type(&id, &source, &source_to_storage, &storage_to_physical)
@@ -760,10 +791,10 @@ fn concrete_target_plan(
 fn open_state_target_plan(
     source: SourceStateId,
     active_physical: &PhysicalStateLayout,
-    model: &Model<'_>,
+    model: &AppCompilationContext<'_>,
 ) -> Result<TargetPhysicalPlan> {
     let (_, storage, source_to_storage) = state_layouts(&source, model)?;
-    let (physical, storage_to_physical) = physical_layout(&storage, Vec::new(), model)?;
+    let (physical, storage_to_physical) = physical_layout(&storage, Vec::new())?;
     let id = PhysicalTargetId::OpenState(source.clone());
     let sil_type = conservative_named_type(&id, &source, &source_to_storage, &storage_to_physical);
     let active_compatible = physical.is_sil_compatible_with(active_physical);
@@ -821,35 +852,69 @@ fn conservative_named_type(
     }
 }
 
-fn dynamic_source_states(active_actor: &str, model: &Model<'_>) -> Result<BTreeSet<SourceStateId>> {
-    let actor = model.actor(active_actor)?;
+fn dynamic_source_states(actor_id: DeclId, model: &AppCompilationContext<'_>) -> Result<BTreeSet<SourceStateId>> {
+    let actor = model.actor_by_decl(actor_id)?;
     let mut states = BTreeSet::new();
-    for field in &model.storage_state(&actor.state)?.fields {
-        if let Some(state) = &field.ty.actor_state {
-            states.insert(source_state_id(state));
+    let active_state = model.types.actor_states.get(&actor_id).ok_or_else(|| ArgentError::new("selected actor has no bound state"))?;
+    let active_source = model.source_state_id_by_decl(*active_state)?;
+    let storage_source = model.storage_source_id(&active_source);
+    let storage = model.state_by_source(storage_source)?;
+    let storage_id = model
+        .state_decl_id_by_source(storage_source)
+        .ok_or_else(|| ArgentError::new(format!("actor `{}` storage has no bound state declaration", actor.name)))?;
+    for (index, field) in storage.fields.iter().enumerate() {
+        if field.ty.actor_state.is_some() {
+            let ty =
+                model.types.state_fields.get(&(storage_id, index)).ok_or_else(|| {
+                    ArgentError::new(format!("state `{}` field `{}` has no resolved type", storage.name, field.name))
+                })?;
+            let ResolvedTypeBase::ActorHandle(state) = ty.base else {
+                return Err(ArgentError::new(format!("state `{}` field `{}` has no bound actor state", storage.name, field.name)));
+            };
+            states.insert(model.source_state_id_by_decl(state)?);
         }
     }
-    for entry in &actor.entries {
-        for param in &entry.params {
-            if let Some(state) = &param.ty.actor_state {
-                states.insert(source_state_id(state));
+    for (entry_index, entry) in actor.entries.iter().enumerate() {
+        for (param_index, param) in entry.params.iter().enumerate() {
+            if param.ty.actor_state.is_some() {
+                let ty = model.types.entry_params.get(&(actor_id, entry_index, param_index)).ok_or_else(|| {
+                    ArgentError::new(format!("entry `{}::{}` parameter `{}` has no resolved type", actor.name, entry.name, param.name))
+                })?;
+                let ResolvedTypeBase::ActorHandle(state) = ty.base else {
+                    return Err(ArgentError::new(format!(
+                        "entry `{}::{}` parameter `{}` has no bound actor state",
+                        actor.name, entry.name, param.name
+                    )));
+                };
+                states.insert(model.source_state_id_by_decl(state)?);
             }
         }
-        for declaration in entry.body.local_declarations() {
-            if let Some(state) = &declaration.binding.actor_type_state {
-                states.insert(source_state_id(state));
-            }
+        for state in
+            model.types.local_actor_handle_states.iter().filter_map(|(local, state)| {
+                (local.owner == actor_id && local.callable == RootSlot::Entry(entry_index)).then_some(state)
+            })
+        {
+            states.insert(model.source_state_id_by_decl(*state)?);
         }
         for observe in &entry.observes {
             for observed in observe.inputs.iter().chain(&observe.outputs) {
-                if model.static_actor_target(&observed.actor).is_none()
-                    && let Some(state) = observed_open_state_for_decl(actor, entry, observe, observed, model)?
+                if model
+                    .static_observed_actor_target(EntryId { actor: actor_id, index: entry_index }, actor, entry, observe, observed)?
+                    .is_none()
+                    && let Some(state) = observed_open_state_for_decl(
+                        EntryId { actor: actor_id, index: entry_index },
+                        actor,
+                        entry,
+                        observe,
+                        observed,
+                        model,
+                    )?
                 {
-                    states.insert(source_state_id(&state));
+                    states.insert(state);
                 }
             }
         }
-        for group in model.entry_model(actor, entry)?.genesis_groups() {
+        for group in model.entry_model_by_id(EntryId { actor: actor_id, index: entry_index })?.genesis_groups() {
             for interaction in group.outputs() {
                 if model.resolve_static_actor_target(interaction.target()).is_some() {
                     continue;
@@ -857,8 +922,16 @@ fn dynamic_source_states(active_actor: &str, model: &Model<'_>) -> Result<BTreeS
                 let InteractionSource::SpawnOutput(output) = interaction.source() else {
                     unreachable!("genesis output retains its spawn declaration");
                 };
-                if let Some(state) = spawn_target_state(interaction.target(), &output.actor, actor, entry, model)? {
-                    states.insert(source_state_id(&state));
+                if let Some(state) = spawn_target_state(
+                    EntryId { actor: actor_id, index: entry_index },
+                    interaction.id(),
+                    interaction.target(),
+                    &output.actor,
+                    actor,
+                    entry,
+                    model,
+                )? {
+                    states.insert(state);
                 }
             }
         }
@@ -866,20 +939,23 @@ fn dynamic_source_states(active_actor: &str, model: &Model<'_>) -> Result<BTreeS
     Ok(states)
 }
 
-fn generated_fields_for_actor(actor: &str, model: &Model<'_>) -> Result<Vec<(GeneratedFieldId, String, TypeRef)>> {
-    if model.linked_actor(actor).is_some() {
-        return Ok(Vec::new());
-    }
-    let leaves =
-        model.route_leaves_by_actor.get(actor).ok_or_else(|| ArgentError::new(format!("actor `{actor}` has no planned route cut")))?;
-    let families = model.route_family_for_actor(actor).into_iter().collect::<Vec<_>>();
+fn generated_fields_for_actor(
+    actor_id: DeclId,
+    model: &AppCompilationContext<'_>,
+) -> Result<Vec<(GeneratedFieldId, String, TypeRef)>> {
+    let actor = model.actor_by_decl(actor_id)?;
+    let leaves = model
+        .route_leaves_by_actor
+        .get(&actor_id)
+        .ok_or_else(|| ArgentError::new(format!("actor `{}` has no planned route cut", actor.name)))?;
+    let families = model.route_family_for_actor_id(actor_id).into_iter().collect::<Vec<_>>();
     let mut fields = Vec::new();
     if families.is_empty() {
         for actor in leaves.iter().filter_map(|leaf| match leaf {
             RouteRootLeaf::Actor(actor) => Some(actor),
             RouteRootLeaf::Family(_) => None,
         }) {
-            fields.push(template_field(actor, model)?);
+            fields.push(template_field(*actor, model)?);
         }
         for family in leaves.iter().filter_map(|leaf| match leaf {
             RouteRootLeaf::Family(family) => Some(family),
@@ -893,13 +969,13 @@ fn generated_fields_for_actor(actor: &str, model: &Model<'_>) -> Result<Vec<(Gen
         return Ok(fields);
     }
 
-    let family_actors = families.iter().flat_map(|family| family.actors.iter().map(String::as_str)).collect::<BTreeSet<_>>();
+    let family_actors = families.iter().flat_map(|family| family.actor_ids.iter().copied()).collect::<BTreeSet<_>>();
     let own_families = families.iter().map(|family| family.id.as_str()).collect::<BTreeSet<_>>();
     for actor in leaves.iter().filter_map(|leaf| match leaf {
-        RouteRootLeaf::Actor(actor) if !family_actors.contains(actor.as_str()) => Some(actor),
+        RouteRootLeaf::Actor(actor) if !family_actors.contains(actor) => Some(actor),
         RouteRootLeaf::Actor(_) | RouteRootLeaf::Family(_) => None,
     }) {
-        fields.push(template_field(actor, model)?);
+        fields.push(template_field(*actor, model)?);
     }
     for family in leaves.iter().filter_map(|leaf| match leaf {
         RouteRootLeaf::Family(family) if !own_families.contains(family.as_str()) => Some(family),
@@ -910,19 +986,23 @@ fn generated_fields_for_actor(actor: &str, model: &Model<'_>) -> Result<Vec<(Gen
         fields.push(route_digest_field(family, model));
     }
     for family in families {
-        for actor in family.direct_template_actors() {
-            fields.push(template_field(actor, model)?);
+        for actor in family.actor_ids.iter().filter(|id| !family.table_actor_ids.contains(id)) {
+            fields.push(template_field(*actor, model)?);
         }
         fields.push(route_table_field(family, model)?);
     }
     Ok(fields)
 }
 
-fn template_field(actor: &str, model: &Model<'_>) -> Result<(GeneratedFieldId, String, TypeRef)> {
-    Ok((GeneratedFieldId::Template(compiled_actor_id(actor, model)?), hidden_template_name(actor), TypeRef::array("byte", 32)))
+fn template_field(actor: DeclId, model: &AppCompilationContext<'_>) -> Result<(GeneratedFieldId, String, TypeRef)> {
+    Ok((
+        GeneratedFieldId::Template(compiled_actor_id(actor, model)?),
+        hidden_template_name(&model.actor_by_decl(actor)?.name),
+        TypeRef::array("byte", 32),
+    ))
 }
 
-fn route_digest_field(family: &RouteFamily, model: &Model<'_>) -> (GeneratedFieldId, String, TypeRef) {
+fn route_digest_field(family: &RouteFamily, model: &AppCompilationContext<'_>) -> (GeneratedFieldId, String, TypeRef) {
     (
         GeneratedFieldId::RouteFamilyDigest { app: model.app_name.clone(), family: family.id.clone() },
         hidden_route_family_commitment_name(family),
@@ -930,8 +1010,8 @@ fn route_digest_field(family: &RouteFamily, model: &Model<'_>) -> (GeneratedFiel
     )
 }
 
-fn route_table_field(family: &RouteFamily, model: &Model<'_>) -> Result<(GeneratedFieldId, String, TypeRef)> {
-    let actors = family.table_actors().iter().map(|actor| compiled_actor_id(actor, model)).collect::<Result<Vec<_>>>()?;
+fn route_table_field(family: &RouteFamily, model: &AppCompilationContext<'_>) -> Result<(GeneratedFieldId, String, TypeRef)> {
+    let actors = family.table_actor_ids.iter().map(|id| compiled_actor_id(*id, model)).collect::<Result<Vec<_>>>()?;
     Ok((
         GeneratedFieldId::RouteFamilyTable { app: model.app_name.clone(), family: family.id.clone(), actors },
         hidden_route_family_table_name(family),
@@ -961,37 +1041,57 @@ fn hidden_route_family_table_name(family: &RouteFamily) -> String {
 }
 
 /// Return the SIL spelling used by layout compatibility checks.
-fn lower_layout_type(ty: &TypeRef, model: &Model<'_>) -> String {
-    if model.is_actor_enum_type(ty) {
-        "int".to_string()
-    } else if ty.name == word::COVENANT_ID && ty.array.is_none() {
-        "byte[32]".to_string()
-    } else {
-        ty.to_sil()
-    }
+fn lower_layout_type(ty: &TypeRef) -> String {
+    if ty.name == word::COVENANT_ID && ty.array.is_none() { "byte[32]".to_string() } else { ty.to_sil() }
 }
 
-fn packed_layout_field_len(ty: &TypeRef, model: &Model<'_>) -> Result<usize> {
-    packed_layout_field_len_inner(ty, model, &mut BTreeSet::new())
+fn packed_layout_field_len(
+    ty: &TypeRef,
+    owner: &SourceStateId,
+    index: usize,
+    field: &str,
+    model: &AppCompilationContext<'_>,
+) -> Result<usize> {
+    packed_layout_field_len_inner(ty, owner, index, field, model, &mut BTreeSet::new())
 }
 
-fn packed_layout_field_len_inner(ty: &TypeRef, model: &Model<'_>, visiting: &mut BTreeSet<String>) -> Result<usize> {
+fn packed_layout_field_len_inner(
+    ty: &TypeRef,
+    owner: &SourceStateId,
+    index: usize,
+    field: &str,
+    model: &AppCompilationContext<'_>,
+    visiting: &mut BTreeSet<SourceStateId>,
+) -> Result<usize> {
     if let Ok(len) = packed_field_len(ty) {
         return Ok(len);
     }
-    if ty.array.is_some() || !model.has_state(&ty.name) {
+    if ty.array.is_some() {
         return packed_field_len(ty);
     }
-    if !visiting.insert(ty.name.clone()) {
+    let target = if let Some(owner_id) = model.state_decl_id_by_source(owner) {
+        match model.types.state_fields.get(&(owner_id, index)) {
+            Some(resolved) => match resolved.base {
+                ResolvedTypeBase::State(state) => Some(model.source_state_id_by_decl(state)?),
+                _ => None,
+            },
+            None => return Err(ArgentError::new(format!("state `{}` field `{field}` has no resolved type", owner.as_str()))),
+        }
+    } else {
+        model.linked_field_sources.get(&SourceFieldId::new(owner.clone(), field)).cloned()
+    };
+    let Some(target) = target else { return packed_field_len(ty) };
+    if !visiting.insert(target.clone()) {
         return Err(ArgentError::new(format!("recursive state field type `{}` has no fixed packed width", ty.name)));
     }
-    let state = model.storage_state(&ty.name)?;
-    let len = state.fields.iter().try_fold(0usize, |sum, field| {
-        packed_layout_field_len_inner(&field.ty, model, visiting).and_then(|len| {
+    let state = model.storage_state_by_source(&target)?;
+    let storage_owner = model.storage_source_id(&target);
+    let len = state.fields.iter().enumerate().try_fold(0usize, |sum, (index, field)| {
+        packed_layout_field_len_inner(&field.ty, storage_owner, index, &field.name, model, visiting).and_then(|len| {
             sum.checked_add(len).ok_or_else(|| ArgentError::new(format!("state `{}` packed width overflows", ty.name)))
         })
     });
-    visiting.remove(&ty.name);
+    visiting.remove(&target);
     len
 }
 
