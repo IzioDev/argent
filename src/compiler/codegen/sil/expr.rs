@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use silverscript_lang::ast::visit::{AstVisitorMut, NameKind, walk_expr_mut, walk_statement_mut};
-use silverscript_lang::ast::{ArrayDim, BinaryOp, Expr, ExprKind, Statement, TypeBase, TypeRef, UnaryOp};
+use silverscript_lang::ast::{ArrayDim, BinaryOp, Expr, ExprKind, Statement, TypeBase, TypeRef};
 use silverscript_lang::span::Span;
 
 use crate::compiler::model::AppCompilationContext;
@@ -56,10 +56,7 @@ impl<'n, 'm, 'src> CoSpentLowerer<'n, 'm, 'src> {
             ExprKind::Call { name: "OpCovInputCount".to_string(), args: vec![operand], name_span: Span::default() },
             expr.span,
         );
-        // Sil's AST formatter preserves parentheses for a negated comparison
-        // when it appears inside another comparison or a boolean expression.
-        let absent = Expr::new(ExprKind::Binary { op: BinaryOp::Eq, left: Box::new(count), right: Box::new(Expr::int(0)) }, expr.span);
-        expr.kind = ExprKind::Unary { op: UnaryOp::Not, expr: Box::new(absent) };
+        expr.kind = ExprKind::Binary { op: BinaryOp::Gt, left: Box::new(count), right: Box::new(Expr::int(0)) };
         Ok(())
     }
 

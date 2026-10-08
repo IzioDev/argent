@@ -4422,7 +4422,7 @@ fn expanded_actor_records_sil_and_capsule_template_cuts() {
         contract.runtime_state.fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),
         ["gen__reserve_asset_template", "gen__wallet_asset_template", "owner_kind", "owner_id", "policy", "balance"]
     );
-    assert_eq!(encode_hex(&contract.compiled.template_hash), "3e011bd78b21510344faf721c32d66fe226dc7b43dbac60a7ba3392e5b4da563");
+    assert_eq!(encode_hex(&contract.compiled.template_hash), "627db2b04fa0d951683831303996ca6cd1c4ababec8bdf59546a57afe3f02206");
     let wallet_contract = artifact.sil_abi.contract("WalletAsset").expect("WalletAsset Sil ABI exists");
     assert_eq!(
         wallet_contract.runtime_state.fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),
@@ -5065,7 +5065,7 @@ fn icc_asset_lowers_cov_id_co_spend_and_else_if() {
     let kcc20_sil = fs::read_to_string(out_dir.join("sil/KCC20.sil")).expect("KCC20.sil exists");
     assert!(kcc20_sil.contains("if (identifier_type == IDENTIFIER_COVENANT_ID) {"), "{kcc20_sil}");
     assert!(kcc20_sil.contains("require(checkSig(owner_sig, pubkey(owner_identifier)));"), "{kcc20_sil}");
-    assert!(kcc20_sil.contains("require(!(OpCovInputCount(owner_identifier) == 0));"), "{kcc20_sil}");
+    assert!(kcc20_sil.contains("require(OpCovInputCount(owner_identifier) > 0);"), "{kcc20_sil}");
     assert!(!kcc20_sil.contains("KCC20State"), "{kcc20_sil}");
     assert!(kcc20_sil.contains("State next_state = State {"), "{kcc20_sil}");
     assert!(kcc20_sil.contains("validateOutputState(gen__next_output_idx, next_state);"), "{kcc20_sil}");
@@ -5075,7 +5075,7 @@ fn icc_asset_lowers_cov_id_co_spend_and_else_if() {
     assert!(proxy_sil.contains("entry mint(MinterProxyState next_proxy,"), "{proxy_sil}");
     assert!(proxy_sil.contains("gen__kcc20_template: gen__kcc20_template"), "{proxy_sil}");
     assert!(proxy_sil.contains("controller_id: next_proxy.controller_id"), "{proxy_sil}");
-    assert!(proxy_sil.contains("require(!(OpCovInputCount(controller_id) == 0));"), "{proxy_sil}");
+    assert!(proxy_sil.contains("require(OpCovInputCount(controller_id) > 0);"), "{proxy_sil}");
 
     let artifact_json = fs::read_to_string(out_dir.join("artifact.json")).expect("artifact json exists");
     let artifact: Artifact = serde_json::from_str(&artifact_json).expect("artifact deserializes");
@@ -5119,7 +5119,7 @@ fn lowers_co_spend_and_output_value_in_the_same_expression() {
         })
         .expect("actor emits");
 
-    assert!(sil.contains("require(!(OpCovInputCount(guard) == 0) && tx.outputs[gen__next_output_idx].value >= 0);"), "{sil}");
+    assert!(sil.contains("require(OpCovInputCount(guard) > 0 && tx.outputs[gen__next_output_idx].value >= 0);"), "{sil}");
 }
 
 #[test]
@@ -5137,7 +5137,9 @@ fn co_spent_preserves_boolean_precedence() {
                     bool raw_missing = !cov_id(raw_guard).co_spent();
                     require(missing == raw_missing);
                     require(guard.co_spent() == expected);
+                    require(expected == guard.co_spent());
                     require(guard.co_spent() != !expected);
+                    require(expected || guard.co_spent());
                     require(identity(!guard.co_spent()) == !expected);
                     if (!guard.co_spent() && !cov_id(raw_guard).co_spent()) {
                         require(!expected);
@@ -5153,12 +5155,14 @@ fn co_spent_preserves_boolean_precedence() {
     );
     let sil = &actor_sil["Gate"];
     for expected in [
-        "bool missing = !!(OpCovInputCount(guard) == 0);",
-        "bool raw_missing = !!(OpCovInputCount(raw_guard) == 0);",
-        "require(!(OpCovInputCount(guard) == 0) == expected);",
-        "require(!(OpCovInputCount(guard) == 0) != !expected);",
-        "require(identity(!!(OpCovInputCount(guard) == 0)) == !expected);",
-        "if (!!(OpCovInputCount(guard) == 0) && !!(OpCovInputCount(raw_guard) == 0)) {",
+        "bool missing = !(OpCovInputCount(guard) > 0);",
+        "bool raw_missing = !(OpCovInputCount(raw_guard) > 0);",
+        "require(OpCovInputCount(guard) > 0 == expected);",
+        "require(expected == OpCovInputCount(guard) > 0);",
+        "require(OpCovInputCount(guard) > 0 != !expected);",
+        "require(expected || OpCovInputCount(guard) > 0);",
+        "require(identity(!(OpCovInputCount(guard) > 0)) == !expected);",
+        "if (!(OpCovInputCount(guard) > 0) && !(OpCovInputCount(raw_guard) > 0)) {",
     ] {
         assert!(sil.contains(expected), "missing `{expected}` in:\n{sil}");
     }
@@ -5197,9 +5201,9 @@ fn co_spend_uses_bound_entry_parameter_and_consumed_state_field_types() {
             emit_actor(model.actor_by_decl(model.types.names["A"])?, &model)
         })
         .expect("entry lowers");
-    assert!(sil.contains("!(OpCovInputCount(authority) == 0)"), "{sil}");
-    assert!(sil.contains("!(OpCovInputCount(gen__previous_state.owner) == 0)"), "{sil}");
-    assert!(sil.contains("!(OpCovInputCount(owner) == 0)"), "{sil}");
+    assert!(sil.contains("OpCovInputCount(authority) > 0"), "{sil}");
+    assert!(sil.contains("OpCovInputCount(gen__previous_state.owner) > 0"), "{sil}");
+    assert!(sil.contains("OpCovInputCount(owner) > 0"), "{sil}");
 }
 
 #[test]
@@ -5230,8 +5234,8 @@ fn co_spend_in_helpers_uses_model_approved_call_sites() {
             emit_actor(model.actor_by_decl(model.types.names["A"])?, &model)
         })
         .expect("helper lowers");
-    assert!(sil.contains("!(OpCovInputCount(id) == 0)"), "{sil}");
-    assert!(sil.contains("!(OpCovInputCount(gen__glob_id) == 0)"), "{sil}");
+    assert!(sil.contains("OpCovInputCount(id) > 0"), "{sil}");
+    assert!(sil.contains("OpCovInputCount(gen__glob_id) > 0"), "{sil}");
 }
 
 #[test]

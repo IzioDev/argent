@@ -22,7 +22,7 @@ contract KCC20(byte[32] init_owner_identifier, byte init_identifier_type, int in
             require(checkSig(owner_sig, pubkey(owner_identifier)));
         } else {
             if (identifier_type == IDENTIFIER_COVENANT_ID) {
-                require(!(OpCovInputCount(owner_identifier) == 0));
+                require(OpCovInputCount(owner_identifier) > 0);
             } else {
                 require(false);
             }

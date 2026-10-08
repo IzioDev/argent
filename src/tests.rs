@@ -377,9 +377,9 @@ fn helpers_lower_co_spent_from_bound_source_ast() {
     "#;
     build_inline("guard.ag", source, &out_dir).expect("co-spend helpers compile");
     let sil = std::fs::read_to_string(out_dir.join("sil/Guard.sil")).expect("generated Guard Sil exists");
-    assert!(sil.contains("!(OpCovInputCount(gen__glob_id) == 0)"), "{sil}");
-    assert!(sil.contains("!(OpCovInputCount(gen__glob_local) == 0)"), "{sil}");
-    assert!(sil.contains("!(OpCovInputCount(guard) == 0)"), "{sil}");
+    assert!(sil.contains("OpCovInputCount(gen__glob_id) > 0"), "{sil}");
+    assert!(sil.contains("OpCovInputCount(gen__glob_local) > 0"), "{sil}");
+    assert!(sil.contains("OpCovInputCount(guard) > 0"), "{sil}");
     let _ = std::fs::remove_dir_all(out_dir);
 }
 

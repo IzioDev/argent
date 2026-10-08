@@ -23,9 +23,9 @@ contract Minter(pubkey init_owner, byte[32] init_kcc20_covid, int init_amount, b
 
     byte constant IDENTIFIER_COVENANT_ID = 2;
 
-    byte[32] constant gen__kcc20_asset__kcc20_template_const = byte[32](0xb700e6efcbfd0e778af6ea831ae8f4a13ec738e725eb44e87f759d2d2e983858);
+    byte[32] constant gen__kcc20_asset__kcc20_template_const = byte[32](0x2acc1d722544817061d8833bd251a9a1728ee987305630f4d9da12130aa1ce84);
 
-    byte[32] constant gen__kcc20_asset__minter_proxy_template_const = byte[32](0x03c3ced9912457534cd4ef47784e75f5aed5f7eaf3589556fe0082678988b3c5);
+    byte[32] constant gen__kcc20_asset__minter_proxy_template_const = byte[32](0x2de20206584a0b58d7d4b93aafe77414b1e9a72ff64e1c60fe8237f092312295);
 
     entry mint(sig owner_sig, byte[32] recipient_owner, int minted_amount, byte[] gen__kcc20_asset__kcc20_prefix, byte[] gen__kcc20_asset__kcc20_suffix, int gen__kcc20_asset__minter_proxy_prefix_len, int gen__kcc20_asset__minter_proxy_suffix_len) {
         byte[32] gen__kcc20_asset__kcc20_template = gen__kcc20_asset__kcc20_template_const;

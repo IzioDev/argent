@@ -61,7 +61,7 @@ contract Agent(byte[32] init_world_id, byte[32] init_agent_id, byte[32] init_spe
     entry step(State next_agent) {
         require(OpAuthOutputCount(this.activeInputIndex) == 1);
         int gen__agent_output_idx = OpAuthOutputIdx(this.activeInputIndex, 0);
-        require(!(OpCovInputCount(controller_id) == 0));
+        require(OpCovInputCount(controller_id) > 0);
         require(next_agent.world_id == world_id);
         require(next_agent.agent_id == agent_id);
         require(next_agent.species_id == species_id);

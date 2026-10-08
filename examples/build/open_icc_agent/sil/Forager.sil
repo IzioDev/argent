@@ -78,7 +78,7 @@ contract Forager(byte[32] init_world_id, byte[32] init_agent_id, byte[32] init_s
         byte[32] gen__strategy_target_agent_id = byte[32](gen__strategy_forager_strategy_preimage.slice(16, 48));
         require(OpAuthOutputCount(this.activeInputIndex) == 1);
         int gen__agent_output_idx = OpAuthOutputIdx(this.activeInputIndex, 0);
-        require(!(OpCovInputCount(controller_id) == 0));
+        require(OpCovInputCount(controller_id) > 0);
         require(next_energy == energy - 1);
         require(next_energy >= 0);
         ForagerState next_agent = ForagerState {world_id: world_id, agent_id: agent_id, species_id: species_id, controller_id: controller_id, capabilities_digest: capabilities_digest, strategy: ForagerStrategy {hunger: gen__strategy_hunger + 1, mood: gen__strategy_mood, target_agent_id: gen__strategy_target_agent_id}, x: next_x, y: next_y, energy: next_energy, generation: generation};
