@@ -112,6 +112,31 @@ fn compile_inline_returns_artifact_without_a_user_output_dir() {
 }
 
 #[test]
+fn compiles_separated_range_bound_and_exponent_constant() {
+    let source = include_str!("../tests/fixtures/emit/entry_range_outputs/app.ag")
+        .replace("const int MAX_ACCOUNTS = 3;", "const int MAX_ACCOUNTS = 3e0;")
+        .replace("Account[1..=MAX_ACCOUNTS]", "Account[0_1..=MAX_ACCOUNTS]");
+    let artifact = compile_inline("entry-range-literals.ag", source).expect("range literals compile");
+    assert_eq!(artifact.app, "EntryRangeOutputs");
+}
+
+#[test]
+fn compiles_bound_arithmetic_range_constant() {
+    let source = include_str!("../tests/fixtures/emit/entry_range_outputs/app.ag")
+        .replace("const int MAX_ACCOUNTS = 3;", "const int MAX_ACCOUNTS = 1 + 2;");
+    let artifact = compile_inline("entry-range-expression.ag", source).expect("bound constant expression compiles");
+    assert_eq!(artifact.app, "EntryRangeOutputs");
+}
+
+#[test]
+fn negative_range_literal_reaches_semantic_validation() {
+    let source = include_str!("../tests/fixtures/emit/entry_range_outputs/app.ag")
+        .replace("Account[1..=MAX_ACCOUNTS]", "Account[-1..=MAX_ACCOUNTS]");
+    let error = compile_inline("negative-range.ag", source).expect_err("negative bounds are invalid");
+    assert!(error.to_string().contains("must have non-negative bounds"), "unexpected error: {error}");
+}
+
+#[test]
 fn aliased_helpers_keep_their_defining_module_bindings() {
     let temp = std::env::temp_dir().join(format!("argent-module-helper-bindings-{}", std::process::id()));
     std::fs::create_dir_all(&temp).expect("test directory created");
@@ -221,7 +246,7 @@ fn importing_module_cannot_supply_an_unresolved_library_identifier() {
     )
     .unwrap();
     let error = build_file(temp.join("root.ag"), temp.join("out")).expect_err("root constants are not in the library's scope");
-    assert!(error.to_string().contains("unresolved identifier `LIMIT`"), "{error}");
+    assert!(error.to_string().contains("unknown reference `LIMIT`"), "{error}");
     std::fs::remove_dir_all(temp).unwrap();
 }
 
@@ -325,11 +350,291 @@ fn build_inline_loads_explicit_standard_module() {
     let sil = std::fs::read_to_string(out_dir.join("sil/Issuer.sil")).expect("generated Issuer Sil exists");
 
     assert!(artifact.modules.iter().any(|module| module == "std::core"));
-    assert!(sil.contains("function invocation_uid(byte[] gen__glob_domain) : byte[32]"), "{sil}");
-    assert!(sil.contains("return blake2bWithKey(byte[](gen__glob_outpoint), gen__glob_domain);"), "{sil}");
+    assert!(sil.contains("function invocation_uid(byte[] gen__glob_domain): byte[32]"), "{sil}");
+    assert!(sil.contains("return(blake2bWithKey(byte[](gen__glob_outpoint), gen__glob_domain));"), "{sil}");
     assert!(sil.contains("byte[32] uid = invocation_uid(domain);"), "{sil}");
 
     let _ = std::fs::remove_dir_all(out_dir);
+}
+
+#[test]
+fn helpers_lower_co_spent_from_bound_source_ast() {
+    let out_dir = std::env::temp_dir().join(format!("argent-helper-co-spent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let source = r#"
+        state GuardState { cov_id guard; }
+        fn globally_present(cov_id id) -> bool {
+            cov_id local = id;
+            return id.co_spent() && local.co_spent();
+        }
+        actor Guard owns GuardState {
+            fn locally_present() -> bool { return guard.co_spent(); }
+            entry check() emits none {
+                require(globally_present(guard) && locally_present());
+            }
+        }
+        app GuardApp { actor Guard; }
+    "#;
+    build_inline("guard.ag", source, &out_dir).expect("co-spend helpers compile");
+    let sil = std::fs::read_to_string(out_dir.join("sil/Guard.sil")).expect("generated Guard Sil exists");
+    assert!(sil.contains("!(OpCovInputCount(gen__glob_id) == 0)"), "{sil}");
+    assert!(sil.contains("!(OpCovInputCount(gen__glob_local) == 0)"), "{sil}");
+    assert!(sil.contains("!(OpCovInputCount(guard) == 0)"), "{sil}");
+    let _ = std::fs::remove_dir_all(out_dir);
+}
+
+#[test]
+fn helper_co_spent_rejects_non_covenant_id_receivers() {
+    let source = r#"
+        state GuardState { byte[32] guard; }
+        fn globally_present(byte[32] id) -> bool { return id.co_spent(); }
+        actor Guard owns GuardState {
+            entry check() emits none { require(globally_present(guard)); }
+        }
+        app GuardApp { actor Guard; }
+    "#;
+    let err = compile_inline("guard.ag", source).expect_err("ordinary bytes are not covenant IDs");
+    assert!(err.to_string().contains("`.co_spent()` requires one `cov_id` receiver"), "{err}");
+}
+
+#[test]
+fn helper_co_spent_accepts_an_explicit_covenant_id_cast() {
+    let source = r#"
+        state GuardState { byte[32] guard; }
+        fn globally_present(byte[32] id) -> bool { return cov_id(id).co_spent(); }
+        actor Guard owns GuardState {
+            entry check() emits none { require(globally_present(guard)); }
+        }
+        app GuardApp { actor Guard; }
+    "#;
+    compile_inline("guard.ag", source).expect("explicit covenant-ID cast compiles in a helper");
+}
+
+#[test]
+fn helper_co_spent_accepts_field_and_call_receivers_by_type() {
+    let source = r#"
+        state GuardState { cov_id guard; }
+        fn same(cov_id id) -> cov_id { return id; }
+        actor Guard owns GuardState {
+            fn present() -> bool { return self.guard.co_spent() && same(guard).co_spent(); }
+            entry check() emits none { require(present()); }
+        }
+        app GuardApp { actor Guard; }
+    "#;
+    compile_inline("guard.ag", source).expect("covenant-ID fields and helper results are valid receivers");
+}
+
+#[test]
+fn helper_local_names_follow_bound_ids_across_shadowing() {
+    let out_dir = std::env::temp_dir().join(format!("argent-helper-local-ids-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let source = r#"
+        state GuardState { cov_id guard; }
+        actor Guard owns GuardState {
+            fn present(bool flag, cov_id guard) -> bool {
+                if (flag) {
+                    cov_id copy = guard;
+                    require(copy.co_spent());
+                }
+                cov_id copy = guard;
+                return copy.co_spent() && self.guard.co_spent();
+            }
+            entry check() emits none { require(present(true, guard)); }
+        }
+        app GuardApp { actor Guard; }
+    "#;
+    build_inline("guard.ag", source, &out_dir).expect("distinct bound locals compile");
+    let sil = std::fs::read_to_string(out_dir.join("sil/Guard.sil")).expect("generated contract exists");
+    assert!(sil.contains("guard__") && sil.contains("copy__"), "{sil}");
+    let _ = std::fs::remove_dir_all(out_dir);
+}
+
+#[test]
+fn co_spent_method_binding_is_independent_of_a_local_name() {
+    let source = r#"
+        state GuardState { cov_id guard; }
+        fn globally_present(cov_id id) -> bool {
+            int co_spent = 1;
+            return id.co_spent() && co_spent > 0;
+        }
+        actor Guard owns GuardState {
+            entry check() emits none { require(globally_present(guard)); }
+        }
+        app GuardApp { actor Guard; }
+    "#;
+    compile_inline("guard.ag", source).expect("method namespace remains separate from local names");
+}
+
+#[test]
+fn retained_helper_ast_lowers_state_types() {
+    let out_dir = std::env::temp_dir().join(format!("argent-helper-state-ast-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let artifact = build_file(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/state_layout/function_contexts/app.ag"), &out_dir)
+        .expect("state-valued helpers compile from retained ASTs");
+    let aligned = std::fs::read_to_string(out_dir.join("sil/Aligned.sil")).expect("aligned contract exists");
+    assert!(aligned.contains("function global_identity(State gen__glob_value): State"), "{aligned}");
+    assert!(aligned.contains("State {left: int gen__glob_copied_left"), "{aligned}");
+    assert!(!aligned.contains("SharedState"), "{aligned}");
+    let aligned_template =
+        artifact.argent.template_plan.templates.iter().find(|template| template.actor == "Aligned").expect("Aligned template exists");
+    assert_eq!(
+        crate::codec::encode_hex(&aligned_template.sil_template_hash),
+        "93509ef29827d95b79f405cf30f2c651fadbd01c06f0a7c73088678a10dfb4ef",
+    );
+    let _ = std::fs::remove_dir_all(out_dir);
+}
+
+#[test]
+fn retained_helper_ast_lowers_bound_actor_enum_variants() {
+    let source = r#"
+        state SharedState { int counter; }
+        actor First owns SharedState {
+            entry check() emits none { require(second_variant() == 1); }
+        }
+        actor Second owns SharedState {
+            entry check() emits none { require(counter >= 0); }
+        }
+        actor enum Choice { First; Second; }
+        fn second_variant() -> int { return Choice::Second; }
+        app Test { actor First; actor Second; }
+    "#;
+    compile_inline("enum-helper.ag", source).expect("bound enum variant lowers to its ordinal");
+}
+
+#[test]
+fn helper_co_spent_rejects_method_arguments() {
+    let source = r#"
+        state GuardState { cov_id guard; }
+        actor Guard owns GuardState {
+            fn locally_present() -> bool { return guard.co_spent(guard); }
+            entry check() emits none { require(locally_present()); }
+        }
+        app GuardApp { actor Guard; }
+    "#;
+    let err = compile_inline("guard.ag", source).expect_err("co-spent does not take method arguments");
+    assert!(err.to_string().contains("unsupported method call `co_spent`"), "{err}");
+}
+
+#[test]
+fn source_helper_ast_keeps_global_constant_bindings_isolated() {
+    let source = r#"
+        const int LIMIT = 4;
+        state CounterState { int count; }
+        fn invalid() -> int { int LIMIT = 2; return LIMIT; }
+        actor Counter owns CounterState {
+            entry check() emits none { require(invalid() > 0); }
+        }
+        app CounterApp { actor Counter; }
+    "#;
+    let err = compile_inline("counter.ag", source).expect_err("helper local shadows a shared constant");
+    assert!(err.to_string().contains("binding `LIMIT` shadows a shared constant"), "{err}");
+}
+
+#[test]
+fn retained_global_helper_ast_renames_bound_variables() {
+    let out_dir = std::env::temp_dir().join(format!("argent-global-helper-bindings-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let source = r#"
+        const int LIMIT = 4;
+        state CounterState { int count; }
+        fn summarize(int value) -> int {
+            int result = value + LIMIT;
+            for (index, 0, 2, LIMIT) {
+                result = result + index;
+            }
+            return result;
+        }
+        actor Counter owns CounterState {
+            entry check() emits none { require(summarize(count) >= 0); }
+        }
+        app CounterApp { actor Counter; }
+    "#;
+    build_inline("counter.ag", source, &out_dir).expect("bound global helper compiles from its AST");
+    let sil = std::fs::read_to_string(out_dir.join("sil/Counter.sil")).expect("generated contract exists");
+    assert!(sil.contains("function summarize(int gen__glob_value): int"), "{sil}");
+    assert!(sil.contains("int gen__glob_result = gen__glob_value + LIMIT;"), "{sil}");
+    assert!(sil.contains("for (gen__glob_index, 0, 2, LIMIT)"), "{sil}");
+    assert!(sil.contains("gen__glob_result = gen__glob_result + gen__glob_index;"), "{sil}");
+    let _ = std::fs::remove_dir_all(out_dir);
+}
+
+#[test]
+fn retained_global_helper_ast_rejects_parameter_shadowing_a_shared_constant() {
+    let source = r#"
+        const int LIMIT = 4;
+        state CounterState { int count; }
+        fn invalid(int LIMIT) -> int { return LIMIT; }
+        actor Counter owns CounterState {
+            entry check() emits none { require(invalid(count) > 0); }
+        }
+        app CounterApp { actor Counter; }
+    "#;
+    let err = compile_inline("counter.ag", source).expect_err("helper parameter shadows a shared constant");
+    assert!(err.to_string().contains("binding `LIMIT` shadows a shared constant"), "{err}");
+}
+
+#[test]
+fn retained_global_helper_ast_rejects_loop_binding_shadowing_a_shared_constant() {
+    let source = r#"
+        const int LIMIT = 4;
+        state CounterState { int count; }
+        fn invalid() -> int {
+            int result = 0;
+            for (LIMIT, 0, 2, 2) { result = result + LIMIT; }
+            return result;
+        }
+        actor Counter owns CounterState {
+            entry check() emits none { require(invalid() >= 0); }
+        }
+        app CounterApp { actor Counter; }
+    "#;
+    let err = compile_inline("counter.ag", source).expect_err("helper loop binding shadows a shared constant");
+    assert!(err.to_string().contains("binding `LIMIT` shadows a shared constant"), "{err}");
+}
+
+#[test]
+fn entry_co_spent_lowers_in_initializers_and_conditions() {
+    let source = r#"
+        state GuardState { cov_id guard; }
+        actor Guard owns GuardState {
+            entry check() emits none {
+                bool present = guard.co_spent();
+                require(present && guard.co_spent());
+                if (guard.co_spent()) { require(true); }
+            }
+        }
+        app GuardApp { actor Guard; }
+    "#;
+    compile_inline("guard.ag", source).expect("entry co-spend compiles from the authored call site");
+}
+
+#[test]
+fn entry_co_spent_accepts_field_and_call_receivers_by_type() {
+    let source = r#"
+        state GuardState { cov_id guard; }
+        fn same(cov_id id) -> cov_id { return id; }
+        actor Guard owns GuardState {
+            entry check() emits none {
+                require(self.guard.co_spent() && same(guard).co_spent());
+            }
+        }
+        app GuardApp { actor Guard; }
+    "#;
+    compile_inline("guard.ag", source).expect("entry receiver types use bound AST lowering");
+}
+
+#[test]
+fn co_spent_rejects_a_call_returning_ordinary_bytes() {
+    let source = r#"
+        state GuardState { byte[32] guard; }
+        fn same(byte[32] id) -> byte[32] { return id; }
+        actor Guard owns GuardState {
+            entry check() emits none { require(same(guard).co_spent()); }
+        }
+        app GuardApp { actor Guard; }
+    "#;
+    let err = compile_inline("guard.ag", source).expect_err("ordinary byte results are not covenant IDs");
+    assert!(err.to_string().contains("requires one `cov_id` receiver"), "{err}");
 }
 
 #[test]
@@ -890,7 +1195,7 @@ const ChildState INITIAL_CHILD = ChildState {
     }
 "#,
             ["ChildState", "ChildDetail"].as_slice(),
-            ["spawned become children.child -> ChildApp::Child"].as_slice(),
+            ["validateOutputStateWithTemplate(gen__children_child_output_idx,"].as_slice(),
         ),
     ];
 
@@ -1154,7 +1459,7 @@ app ControllerApp {
     assert_eq!(compiled.apps().map(|(app, _)| app).collect::<Vec<_>>(), ["AssetApp", "ControllerApp"]);
     assert!(out_dir.join("apps/AssetApp/artifact.json").is_file());
     let controller_sil = std::fs::read_to_string(out_dir.join("sil/Controller.sil")).expect("controller Sil exists");
-    assert!(controller_sil.contains("byte constant ASSET_TAG = 0x01;"), "{controller_sil}");
+    assert!(controller_sil.contains("byte constant ASSET_TAG = 1;"), "{controller_sil}");
     let observed =
         &compiled.primary().argent.actors.iter().find(|actor| actor.name == "Controller").expect("controller artifact exists").entries
             [0]
@@ -1261,7 +1566,7 @@ fn body_app_reference_must_include_import_alias() {
 
     let error = build_file(temp.join("root.ag"), temp.join("out"))
         .expect_err("a linker-generated app name must not resolve an authored successor");
-    assert!(error.to_string().contains("unknown export `AssetApp`"), "{error}");
+    assert!(error.to_string().contains("unresolved qualified reference `AssetApp::A`"), "{error}");
     std::fs::remove_dir_all(temp).unwrap();
 }
 
@@ -1290,6 +1595,52 @@ fn local_state_does_not_conflict_with_linked_state() {
     .unwrap();
 
     build_file(temp.join("root.ag"), temp.join("out")).expect("unrelated local and linked S declarations may have different layouts");
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn co_spend_uses_imported_storage_type_despite_local_name_collision() {
+    let temp = std::env::temp_dir().join(format!("argent-linked-co-spend-type-{}", std::process::id()));
+    std::fs::create_dir_all(&temp).unwrap();
+    std::fs::write(
+        temp.join("asset.ag"),
+        "state S { byte[32] guard; } actor A owns S { entry hold() emits none {} } app AssetApp { actor A; }",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.join("root.ag"),
+        r#"
+        import "./asset.ag" as asset;
+        state S { cov_id guard; }
+        actor Root owns asset::S {
+            entry check() emits none { require(guard.co_spent()); }
+        }
+        app Test { actor Root; }
+        "#,
+    )
+    .unwrap();
+
+    let error = build_file(temp.join("root.ag"), temp.join("out")).expect_err("the local S must not supply the imported S field type");
+    assert!(error.to_string().contains("requires one `cov_id` receiver"), "{error}");
+    std::fs::write(
+        temp.join("asset.ag"),
+        "state S { cov_id guard; } actor A owns S { entry hold() emits none {} } app AssetApp { actor A; }",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.join("root.ag"),
+        r#"
+        import "./asset.ag" as asset;
+        state S { byte[32] guard; }
+        actor Root owns asset::S {
+            entry check() emits none { require(guard.co_spent()); }
+        }
+        app Test { actor Root; }
+        "#,
+    )
+    .unwrap();
+    build_file(temp.join("root.ag"), temp.join("out-valid"))
+        .expect("the imported S cov_id must remain valid despite the local S type");
     std::fs::remove_dir_all(temp).unwrap();
 }
 
@@ -1327,7 +1678,16 @@ fn dependencies_can_have_distinct_states_named_s() {
     )
     .unwrap();
 
-    build_file(temp.join("root.ag"), temp.join("out")).expect("each dependency keeps its own S layout");
+    let artifact = build_file(temp.join("root.ag"), temp.join("out")).expect("each dependency keeps its own S layout");
+    let linked_sources = artifact
+        .sil_abi
+        .structs
+        .iter()
+        .filter(|(_, structure)| structure.fields.len() == 1 && matches!(structure.fields[0].name.as_str(), "amount" | "active"))
+        .map(|(name, structure)| (name.as_str(), structure.fields[0].name.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(linked_sources.len(), 2, "distinct dependency states must retain separate ABI structs: {linked_sources:?}");
+    assert_ne!(linked_sources[0].0, linked_sources[1].0);
     std::fs::remove_dir_all(temp).unwrap();
 }
 

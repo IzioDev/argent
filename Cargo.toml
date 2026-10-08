@@ -30,6 +30,8 @@ serde_json = "1"
 silverscript-abi = { git = "https://github.com/kaspanet/silverscript", rev = "3ed973335b59269293564805cc2c58a14595ec03", package = "silverscript-abi" }
 silverscript-lang = { git = "https://github.com/kaspanet/silverscript", rev = "3ed973335b59269293564805cc2c58a14595ec03", package = "silverscript-lang" }
 tempfile = "3"
+# date literals in the pinned Sil AST use chrono, so do Argent
+chrono = { version = "0.4.45", default-features = false }
 thiserror = "2"
 
 [package]
@@ -55,6 +57,7 @@ argent-genesis = { workspace = true }
 argent-runtime = { workspace = true }
 blake2b_simd = { workspace = true }
 clap = { workspace = true }
+chrono = { workspace = true }
 colored = { workspace = true }
 kaspa-consensus-core = { workspace = true }
 kaspa-txscript = { workspace = true }

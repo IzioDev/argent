@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn skips_nested_block_comments() {
-    let tokens = lex("before /* outer /* inner */ outer */ after").expect("nested block comments must lex");
+    let tokens = lex_argent_source("before /* outer /* inner */ outer */ after").expect("nested block comments must lex");
     let identifiers = tokens
         .iter()
         .filter_map(|token| match &token.kind {
@@ -16,7 +16,7 @@ fn skips_nested_block_comments() {
 
 #[test]
 fn reports_unterminated_block_comment_location() {
-    let err = lex("before\n  /* never closed").expect_err("unterminated block comment must be rejected");
+    let err = lex_argent_source("before\n  /* never closed").expect_err("unterminated block comment must be rejected");
 
     assert_eq!(err.to_string(), "2:3: unterminated block comment");
 }
@@ -41,6 +41,13 @@ fn rejects_legacy_covenant_id_keyword() {
 }
 
 #[test]
-fn internal_lexing_accepts_generated_identifiers() {
-    lex("tx.outputs[gen__next_output_idx].value").expect("generated lowering text lexes");
+fn source_tokens_preserve_extended_literals_and_utf8() {
+    let source = r#"0x00 1_000 2e3 ^ "Caf\u00e9\n""#;
+    let tokens = lex_argent_source(source).expect("Argent source tokenization");
+    assert_eq!(tokens[0].kind, TokenKind::Number("0x00".to_string()));
+    assert_eq!(tokens[1].kind, TokenKind::Number("1_000".to_string()));
+    assert_eq!(tokens[2].kind, TokenKind::Number("2e3".to_string()));
+    assert_eq!(tokens[3].kind, TokenKind::Symbol('^'));
+    assert_eq!(tokens[4].kind, TokenKind::Str("Café\n".to_string()));
+    assert_eq!(&source[tokens[4].span.start..tokens[4].span.end], r#""Caf\u00e9\n""#);
 }

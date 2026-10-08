@@ -3,27 +3,48 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::compiler::loader::{ResolvedModules, load_inline_program};
-
-fn test_program(source: &str) -> ResolvedModules {
-    let path = PathBuf::from("body-lowering.ag");
-    load_inline_program(path, source.to_string()).expect("source resolves")
-}
+use crate::compiler::loader::SourceSet;
 
 fn lower_test_body(source: &str, actor_name: &str) -> String {
     lower_test_body_result(source, actor_name).expect("body lowers")
 }
 
 fn lower_test_body_result(source: &str, actor_name: &str) -> Result<String> {
-    let program = test_program(source);
-    let source = crate::compiler::model::ModelSource::new(&program, None).expect("source adapts");
-    let model = Model::from_source(&source).expect("model builds");
-    let actor = model.actor(actor_name).expect("actor exists");
-    let entry = actor.entries.first().expect("actor has an entry");
-    let state_values = ContractStateValuePlan::new(actor, &model).expect("state values plan");
-    let input_references =
-        super::super::state_boundary::plan_entry_input_references(actor, entry, &model, &state_values).expect("input references plan");
-    lower_entry_body(actor, entry, &model, &input_references, &state_values).map(|body| body.sil)
+    let sources = SourceSet::discover_inline(PathBuf::from("body-lowering.ag"), source.to_string())?;
+    sources.with_resolved(|program| {
+        let model = AppCompilationContext::from_resolved(
+            &program,
+            None,
+            &std::collections::BTreeMap::new(),
+            &crate::compiler::model::default_route_planner,
+        )?;
+        let actor = model.actor_by_decl(model.types.names[actor_name])?;
+        let entry = actor.entries.first().expect("actor has an entry");
+        let entry_id = model
+            .entry_model_by_id(crate::compiler::syntax::node::EntryId {
+                actor: model.types.names[&actor.name],
+                index: actor.entries.iter().position(|candidate| std::ptr::eq(candidate, entry)).expect("entry belongs to actor"),
+            })?
+            .id;
+        let state_values = StateValueTypes::new(entry_id.actor, &model)?;
+        let input_references =
+            super::super::state_boundary::plan_entry_input_references(entry_id, actor, entry, &model, &state_values)?;
+        let mut body = lower_entry_body(entry_id, actor, entry, &model, &input_references, &state_values)?;
+        let function = body.take_entrypoint(entry.name.clone(), Vec::new(), Vec::new());
+        let span = SilSpan::default();
+        let contract = silverscript_lang::ast::ContractAst {
+            pragma: None,
+            name: actor.name.clone(),
+            params: Vec::new(),
+            structs: Vec::new(),
+            fields: Vec::new(),
+            constants: Vec::new(),
+            functions: vec![function],
+            span,
+            name_span: span,
+        };
+        Ok(silverscript_lang::ast::format_contract_ast(&contract))
+    })
 }
 
 #[test]
@@ -66,6 +87,7 @@ fn lowers_singleton_and_ranged_input_values_by_lexical_binding() {
                     require(selected.balance >= 0);
                     require(balance_of(state(accounts[0])) >= 0);
                     require(accounts[0].value_note >= 0);
+                    int parent = 0;
                     require(parent.accounts[0].value >= 0);
                     require("accounts[0].value" == "accounts[0].value");
                 }
@@ -84,28 +106,26 @@ fn lowers_singleton_and_ranged_input_values_by_lexical_binding() {
     assert!(sil.contains("tx.inputs[gen__account_input_idx].value"), "singleton input value was not lowered:\n{sil}");
     assert!(
         sil.contains(
-            "tx.inputs[OpCovInputIdx(gen__cov_id, 2 + (gen__checked_range_index(gen__accounts_count, gen__accounts_count)))].value"
+            "tx.inputs[OpCovInputIdx(gen__cov_id, 2 + gen__checked_range_index(gen__accounts_count, gen__accounts_count))].value"
         ),
         "a one-past-end input index omitted its runtime check:\n{sil}"
     );
     assert!(
         sil.contains(
-            "tx.inputs[OpCovInputIdx(gen__cov_id, 2 + (gen__checked_range_index(positions[gen__accounts_count - 1], gen__accounts_count)))].value"
+            "tx.inputs[OpCovInputIdx(gen__cov_id, 2 + gen__checked_range_index(positions[gen__accounts_count - 1], gen__accounts_count))].value"
         ),
         "nested range index was not lowered:\n{sil}"
     );
     assert!(
-        sil.contains(
-            "tx.inputs[OpCovInputIdx(gen__cov_id, 2 + (gen__checked_range_index(positions[/* accounts[0].value */ 0], gen__accounts_count)))].value"
-        ),
-        "comments in the index expression were not preserved:\n{sil}"
+        sil.contains("tx.inputs[OpCovInputIdx(gen__cov_id, 2 + gen__checked_range_index(positions[0], gen__accounts_count))].value"),
+        "comments in the source must not turn an index into a field access:\n{sil}"
     );
     assert!(
-        sil.contains("tx.inputs[OpCovInputIdx(gen__cov_id, 2 + (/* guaranteed */ 0))].value"),
+        sil.contains("tx.inputs[OpCovInputIdx(gen__cov_id, 2 + 0)].value"),
         "a guaranteed literal index retained a runtime check:\n{sil}"
     );
     assert!(
-        sil.contains("tx.inputs[OpCovInputIdx(gen__cov_id, 2 + (gen__checked_range_index(1, gen__accounts_count)))].value"),
+        sil.contains("tx.inputs[OpCovInputIdx(gen__cov_id, 2 + gen__checked_range_index(1, gen__accounts_count))].value"),
         "an optional literal index omitted its runtime check:\n{sil}"
     );
     assert!(
@@ -120,7 +140,7 @@ fn lowers_singleton_and_ranged_input_values_by_lexical_binding() {
         "a variable field-projection index omitted its runtime check:\n{sil}"
     );
     assert!(
-        sil.contains(&format!("OpInputCovenantId(OpCovInputIdx(gen__cov_id, 2 + ({checked_position})))")),
+        sil.contains(&format!("OpInputCovenantId(OpCovInputIdx(gen__cov_id, 2 + {checked_position}))")),
         "a variable covenant-id index omitted its runtime check:\n{sil}"
     );
     assert!(
@@ -163,6 +183,7 @@ fn lowers_ranged_output_values_and_named_state_array_routes() {
                     require(next[/* next[0].value */ 0].value >= 0);
                     require(next[0].balance >= 0);
                     require(next.length_note >= 0);
+                    int parent = 0;
                     require(parent.next.length >= 0);
                     require(parent.next[0].value >= 0);
                     require("next[0].value" == "next[0].value");
@@ -195,8 +216,8 @@ fn lowers_ranged_output_values_and_named_state_array_routes() {
         "an optional output index omitted its runtime check:\n{sil}"
     );
     assert!(
-        sil.contains("tx.outputs[OpAuthOutputIdx(this.activeInputIndex, /* next[0].value */ 0)].value"),
-        "comments in the output index were not preserved:\n{sil}"
+        sil.contains("tx.outputs[OpAuthOutputIdx(this.activeInputIndex, 0)].value"),
+        "comments in the source must not turn an output index into a field access:\n{sil}"
     );
     assert!(sil.contains("next[0].balance"), "ordinary output-handle syntax changed:\n{sil}");
     assert!(sil.contains("next.length_note"), "a longer output member name was rewritten:\n{sil}");
@@ -232,6 +253,8 @@ fn checks_literal_zero_against_optional_input_and_output_range_lengths() {
             } {
                 require(accounts[0].value >= 0);
                 require(next[0].value >= 0);
+                require(accounts[accounts.length].value >= 0);
+                require(next[next.length].value >= 0);
                 unrestricted(tail_out.value);
                 become {
                     next <- Account[](next_states),
@@ -248,12 +271,20 @@ fn checks_literal_zero_against_optional_input_and_output_range_lengths() {
     let sil = lower_test_body(source, "Batch");
 
     assert!(
-        sil.contains("tx.inputs[OpCovInputIdx(gen__cov_id, 1 + (gen__checked_range_index(0, gen__accounts_count)))].value"),
+        sil.contains("tx.inputs[OpCovInputIdx(gen__cov_id, 1 + gen__checked_range_index(0, gen__accounts_count))].value"),
         "literal zero could alias the trailing input when the optional input range is empty:\n{sil}"
     );
     assert!(
         sil.contains("tx.outputs[OpAuthOutputIdx(this.activeInputIndex, gen__checked_range_index(0, gen__next_output_count))].value"),
         "literal zero could alias the trailing output when the optional output range is empty:\n{sil}"
+    );
+    assert!(
+        sil.contains("gen__checked_range_index(gen__accounts_count, gen__accounts_count)"),
+        "nested input range length was not lowered before its runtime check:\n{sil}"
+    );
+    assert!(
+        sil.contains("gen__checked_range_index(gen__next_output_count, gen__next_output_count)"),
+        "nested output range length was not lowered before its runtime check:\n{sil}"
     );
     crate::compile_inline("optional-range-index-zero.ag", source)
         .expect("optional range literal-zero checks compile through the SIL backend");
@@ -328,13 +359,12 @@ fn rejects_literal_range_value_indices_that_can_never_exist() {
 
 #[test]
 fn records_ranged_current_inputs_as_reference_collections() {
-    let program = test_program(
+    let sources = SourceSet::discover_inline(
+        PathBuf::from("body-ranged-inputs.ag"),
         r#"
             const int MAX_ACCOUNTS = 3;
 
-            state BatchState {
-                cov_id source_id;
-            }
+            state BatchState {}
 
             state AccountState {
                 int balance;
@@ -345,12 +375,6 @@ fn records_ranged_current_inputs_as_reference_collections() {
                 consumes {
                     accounts: Account[1..=MAX_ACCOUNTS],
                 }
-                observes source by self.source_id {
-                    inputs {
-                        previous: Account[1..=MAX_ACCOUNTS],
-                    }
-                    outputs {}
-                }
                 emits none {}
             }
 
@@ -360,23 +384,59 @@ fn records_ranged_current_inputs_as_reference_collections() {
                 actor Batch;
                 actor Account;
             }
-        "#,
-    );
-    let source = crate::compiler::model::ModelSource::new(&program, None).expect("source adapts");
-    let model = Model::from_source(&source).expect("model builds");
-    let actor = model.actor("Batch").expect("actor exists");
-    let entry = actor.entries.first().expect("actor has an entry");
-    let state_values = ContractStateValuePlan::new(actor, &model).expect("state values plan");
-    let input_references =
-        super::super::state_boundary::plan_entry_input_references(actor, entry, &model, &state_values).expect("input references plan");
-    let lowerer = BodyLowerer::new(actor, entry, &model, EntryInputReferenceView::Complete(&input_references), &state_values)
-        .expect("body lowerer builds");
-
-    assert_eq!(lowerer.bindings.source_type("accounts"), None);
-    assert_eq!(lowerer.bindings.lowered_type("accounts"), None);
-    let item = lowerer.input_reference_for_expr("accounts[0]", 0).expect("range index lowers").expect("item reference exists");
-    assert_eq!(item.reference(), "accounts[0]");
-    assert_eq!(item.source_identity(), "AccountState");
+        "#
+        .to_string(),
+    )
+    .expect("source discovers");
+    sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(
+                &program,
+                None,
+                &std::collections::BTreeMap::new(),
+                &crate::compiler::model::default_route_planner,
+            )?;
+            let actor = model.actor_by_decl(model.types.names["Batch"])?;
+            let entry = actor.entries.first().expect("actor has an entry");
+            let entry_id = model
+                .entry_model_by_id(crate::compiler::syntax::node::EntryId {
+                    actor: model.types.names[&actor.name],
+                    index: actor.entries.iter().position(|candidate| std::ptr::eq(candidate, entry)).expect("entry belongs to actor"),
+                })?
+                .id;
+            let state_values = StateValueTypes::new(entry_id.actor, &model)?;
+            let input_references =
+                super::super::state_boundary::plan_entry_input_references(entry_id, actor, entry, &model, &state_values)?;
+            let account = model
+                .entry_model_by_id(crate::compiler::syntax::node::EntryId {
+                    actor: model.types.names[&actor.name],
+                    index: actor.entries.iter().position(|candidate| std::ptr::eq(candidate, entry)).expect("entry belongs to actor"),
+                })?
+                .current()
+                .inputs()
+                .iter()
+                .find(|input| input.handle() == "accounts")
+                .expect("accounts interaction");
+            assert!(
+                model
+                    .input_plan_by_id(crate::compiler::syntax::node::EntryId {
+                        actor: model.types.names[&actor.name],
+                        index: actor
+                            .entries
+                            .iter()
+                            .position(|candidate| std::ptr::eq(candidate, entry))
+                            .expect("entry belongs to actor")
+                    })?
+                    .consumed_range(account.id())
+                    .is_some()
+            );
+            let input = input_references.consumed(account.id())?;
+            assert_eq!(input.reference(), "accounts");
+            let target = model.state_lowering_by_id(entry_id.actor)?.target(input.physical_target()).expect("account target");
+            assert_eq!(target.source().as_str(), "AccountState");
+            Ok(())
+        })
+        .expect("ranged input references are planned");
 }
 
 #[test]
@@ -465,7 +525,8 @@ fn unrestricted_validates_ranged_output_indices_under_the_handle_policy() {
     "#;
     for index in ["-1", "3"] {
         let invalid = source.replace("UNRESTRICTED", &format!("unrestricted(next[{index}].value);"));
-        let err = lower_test_body_result(&invalid, "Batch").expect_err("unrestricted must enforce the declared maximum");
+        let err = crate::compile_inline(format!("unrestricted-ranged-output-invalid-{index}.ag"), &invalid)
+            .expect_err("unrestricted must enforce the declared maximum");
         assert!(
             err.to_string().contains(&format!("range `next` index `{index}` is outside its declared positions `0..3`")),
             "unexpected error: {err}"

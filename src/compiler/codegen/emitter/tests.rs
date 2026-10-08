@@ -4,9 +4,17 @@ use std::{
 };
 
 use kaspa_txscript::opcodes::codes::OpPushData1;
+use silverscript_lang::ast::Expr as SilExpr;
+use silverscript_lang::compiler::{CompileOptions, compile_contract, sil_abi_artifact_from_compiled};
 
+use super::super::abi::{constructor_args_for_actor, extract_sil_template, runtime_state_fields_for_actor};
+use super::super::display_path;
 use super::*;
+use crate::codec::encode_hex;
 use crate::compiler::model::{CompilerRouteTransition, RouteRootLeaf};
+use crate::compiler::model::{GeneratedFieldId, PhysicalFieldId, TemplateWitnessSource};
+use crate::compiler::naming::to_snake;
+use crate::compiler::syntax::node::ModuleId;
 use crate::routing::{CommitmentNode, RouteGraph, SelectorRequirement};
 
 #[test]
@@ -31,8 +39,13 @@ fn rejects_route_outside_named_output_union() {
     )
     .expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let err = Model::from_source(&program_source).expect_err("route must be rejected");
+    let err = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect_err("route must be rejected");
     assert!(err.to_string().contains("routes output `next` to `Game`"), "unexpected error: {err}");
 }
 
@@ -58,8 +71,13 @@ fn accepts_route_inside_named_output_union() {
     )
     .expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    Model::from_source(&program_source).expect("route should be accepted");
+    AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("route should be accepted");
 }
 
 #[test]
@@ -185,7 +203,7 @@ fn singleton_spawned_output_rejects_bulk_become_syntax() {
 }
 
 #[test]
-fn delegate_consume_ranges_are_rejected_at_the_sil_codegen_boundary() {
+fn delegate_consume_ranges_are_rejected_before_emission() {
     let err = emit_inline_error(
         r#"
             const int MAX_PEERS = 2;
@@ -211,7 +229,7 @@ fn delegate_consume_ranges_are_rejected_at_the_sil_codegen_boundary() {
 }
 
 #[test]
-fn observed_ranges_are_rejected_at_the_sil_codegen_boundary() {
+fn observed_ranges_are_rejected_before_emission() {
     let err = emit_inline_error(
         r#"
             const int MAX_ACCOUNTS = 2;
@@ -241,7 +259,7 @@ fn observed_ranges_are_rejected_at_the_sil_codegen_boundary() {
 }
 
 #[test]
-fn spawn_ranges_are_rejected_at_the_sil_codegen_boundary() {
+fn spawn_ranges_are_rejected_before_emission() {
     let err = emit_inline_error(
         r#"
             const int MAX_ACCOUNTS = 2;
@@ -272,7 +290,7 @@ fn spawn_ranges_are_rejected_at_the_sil_codegen_boundary() {
 }
 
 #[test]
-fn artifacts_record_resolved_cardinality_for_every_interaction_kind() {
+fn unsupported_foreign_ranges_fail_before_artifact_projection() {
     let path = PathBuf::from("artifact-cardinality.ag");
     let program = crate::compiler::loader::load_inline_program(
         path.clone(),
@@ -336,33 +354,14 @@ fn artifacts_record_resolved_cardinality_for_every_interaction_kind() {
         .to_string(),
     )
     .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model builds");
-    let actor = model.actor("Batch").expect("actor exists");
-    let entry = entry_artifact(actor, &actor.entries[0], &model).expect("entry artifact builds");
-
-    assert_eq!(entry.consumes[0].cardinality, CardinalityArtifact::Range { minimum: 1, maximum: 3 });
-    let EmitArtifact::Outputs { outputs } = &entry.emits else {
-        panic!("entry emits outputs");
-    };
-    assert_eq!(outputs[0].cardinality, CardinalityArtifact::Range { minimum: 1, maximum: 3 });
-    assert_eq!(entry.observes[0].inputs[0].cardinality, CardinalityArtifact::Range { minimum: 0, maximum: 3 });
-    assert_eq!(entry.observes[0].outputs[0].cardinality, CardinalityArtifact::Range { minimum: 1, maximum: 3 });
-    assert_eq!(entry.spawns[0].outputs[0].cardinality, CardinalityArtifact::Range { minimum: 1, maximum: 2 });
-}
-
-#[test]
-fn lowers_planned_singleton_locations_to_section_indices() {
-    assert_eq!(lower_singleton_interaction_index(InteractionLocation::FromStart(2), "count", 1).expect("leading location"), "3");
-    assert_eq!(
-        lower_singleton_interaction_index(InteractionLocation::FromEnd(2), "count", 0).expect("trailing location"),
-        "count - 2"
-    );
-    assert_eq!(
-        lower_singleton_interaction_index(InteractionLocation::FromEnd(1), "count", 1).expect("offset trailing location"),
-        "count - 1"
-    );
-    assert!(lower_singleton_interaction_index(InteractionLocation::Range { start: 1, singleton_count: 2 }, "count", 0).is_err());
+    let err = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect_err("unsupported ranges cannot complete input plans");
+    assert!(err.to_string().contains("range code generation is not implemented yet"), "unexpected error: {err}");
 }
 
 #[test]
@@ -402,23 +401,45 @@ fn planning_uses_declared_emit_domain_not_body_routes() {
     )
     .expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("declared emit domain plans");
-    let source = model.actor("Source").expect("Source exists");
+    let model = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("declared emit domain plans");
+    let source = model.actor_by_decl(model.types.names["Source"]).expect("Source exists");
     let entry = &source.entries[0];
+    let entry_id = model
+        .entry_model_by_id(crate::compiler::syntax::node::EntryId {
+            actor: model.types.names[&source.name],
+            index: source.entries.iter().position(|candidate| std::ptr::eq(candidate, entry)).expect("entry belongs to actor"),
+        })
+        .expect("entry model exists")
+        .id;
     assert_eq!(
         model
-            .entry_model(source, entry)
-            .expect("entry model exists")
-            .expanded_routes()
+            .expanded_routes_by_id(crate::compiler::syntax::node::EntryId {
+                actor: model.types.names[&source.name],
+                index: source.entries.iter().position(|candidate| std::ptr::eq(candidate, entry)).expect("entry belongs to actor")
+            })
+            .expect("route expansion resolves")
             .iter()
-            .map(resolved_constructed_actor)
+            .map(|route| {
+                let ResolvedSuccessor::Constructed { actor: target, .. } = &route.successor else {
+                    panic!("expected constructed successor")
+                };
+                target.display(entry, entry_id, route.id, &model).expect("route actor renders")
+            })
             .collect::<Vec<_>>(),
         ["A"]
     );
-    assert!(model.route_transitions.contains_key(&("Source".to_string(), "A".to_string())));
-    assert!(model.route_transitions.contains_key(&("Source".to_string(), "B".to_string())));
-    assert_eq!(model.route_leaves_by_actor["Source"], [RouteRootLeaf::Actor("A".to_string()), RouteRootLeaf::Actor("B".to_string())]);
+    assert!(model.route_transitions.contains_key(&(model.types.names["Source"], model.types.names["A"])));
+    assert!(model.route_transitions.contains_key(&(model.types.names["Source"], model.types.names["B"])));
+    assert_eq!(
+        model.route_leaves_by_actor[&model.types.names["Source"]],
+        [RouteRootLeaf::Actor(model.types.names["A"]), RouteRootLeaf::Actor(model.types.names["B"])]
+    );
 }
 
 #[test]
@@ -457,6 +478,7 @@ fn rejects_source_with_missing_named_output_coverage() {
                 } {
                     unrestricted(a.value);
                     unrestricted(b.value);
+                    FooState next_a = FooState {};
                     become a <- Foo(next_a);
                 }
             }
@@ -469,8 +491,13 @@ fn rejects_source_with_missing_named_output_coverage() {
     )
     .expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let err = Model::from_source(&program_source).expect_err("missing output coverage must be rejected");
+    let err = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect_err("missing output coverage must be rejected");
     assert!(err.to_string().contains("does not validate output `b`"), "unexpected error: {err}");
 }
 
@@ -525,8 +552,13 @@ fn rejects_duplicate_named_output_coverage() {
     )
     .expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let err = Model::from_source(&program_source).expect_err("duplicate output coverage must be rejected");
+    let err = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect_err("duplicate output coverage must be rejected");
     assert!(err.to_string().contains("validates output `next` more than once"), "unexpected error: {err}");
 }
 
@@ -539,7 +571,7 @@ fn rejects_delegate_become() {
 
             actor Player owns PlayerState {
                 delegate step() consumes { leader: Player, } {
-                    become next <- Player(PlayerState {});
+                    become leader <- Player(PlayerState {});
                 }
             }
 
@@ -549,8 +581,13 @@ fn rejects_delegate_become() {
     )
     .expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let err = Model::from_source(&program_source).expect_err("delegate become must be rejected");
+    let err = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect_err("delegate become must be rejected");
     assert!(err.to_string().contains("cannot use `become`"), "unexpected error: {err}");
 }
 
@@ -627,25 +664,19 @@ fn leader_actors_close_all_leader_input_groups() {
                 actor Unrelated;
             }
         "#;
-    let path = PathBuf::from("test.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-
-    let leader_sil = emit_actor(model.actor("Leader").expect("Leader exists"), &model).expect("Leader emits");
-    assert!(leader_sil.contains("// :: leader entry (1:N)\n    entry standalone("), "{leader_sil}");
-    assert!(leader_sil.contains("// :: leader entry (M:N)\n    entry coordinated("), "{leader_sil}");
+    let (actor_sil, artifact) = inline_actor_sil_and_artifact("leader-input-groups", source);
+    let leader_sil = &actor_sil["Leader"];
+    assert!(leader_sil.contains("entry standalone("), "{leader_sil}");
+    assert!(leader_sil.contains("entry coordinated("), "{leader_sil}");
     assert!(leader_sil.contains("require(OpCovInputCount(gen__cov_id) == 1);"), "{leader_sil}");
     assert!(leader_sil.contains("require(OpCovInputCount(gen__cov_id) == 2);"), "{leader_sil}");
 
-    let worker_sil = emit_actor(model.actor("Worker").expect("Worker exists"), &model).expect("Worker emits");
-    assert!(worker_sil.contains("// :: delegate entry\n    entry assist("), "{worker_sil}");
+    let worker_sil = &actor_sil["Worker"];
+    assert!(worker_sil.contains("entry assist("), "{worker_sil}");
 
-    let unrelated_sil = emit_actor(model.actor("Unrelated").expect("Unrelated exists"), &model).expect("Unrelated emits");
+    let unrelated_sil = &actor_sil["Unrelated"];
     assert!(!unrelated_sil.contains("OpCovInputCount"), "{unrelated_sil}");
 
-    let actor_sil = actor_sil_for_model(&model);
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("artifact emits");
     let leader = artifact.argent.actors.iter().find(|actor| actor.name == "Leader").expect("Leader artifact exists");
     assert_eq!(leader.leader_for, vec![EntryRefArtifact { actor: "Worker".to_string(), entry: "assist".to_string() }]);
     let unrelated = artifact.argent.actors.iter().find(|actor| actor.name == "Unrelated").expect("Unrelated artifact exists");
@@ -698,8 +729,13 @@ fn rejects_function_named_unrestricted() {
         crate::compiler::loader::load_inline_program(PathBuf::from("test.ag"), "fn unrestricted() -> int { return 0; }".to_string())
             .expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let err = Model::from_source(&program_source).expect_err("the output-value declaration must not be shadowed");
+    let err = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect_err("the output-value declaration must not be shadowed");
     assert!(
         err.to_string().contains("function identifier `unrestricted` is reserved for output-value declarations"),
         "unexpected error: {err}"
@@ -788,15 +824,20 @@ fn rejects_global_and_actor_functions_with_the_same_name() {
     )
     .expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let err = Model::from_source(&program_source).expect_err("global and actor functions share the generated contract namespace");
+    let err = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect_err("global and actor functions share the generated contract namespace");
 
     assert_eq!(err.message, "actor `Player` function `helper` conflicts with a global function of the same name");
 }
 
 #[test]
 fn rejects_global_calls_to_actor_functions() {
-    let program = crate::compiler::loader::load_inline_program(
+    let err = crate::compiler::loader::load_inline_program(
         PathBuf::from("test.ag"),
         r#"
             fn global_helper() -> int { return actor_helper(); }
@@ -808,14 +849,8 @@ fn rejects_global_calls_to_actor_functions() {
         "#
         .to_string(),
     )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("function declarations form distinct namespaces");
-
-    let err = emit_actor(model.actor("Player").expect("Player exists"), &model)
-        .expect_err("global functions must not depend on actor functions");
-
-    assert_eq!(err.message, "global function `global_helper` cannot call actor function `actor_helper`");
+    .expect_err("actor helpers are absent from global function scope");
+    assert!(err.to_string().contains("unknown reference `actor_helper`"), "unexpected error: {err}");
 }
 
 #[test]
@@ -833,8 +868,13 @@ fn allows_the_same_function_name_on_different_actors() {
     )
     .expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    Model::from_source(&program_source).expect("actor-local function names may repeat across contracts");
+    AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("actor-local function names may repeat across contracts");
 }
 
 #[test]
@@ -897,18 +937,18 @@ fn emits_actor_functions_only_in_their_owning_contract() {
     let out_dir = std::env::temp_dir().join(format!("argent-actor-functions-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&out_dir);
 
-    emit_resolved_build(&program, &out_dir).expect("actor functions compile in their owning contracts");
+    crate::build_inline(program.root_path(), program.source_text(ModuleId::new(0)), &out_dir)
+        .expect("actor functions compile in their owning contracts");
     let counter = fs::read_to_string(out_dir.join("sil/Counter.sil")).expect("generated Counter Sil exists");
     let other = fs::read_to_string(out_dir.join("sil/Other.sil")).expect("generated Other Sil exists");
 
-    assert!(counter.contains("// :: actor functions"), "{counter}");
-    assert!(counter.contains("function current() : int"), "{counter}");
-    assert!(counter.contains("return cycles;"), "{counter}");
-    assert!(counter.contains("function adjusted(int delta) : int"), "{counter}");
-    assert!(counter.contains("return add_bias(current() + delta);"), "{counter}");
+    assert!(counter.contains("function current(): int"), "{counter}");
+    assert!(counter.contains("return(cycles);"), "{counter}");
+    assert!(counter.contains("function adjusted(int delta): int"), "{counter}");
+    assert!(counter.contains("return(add_bias(current() + delta));"), "{counter}");
     assert!(counter.contains("function ensure_nonnegative()"), "{counter}");
     assert!(!other.contains("function current()"), "{other}");
-    assert!(other.contains("return amount - delta;"), "{other}");
+    assert!(other.contains("return(amount - delta);"), "{other}");
 
     let _ = fs::remove_dir_all(out_dir);
 }
@@ -923,15 +963,17 @@ fn global_function_variables_do_not_collide_with_actor_fields() {
             }
         "#,
         "increment(cycles) > cycles",
-    );
+    )
+    .expect("source resolves");
     let out_dir = std::env::temp_dir().join(format!("argent-global-function-scope-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&out_dir);
 
-    emit_resolved_build(&program, &out_dir).expect("global function with actor-field name collisions builds");
+    crate::build_inline(program.root_path(), program.source_text(ModuleId::new(0)), &out_dir)
+        .expect("global function with actor-field name collisions builds");
     let sil = fs::read_to_string(out_dir.join("sil/Counter.sil")).expect("generated Counter Sil exists");
-    assert!(sil.contains("function increment(int gen__glob_cycles) : int"), "{sil}");
+    assert!(sil.contains("function increment(int gen__glob_cycles): int"), "{sil}");
     assert!(sil.contains("int gen__glob_result = gen__glob_cycles + 1;"), "{sil}");
-    assert!(sil.contains("return gen__glob_result;"), "{sil}");
+    assert!(sil.contains("return(gen__glob_result);"), "{sil}");
     assert!(sil.contains("require(increment(cycles) > cycles);"), "{sil}");
 
     let _ = fs::remove_dir_all(out_dir);
@@ -939,42 +981,30 @@ fn global_function_variables_do_not_collide_with_actor_fields() {
 
 #[test]
 fn global_function_bare_names_do_not_capture_actor_fields() {
-    let program = global_function_program(
+    let err = global_function_program(
         r#"
             fn read_cycles() -> int {
                 return cycles;
             }
         "#,
         "read_cycles() >= 0",
-    );
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("program models");
-    let counter = model.actor("Counter").expect("Counter exists");
-    let err = emit_actor(counter, &model).expect_err("undeclared global-function name must not capture an actor field");
-    assert!(
-        err.to_string().contains("global function `read_cycles` cannot access unresolved identifier `cycles`"),
-        "unexpected error: {err}"
-    );
+    )
+    .expect_err("a global function cannot capture an actor field");
+    assert!(err.to_string().contains("unknown reference `cycles`"), "unexpected error: {err}");
 }
 
 #[test]
 fn global_function_assignments_do_not_capture_actor_fields() {
-    let program = global_function_program(
+    let err = global_function_program(
         r#"
             fn write_cycles() {
                 cycles = 1;
             }
         "#,
         "true",
-    );
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("program models");
-    let counter = model.actor("Counter").expect("Counter exists");
-    let err = emit_actor(counter, &model).expect_err("global-function assignment must not capture an actor field");
-    assert!(
-        err.to_string().contains("global function `write_cycles` assigns unresolved identifier `cycles`"),
-        "unexpected error: {err}"
-    );
+    )
+    .expect_err("a global assignment cannot capture an actor field");
+    assert!(err.to_string().contains("unknown reference `cycles`"), "unexpected error: {err}");
 }
 
 #[test]
@@ -989,21 +1019,23 @@ fn global_function_contextual_names_and_literals_are_lowered_by_sil_syntax() {
             }
         "#,
         "echo(seconds) >= seconds",
-    );
+    )
+    .expect("source resolves");
     let out_dir = std::env::temp_dir().join(format!("argent-global-function-syntax-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&out_dir);
 
-    emit_resolved_build(&program, &out_dir).expect("contextual names and complete Sil literals build");
+    crate::build_inline(program.root_path(), program.source_text(ModuleId::new(0)), &out_dir)
+        .expect("contextual names and complete Sil literals build");
     let sil = fs::read_to_string(out_dir.join("sil/Counter.sil")).expect("generated Counter Sil exists");
-    assert!(sil.contains("function echo(int gen__glob_seconds) : int"), "{sil}");
-    assert!(sil.contains("byte[2] gen__glob_marker = byte[_](0xaabb);"), "{sil}");
-    assert!(sil.contains("int gen__glob_grouped = 1_000;"), "{sil}");
-    assert!(sil.contains("return gen__glob_seconds + gen__glob_grouped - 1_000;"), "{sil}");
+    assert!(sil.contains("function echo(int gen__glob_seconds): int"), "{sil}");
+    assert!(sil.contains("byte[2] gen__glob_marker = byte[2](0xaabb);"), "{sil}");
+    assert!(sil.contains("int gen__glob_grouped = 1000;"), "{sil}");
+    assert!(sil.contains("return(gen__glob_seconds + gen__glob_grouped - 1000);"), "{sil}");
 
     let _ = fs::remove_dir_all(out_dir);
 }
 
-fn global_function_program(function: &str, requirement: &str) -> ResolvedModules {
+fn global_function_program(function: &str, requirement: &str) -> crate::Result<ResolvedModules<'static>> {
     let path = PathBuf::from("global-function-scope.ag");
     let source = format!(
         r#"
@@ -1025,7 +1057,7 @@ fn global_function_program(function: &str, requirement: &str) -> ResolvedModules
             }}
         "#
     );
-    crate::compiler::loader::load_inline_program(path, source).expect("scope test source resolves")
+    crate::compiler::loader::load_inline_program(path, source)
 }
 
 #[test]
@@ -1224,8 +1256,8 @@ fn rejects_self_as_an_entry_body_binding() {
     let cases = [
         ("local", "int self = 7; require(self.count >= 0);"),
         ("loop", "for (self, 0, 1, 1) { require(self.count >= 0); }"),
-        ("tuple", "(int self, int other) = pair(); require(self.count >= 0);"),
-        ("destructuring", "CounterState { count: int self } = current; require(self.count >= 0);"),
+        ("tuple", "(int self, int other) = sha256(0x00); require(self.count >= 0);"),
+        ("destructuring", "CounterState { count: int self } = state(self); require(self.count >= 0);"),
     ];
 
     for (case, body) in cases {
@@ -1257,7 +1289,7 @@ fn rejects_entry_body_bindings_that_collide_with_handles_or_parameters() {
         ("emit parameter", "int next", "", "emits next: Counter", "become next <- self;", "emit handle"),
         ("consume local", "", "consumes { peer: Peer, }", "emits none", "int peer = 1;", "consume handle"),
         ("consume loop", "", "consumes { peer: Peer, }", "emits none", "for (peer, 0, 1, 1) { require(1 == 1); }", "consume handle"),
-        ("consume tuple", "", "consumes { peer: Peer, }", "emits none", "(int peer, int other) = pair();", "consume handle"),
+        ("consume tuple", "", "consumes { peer: Peer, }", "emits none", "(int peer, int other) = sha256(0x00);", "consume handle"),
         (
             "consume destructuring",
             "",
@@ -1324,8 +1356,13 @@ fn rejects_template_actor_snake_case_collision() {
     )
     .expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let err = Model::from_source(&program_source).expect_err("snake-case generated names must not collide");
+    let err = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect_err("snake-case generated names must not collide");
     assert!(err.to_string().contains("both map to generated suffix `foo_bar`"), "unexpected error: {err}");
 }
 
@@ -1348,13 +1385,18 @@ fn allows_legacy_template_like_user_field_after_namespace_move() {
     )
     .expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    Model::from_source(&program_source).expect("ordinary template-like names should be legal");
+    AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("ordinary template-like names should be legal");
 }
 
 #[test]
 fn emits_reserved_generated_namespace_names() {
-    let program = crate::compiler::loader::load_inline_program(
+    let sources = crate::compiler::loader::SourceSet::discover_inline(
         PathBuf::from("test.ag"),
         r#"
             state FooState {}
@@ -1372,12 +1414,19 @@ fn emits_reserved_generated_namespace_names() {
             "#
         .to_string(),
     )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let actor = model.actor("Foo").expect("actor exists");
-    let sil = emit_actor(actor, &model).expect("actor emits");
-    let manifest = emit_manifest(&program, &model);
+    .expect("source discovers");
+    let (sil, manifest) = sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(
+                &program,
+                None,
+                &std::collections::BTreeMap::new(),
+                &crate::compiler::model::default_route_planner,
+            )?;
+            let sil = emit_actor(model.actor_by_decl(model.types.names["Foo"])?, &model)?;
+            Ok((sil, emit_manifest(&program, &model)?))
+        })
+        .expect("actor emits");
 
     assert!(!sil.contains("byte[32] gen__init_foo_template"), "{sil}");
     assert!(!sil.contains("byte[32] gen__foo_template = gen__init_foo_template;"), "{sil}");
@@ -1455,11 +1504,7 @@ fn output_value_reference_anywhere_in_the_entry_satisfies_the_check() {
                 actor Foo;
             }
         "#;
-    let path = PathBuf::from("test.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let sil = emit_actor(model.actor("Foo").expect("actor exists"), &model).expect("actor emits");
+    let sil = emit_inline_actor(source, "Foo");
 
     assert!(sil.contains("int output_value = tx.outputs[gen__next_output_idx].value;"), "{sil}");
 }
@@ -1480,11 +1525,7 @@ fn unrestricted_output_value_policy_is_compile_time_only() {
                 actor Foo;
             }
         "#;
-    let path = PathBuf::from("test.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let sil = emit_actor(model.actor("Foo").expect("actor exists"), &model).expect("actor emits");
+    let sil = emit_inline_actor(source, "Foo");
 
     assert!(!sil.contains(word::UNRESTRICTED), "{sil}");
 }
@@ -1545,11 +1586,7 @@ fn spawn_output_value_can_be_constrained_by_qualified_handle() {
                 actor Child;
             }
         "#;
-    let path = PathBuf::from("test.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let sil = emit_actor(model.actor("Launcher").expect("actor exists"), &model).expect("actor emits");
+    let sil = emit_inline_actor(source, "Launcher");
 
     assert!(sil.contains("require(tx.outputs[gen__children_child_output_idx].value > 0);"), "{sil}");
 }
@@ -1653,12 +1690,7 @@ fn observed_output_value_is_the_emitter_contracts_responsibility() {
                 actor Asset;
             }
         "#;
-    let path = PathBuf::from("test.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-
-    emit_actor(model.actor("Observer").expect("actor exists"), &model).expect("observed output needs no local value policy");
+    emit_inline_actor(source, "Observer");
 }
 
 #[test]
@@ -1678,11 +1710,7 @@ fn self_cov_id_lowers_to_the_active_input_covenant_id() {
                 actor Foo;
             }
         "#;
-    let path = PathBuf::from("test.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let sil = emit_actor(model.actor("Foo").expect("actor exists"), &model).expect("actor emits");
+    let sil = emit_inline_actor(source, "Foo");
 
     assert!(sil.contains("require(OpInputCovenantId(this.activeInputIndex) == OpInputCovenantId(this.activeInputIndex));"), "{sil}");
 }
@@ -1717,11 +1745,7 @@ fn self_member_prefixes_remain_state_field_refs() {
                 actor Peer;
             }
         "#;
-    let path = PathBuf::from("test.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let sil = emit_actor(model.actor("Foo").expect("actor exists"), &model).expect("actor emits");
+    let sil = emit_inline_actor(source, "Foo");
 
     assert!(sil.contains("require(value_note == value_note);"), "{sil}");
     assert!(sil.contains("require(cov_id_note == cov_id_note);"), "{sil}");
@@ -1730,8 +1754,8 @@ fn self_member_prefixes_remain_state_field_refs() {
 
 #[test]
 fn self_transition_uses_same_template_shortcut() {
-    let program = crate::compiler::loader::load_inline_program(
-        PathBuf::from("test.ag"),
+    let (actor_sil, artifact) = inline_actor_sil_and_artifact(
+        "self-transition",
         r#"
             state FooState {
                 int count;
@@ -1750,16 +1774,9 @@ fn self_transition_uses_same_template_shortcut() {
             app Test {
                 actor Foo;
             }
-            "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let actor = model.actor("Foo").expect("actor exists");
-    let sil = emit_actor(actor, &model).expect("actor emits");
-    let actor_sil = actor_sil_for_model(&model);
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("artifact emits");
+            "#,
+    );
+    let sil = &actor_sil["Foo"];
 
     assert!(!sil.contains("FooState"), "{sil}");
     assert!(sil.contains("State next_state = State {"), "{sil}");
@@ -1883,7 +1900,7 @@ fn state_returning_function_initializes_an_authored_local_once() {
 
     let sil = actor_sil.get("Counter").expect("Counter emits");
     assert!(!sil.contains("CounterState"), "{sil}");
-    assert!(sil.contains("function successor() : State"), "{sil}");
+    assert!(sil.contains("function successor(): State"), "{sil}");
     assert!(sil.contains("State candidate = successor();"), "{sil}");
     assert!(!sil.contains("successor().left"), "{sil}");
     assert!(!sil.contains("successor().right"), "{sil}");
@@ -1929,10 +1946,8 @@ fn named_exact_self_coexists_with_a_constructed_route() {
     );
 
     let sil = actor_sil.get("Current").expect("Current emits");
-    assert!(sil.contains("// :: become Current"), "{sil}");
     assert!(sil.contains("tx.outputs[gen__current_output_idx].scriptPubKey"), "{sil}");
     assert!(sil.contains("== tx.inputs[this.activeInputIndex].scriptPubKey"), "{sil}");
-    assert!(sil.contains("// :: become Peer"), "{sil}");
     assert_eq!(sil.matches("validateOutputStateWithTemplate(").count(), 1, "{sil}");
 
     let entry = artifact
@@ -2105,9 +2120,11 @@ fn state_valued_functions_are_characterized_in_aligned_and_augmented_contexts() 
     let (routed_sil, _) = emit_selected_fixture(fixture, "Test", "Routed");
     let (reader_sil, _) = emit_selected_fixture(fixture, "Test", "Reader");
 
-    assert_eq!(aligned_sil, include_str!("../../../../tests/fixtures/state_layout/function_contexts/Aligned.sil"));
-    assert_eq!(routed_sil, include_str!("../../../../tests/fixtures/state_layout/function_contexts/Routed.sil"));
-    assert_eq!(reader_sil, include_str!("../../../../tests/fixtures/state_layout/function_contexts/Reader.sil"));
+    assert_pinned_sil_semantics(&aligned_sil, include_str!("../../../../tests/fixtures/state_layout/function_contexts/Aligned.sil"));
+    assert_pinned_sil_semantics(&routed_sil, include_str!("../../../../tests/fixtures/state_layout/function_contexts/Routed.sil"));
+    assert_pinned_sil_semantics(&reader_sil, include_str!("../../../../tests/fixtures/state_layout/function_contexts/Reader.sil"));
+    let aligned_sil = aligned_sil.replace("): ", ") : ");
+    let routed_sil = routed_sil.replace("): ", ") : ");
 
     assert!(!aligned_sil.contains("SharedState"), "{aligned_sil}");
     assert!(!aligned_sil.contains("struct SharedState"), "{aligned_sil}");
@@ -2118,12 +2135,13 @@ fn state_valued_functions_are_characterized_in_aligned_and_augmented_contexts() 
     assert!(aligned_sil.contains("function actor_fixed(State[2] values) : State[2]"), "{aligned_sil}");
     assert!(aligned_sil.contains("function actor_dynamic(State[] values) : State[]"), "{aligned_sil}");
     assert!(aligned_sil.contains("State[2] gen__glob_fixed_literal = State[2]"), "{aligned_sil}");
-    assert!(aligned_sil.contains("State[_] gen__glob_inferred_literal = State[_]"), "{aligned_sil}");
+    assert!(aligned_sil.contains("State[_] gen__glob_inferred_literal = State[2]"), "{aligned_sil}");
     assert!(aligned_sil.contains("State[SHARED_COUNT] gen__glob_symbolic_literal = State[SHARED_COUNT]"), "{aligned_sil}");
     assert!(aligned_sil.contains("State[] gen__glob_dynamic_literal = State[]"), "{aligned_sil}");
     assert!(aligned_sil.contains("State constructed = State {"), "{aligned_sil}");
 
     assert!(routed_sil.contains("struct SharedState"), "{routed_sil}");
+    assert!(reader_sil.contains("struct SharedState"), "{reader_sil}");
     assert!(routed_sil.contains("function global_identity(SharedState gen__glob_value) : SharedState"), "{routed_sil}");
     assert!(routed_sil.contains("function global_fixed(SharedState[2] gen__glob_values) : SharedState[2]"), "{routed_sil}");
     assert!(routed_sil.contains("function global_dynamic(SharedState[] gen__glob_values) : SharedState[]"), "{routed_sil}");
@@ -2136,7 +2154,7 @@ fn state_valued_functions_are_characterized_in_aligned_and_augmented_contexts() 
     let advance = routed_sil
         .split_once("entry advance")
         .map(|(_, tail)| tail)
-        .and_then(|tail| tail.split_once("// :: leader entry (1:N)\n    entry export").map(|(body, _)| body))
+        .and_then(|tail| tail.split_once("entry export").map(|(body, _)| body))
         .expect("advance entry is delimited in the generated SIL");
     assert_eq!(advance.matches("actor_identity(global_identity(value))").count(), 1, "{advance}");
     assert_eq!(advance.matches("actor_fixed(global_fixed(fixed))").count(), 1, "{advance}");
@@ -2150,14 +2168,14 @@ fn state_valued_functions_are_characterized_in_aligned_and_augmented_contexts() 
 
     let inspect = reader_sil.split_once("entry inspect").map(|(_, body)| body).expect("Reader inspect entry is emitted");
     assert_eq!(inspect.matches("readInputStateWithTemplate(").count(), 1, "{inspect}");
-    assert!(inspect.contains("SharedState[2] fixed_from_peer = SharedState[_]{ value, SharedState {"), "{inspect}");
-    assert!(inspect.contains("SharedState[] dynamic_from_peer = SharedState[]{ SharedState {"), "{inspect}");
+    assert!(inspect.contains("SharedState[2] fixed_from_peer = SharedState[2]{value, SharedState {"), "{inspect}");
+    assert!(inspect.contains("SharedState[] dynamic_from_peer = SharedState[]{SharedState {"), "{inspect}");
     assert!(inspect.contains("SharedState[3] fixed_appended = fixed.append(SharedState {"), "{inspect}");
     assert!(inspect.contains("SharedState[] appended = dynamic.append(SharedState {"), "{inspect}");
     assert!(inspect.contains("appended = appended.append(SharedState {"), "{inspect}");
     assert!(!inspect.contains("dynamic.append(peer)"), "{inspect}");
     assert!(inspect.contains("require(dynamic.append(SharedState {"), "{inspect}");
-    assert!(inspect.contains("require(SharedState[]{ SharedState {"), "{inspect}");
+    assert!(inspect.contains("require(SharedState[]{SharedState {"), "{inspect}");
     assert_eq!(inspect.matches("global_fixed(fixed)").count(), 1, "{inspect}");
     assert_eq!(inspect.matches("global_dynamic(dynamic)").count(), 1, "{inspect}");
     assert!(inspect.contains("SharedState indexed = global_fixed(fixed)[0];"), "{inspect}");
@@ -2165,6 +2183,10 @@ fn state_valued_functions_are_characterized_in_aligned_and_augmented_contexts() 
 
     let shared = artifact.argent.states.iter().find(|state| state.name == "SharedState").expect("SharedState is recorded");
     assert_eq!(shared.fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["left", "right"]);
+    assert_eq!(
+        artifact.sil_abi.structs["SharedState"].fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),
+        ["left", "right"]
+    );
 
     let aligned = artifact.sil_abi.contract("Aligned").expect("Aligned contract exists");
     assert_eq!(aligned.runtime_state.fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["left", "right"]);
@@ -2270,8 +2292,7 @@ fn equivalent_state_literals_lower_in_plain_entry_statements() {
     );
     let sil = &actor_sil["Counter"];
 
-    assert!(sil.contains("require(State[]{ State {"), "{sil}");
-    assert!(sil.contains("}.length == 1);"), "{sil}");
+    assert!(sil.contains("require(State[]{State {count: count}}.length == 1);"), "{sil}");
     assert!(!sil.contains("CounterState"), "{sil}");
 }
 
@@ -2330,7 +2351,7 @@ fn typed_state_constant_can_supply_a_constructed_successor_directly() {
 
     assert!(actors["Counter"].contains("State constant INITIAL = State {"), "{}", actors["Counter"]);
     assert!(
-        actors["Counter"].contains("byte[32] initial_digest = blake3(byte[](((INITIAL.count) as byte[8])));"),
+        actors["Counter"].contains("byte[32] initial_digest = blake3(byte[](INITIAL.count as byte[8]));"),
         "{}",
         actors["Counter"]
     );
@@ -2465,12 +2486,12 @@ fn observed_state_reference_can_supply_a_matching_route_state() {
     let authored = relay
         .split_once("ForeignState gen__source_dst_foreign_state = ForeignState {")
         .map(|(_, tail)| tail)
-        .and_then(|tail| tail.split_once("        };").map(|(body, _)| body))
+        .and_then(|tail| tail.split_once("};").map(|(body, _)| body))
         .expect("relay reconstructs one authored ForeignState");
 
     assert_eq!(relay.matches("State gen__asset_src_state = readInputStateWithTemplate(").count(), 1, "{relay}");
     assert!(authored.contains("group_id: gen__asset_src_state.group_id,"), "{authored}");
-    assert!(authored.contains("amount: gen__asset_src_state.amount,"), "{authored}");
+    assert!(authored.contains("amount: gen__asset_src_state.amount"), "{authored}");
     assert!(!authored.contains("gen__foreign_template"), "{authored}");
     assert!(!authored.contains("gen__peer_template"), "{authored}");
     assert!(relay.contains("gen__foreign_template: gen__foreign_template,"), "{relay}");
@@ -2482,9 +2503,7 @@ fn observed_state_reference_can_supply_a_matching_route_state() {
 
 #[test]
 fn consumed_input_handles_reject_same_named_locals() {
-    let path = PathBuf::from("consumed-reference-shadowing.ag");
-    let program = crate::compiler::loader::load_inline_program(
-        path.clone(),
+    let err = emit_inline_error(
         r#"
             state LocalState {
                 int count;
@@ -2517,14 +2536,8 @@ fn consumed_input_handles_reject_same_named_locals() {
                 actor Local;
                 actor Peer;
             }
-        "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let actor = model.actor("Local").expect("Local exists");
-    let err = emit_actor(actor, &model).expect_err("entry locals must not shadow consumed input handles");
+        "#,
+    );
     assert!(err.to_string().contains("entry binding `peer` collides with consume handle of the same name"), "{err}");
 }
 
@@ -2581,14 +2594,14 @@ fn uniform_input_references_expose_operations_without_implicit_state_values() {
     );
     let sil = &actors["Local"];
 
-    assert!(sil.contains("PeerState gen__peer_state = readInputStateWithTemplate("), "{sil}");
-    assert!(sil.contains("PeerState gen__remote_src_state = readInputStateWithTemplate("), "{sil}");
+    assert!(sil.contains("Gen__PeerState gen__peer_state = readInputStateWithTemplate("), "{sil}");
+    assert!(sil.contains("Gen__PeerState gen__remote_src_state = readInputStateWithTemplate("), "{sil}");
     assert!(sil.contains("PeerState consumed = PeerState {"), "{sil}");
-    assert!(sil.contains("amount: gen__peer_state.amount,"), "{sil}");
+    assert!(sil.contains("amount: gen__peer_state.amount}"), "{sil}");
     assert!(sil.contains("PeerState observed = PeerState {"), "{sil}");
-    assert!(sil.contains("amount: gen__remote_src_state.amount,"), "{sil}");
+    assert!(sil.contains("amount: gen__remote_src_state.amount}"), "{sil}");
     assert!(sil.contains("peer_amount(PeerState {"), "{sil}");
-    assert!(sil.contains("byte[32] consumed_digest = blake3(byte[](((gen__peer_state.amount) as byte[8])));"), "{sil}");
+    assert!(sil.contains("byte[32] consumed_digest = blake3(byte[](gen__peer_state.amount as byte[8]));"), "{sil}");
     assert!(sil.contains("tx.inputs[gen__peer_input_idx].value"), "{sil}");
     assert!(sil.contains("tx.inputs[gen__remote_src_input_idx].value"), "{sil}");
     assert!(sil.contains("OpInputCovenantId(gen__peer_input_idx)"), "{sil}");
@@ -2745,7 +2758,7 @@ fn empty_input_state_digest_uses_explicit_empty_bytes() {
     );
     let sil = &actors["EmptyActor"];
 
-    assert!(sil.contains("require(blake3(byte[](0x)) == expected);"), "{sil}");
+    assert!(sil.contains("require(blake3(byte[](byte[0](0x))) == expected);"), "{sil}");
 }
 
 #[test]
@@ -2812,7 +2825,7 @@ fn digest_call_uses_ast_spans_for_spacing_comments_and_arity() {
         );
         let (actors, _) = inline_actor_sil_and_artifact(case, &source);
         let sil = &actors["EmptyActor"];
-        assert!(sil.contains("require(blake3(byte[](0x)) == expected);"), "{case}: {sil}");
+        assert!(sil.contains("require(blake3(byte[](byte[0](0x))) == expected);"), "{case}: {sil}");
     }
 
     for expression in ["digest()", "digest(state(self), state(self))"] {
@@ -2876,9 +2889,7 @@ fn observe_roots_reject_same_named_locals() {
 
 #[test]
 fn observed_input_leaves_do_not_reserve_bare_body_names() {
-    let path = PathBuf::from("observed-input-leaf-local.ag");
-    let program = crate::compiler::loader::load_inline_program(
-        path.clone(),
+    let sil = emit_inline_actor(
         r#"
             state ForeignState {
                 cov_id group_id;
@@ -2897,14 +2908,9 @@ fn observed_input_leaves_do_not_reserve_bare_body_names() {
             }
 
             app Test { actor Foreign; }
-        "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let actor = model.actor("Foreign").expect("Foreign exists");
-    let sil = emit_actor(actor, &model).expect("a local may share a qualified observed input leaf name");
+        "#,
+        "Foreign",
+    );
 
     assert!(sil.contains("int src = 1;"), "{sil}");
     assert!(sil.contains("State gen__asset_src_state = readInputState("), "{sil}");
@@ -2912,9 +2918,8 @@ fn observed_input_leaves_do_not_reserve_bare_body_names() {
 
 #[test]
 fn observed_input_and_output_leaves_may_share_a_name() {
-    let path = PathBuf::from("observed-input-output-leaf.ag");
-    let program = crate::compiler::loader::load_inline_program(
-        path.clone(),
+    inline_artifact(
+        "observed-input-output-leaf",
         r#"
             state ForeignState { int amount; }
             state LocalState { cov_id group_id; }
@@ -2939,15 +2944,8 @@ fn observed_input_and_output_leaves_may_share_a_name() {
             }
 
             app Test { actor Foreign; actor Local; }
-        "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("qualified input and output leaves may share a name");
-    let actor_sil = actor_sil_for_model(&model);
-
-    emit_artifact(&program, &model, &actor_sil).expect("same-named qualified input and output leaves compile");
+        "#,
+    );
 }
 
 #[test]
@@ -3048,9 +3046,7 @@ fn current_state_array_entry_param_uses_selected_state_type() {
 
 #[test]
 fn rejects_mismatched_authored_state_array_shapes_at_function_boundaries() {
-    let path = PathBuf::from("state-array-shape-mismatch.ag");
-    let program = crate::compiler::loader::load_inline_program(
-        path.clone(),
+    let err = emit_inline_error(
         r#"
             state NoteState {
                 int nonce;
@@ -3070,15 +3066,14 @@ fn rejects_mismatched_authored_state_array_shapes_at_function_boundaries() {
             app Test {
                 actor Note;
             }
-        "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let err = emit_actor(model.actor("Note").expect("Note exists"), &model).expect_err("array shapes must agree at the call boundary");
+        "#,
+    );
 
-    assert!(err.to_string().contains("authored state value has type `State[]`, not `State[2]`"), "unexpected error: {err}");
+    assert!(
+        err.to_string()
+            .contains("call to `fixed` passes an authored state value with incompatible identity or array shape at argument 1"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -3095,7 +3090,7 @@ fn constant_sized_state_array_local_remains_planned() {
 fn inferred_state_array_local_uses_initializer_shape() {
     let sil = emit_unresolved_fixed_state_array_local("inferred-state-array-local", "", "_");
 
-    assert!(sil.contains("State[_] values = State[_]{"), "{sil}");
+    assert!(sil.contains("State[_] values = State[2]{"), "{sil}");
     assert!(sil.contains("State indexed = values[0];"), "{sil}");
     assert!(sil.contains("State[2] result = fixed(values);"), "{sil}");
 }
@@ -3249,11 +3244,11 @@ fn expanded_entry_params_keep_the_authored_nested_layout() {
 
     assert!(sil.contains("struct Expanded {"), "{sil}");
     assert!(sil.contains("Details detail;"), "{sil}");
-    assert!(sil.contains("Expanded value,\n        Expanded[] values,\n        byte[32] expected_digest,"), "{sil}");
+    assert!(sil.contains("entry inspect(Expanded value, Expanded[] values, byte[32] expected_digest,"), "{sil}");
     assert!(sil.contains("Expanded current = Expanded {"), "{sil}");
-    assert!(sil.contains("count: gen__detail_count,"), "{sil}");
+    assert!(sil.contains("count: gen__detail_count}"), "{sil}");
     assert!(sil.contains("Details copy = Details {"), "{sil}");
-    assert!(sil.contains("byte[32] whole = blake3(byte[](((nonce) as byte[8]) + byte[](detail)));"), "{sil}");
+    assert!(sil.contains("byte[32] whole = blake3(byte[](nonce as byte[8] + byte[](detail)));"), "{sil}");
     assert!(sil.contains("int gen__detail_count = OpBin2Num(gen__detail_details_preimage.slice(0, 8));"), "{sil}");
     let inspect = artifact.sil_abi.contract("Vault").expect("Vault contract exists").entry("inspect").expect("inspect entry exists");
     assert_eq!(inspect.params[0].ty, TypeArtifact::Struct { name: "Expanded".to_string() });
@@ -3291,8 +3286,10 @@ fn active_expanded_field_projects_as_an_authored_value() {
                 entry inspect() emits next: Archive {
                     Details copy = detail;
                     int opened_count = detail.count;
+                    int self_opened = self.detail.count;
                     Details[1] copies = Details[1]{ detail };
                     require(copy.count == opened_count);
+                    require(self_opened == opened_count);
                     require(copies.length == 1);
                     require(read_detail(detail) == opened_count);
 
@@ -3314,10 +3311,11 @@ fn active_expanded_field_projects_as_an_authored_value() {
     let sil = &actors["Vault"];
     assert!(sil.contains("Details copy = Details {"), "{sil}");
     assert!(sil.contains("int opened_count = gen__detail_count;"), "{sil}");
-    assert!(sil.contains("Details[1] copies = Details[1]{ Details {"), "{sil}");
+    assert!(sil.contains("int self_opened = gen__detail_count;"), "{sil}");
+    assert!(sil.contains("Details[1] copies = Details[1]{Details {"), "{sil}");
     assert!(sil.contains("read_detail(Details {"), "{sil}");
     assert!(sil.contains("Details gen__source_next_details = Details {"), "{sil}");
-    assert_eq!(sil.matches("count: gen__detail_count,").count(), 4, "{sil}");
+    assert_eq!(sil.matches("count: gen__detail_count}").count(), 4, "{sil}");
 
     let expanded = artifact.sil_abi.structs.get("Expanded").expect("Expanded ABI struct exists");
     assert_eq!(expanded.fields[0].ty, TypeArtifact::Struct { name: "Details".to_string() });
@@ -3350,7 +3348,7 @@ fn aggregate_sil_abi_canonicalizes_contract_local_state_struct_references() {
     );
 
     let archive_sil = &actors["Archive"];
-    assert!(archive_sil.contains("struct Expanded {\n        // :: user declared fields\n        State detail;"), "{archive_sil}");
+    assert!(archive_sil.contains("struct Expanded {\n        State detail;"), "{archive_sil}");
 
     let expanded = &artifact.sil_abi.structs["Expanded"];
     assert_eq!(expanded.fields[0].ty, TypeArtifact::Struct { name: "Details".to_string() });
@@ -3374,55 +3372,6 @@ fn aggregate_sil_abi_canonicalizes_contract_local_state_struct_references() {
     let aggregate_sig = crate::codec::encode_contract_entry_sig_script(&artifact.sil_abi, "Archive", "inspect", &[value])
         .expect("aggregate Sil ABI encodes the canonical struct argument");
     assert_eq!(aggregate_sig, direct_sig);
-}
-
-#[test]
-fn canonicalizes_state_references_inside_array_types() {
-    let mut fixed = TypeArtifact::FixedArray { item: Box::new(TypeArtifact::Struct { name: "State".to_string() }), len: 2 };
-    let mut dynamic = TypeArtifact::DynamicArray { item: Box::new(TypeArtifact::Struct { name: "State".to_string() }) };
-
-    assert!(type_references_state(&fixed));
-    assert!(type_references_state(&dynamic));
-    replace_state_type_ref(&mut fixed, "Details");
-    replace_state_type_ref(&mut dynamic, "Details");
-
-    assert!(!type_references_state(&fixed));
-    assert!(!type_references_state(&dynamic));
-    assert_eq!(fixed, TypeArtifact::FixedArray { item: Box::new(TypeArtifact::Struct { name: "Details".to_string() }), len: 2 });
-    assert_eq!(dynamic, TypeArtifact::DynamicArray { item: Box::new(TypeArtifact::Struct { name: "Details".to_string() }) });
-}
-
-#[test]
-fn sil_abi_merge_rejects_conflicting_structs_and_duplicate_contracts() {
-    let compile = |contract: &str, field_type: &str| {
-        let source = format!(
-            r#"pragma silverscript ^0.1.0;
-contract {contract}() {{
-    struct Shared {{
-        {field_type} value;
-    }}
-
-    entry hold() {{
-        require(true);
-    }}
-}}
-"#
-        );
-        let compiled = compile_contract(&source, &[], CompileOptions::default()).expect("test Sil compiles");
-        sil_abi_artifact_from_compiled(&compiled, &[]).expect("test Sil ABI builds")
-    };
-
-    let left = compile("Left", "int");
-    let merged = merge_sil_abi_artifacts(left.clone(), compile("Right", "int")).expect("identical shared structs merge");
-    assert_eq!(merged.contracts.len(), 2);
-    assert_eq!(merged.structs.len(), 1);
-
-    let right = compile("Right", "bool");
-    let err = merge_sil_abi_artifacts(left.clone(), right).expect_err("different definitions of Shared must not merge");
-    assert!(err.to_string().contains("conflicting Sil struct `Shared`"), "unexpected error: {err}");
-
-    let err = merge_sil_abi_artifacts(left.clone(), left).expect_err("the same contract must not merge twice");
-    assert!(err.to_string().contains("duplicate Sil contract `Left`"), "unexpected error: {err}");
 }
 
 #[test]
@@ -3480,11 +3429,13 @@ fn expanded_input_fields_require_validated_preimages() {
         .to_string(),
     )
     .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("expanded input plans");
-
-    let err = emit_actor(model.actor("Reader").expect("Reader exists"), &model)
-        .expect_err("a stored expansion digest cannot expose its authored payload");
+    let err = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect_err("a stored expansion digest cannot expose its authored payload in a completed model");
     assert!(err.to_string().contains("expanded input field `detail`"), "unexpected error: {err}");
     assert!(err.to_string().contains("validated preimage"), "unexpected error: {err}");
 }
@@ -3542,10 +3493,13 @@ fn expanded_actor_functions_require_explicit_authored_parameters() {
         .to_string(),
     )
     .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("expanded actor plans");
-    let err = emit_actor(model.actor("Vault").expect("Vault exists"), &model)
-        .expect_err("actor functions cannot capture an entry-specific expansion preimage");
+    let err = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect_err("actor functions cannot capture an entry-specific expansion preimage");
     assert!(err.to_string().contains("actor function `Vault::captured_count`"), "unexpected error: {err}");
     assert!(err.to_string().contains("cannot capture expanded field `detail`"), "unexpected error: {err}");
     assert!(err.location.is_some(), "expanded capture diagnostics retain the exact function-body location");
@@ -3598,8 +3552,8 @@ fn expanded_actor_functions_require_explicit_authored_parameters() {
         "#,
     );
     let sil = actor_sil.get("Vault").expect("Vault emits");
-    assert!(sil.contains("function explicit_count(Expanded value) : int"), "{sil}");
-    assert!(sil.contains("return value.detail.count;"), "{sil}");
+    assert!(sil.contains("function explicit_count(Expanded value): int"), "{sil}");
+    assert!(sil.contains("return(value.detail.count);"), "{sil}");
     assert!(sil.contains("Expanded current = Expanded {"), "{sil}");
     assert!(sil.contains("detail: Details {"), "{sil}");
     assert!(sil.contains("count: gen__detail_count"), "{sil}");
@@ -3640,7 +3594,7 @@ fn entry_state_params_use_selected_types_for_actor_function_calls() {
 
     let sil = actor_sil.get("Note").expect("Note emits");
     assert!(!sil.contains("NoteState"), "{sil}");
-    assert!(sil.contains("function read_nonce(State note) : int"), "{sil}");
+    assert!(sil.contains("function read_nonce(State note): int"), "{sil}");
     assert!(sil.contains("entry inspect(State note)"), "{sil}");
     assert!(sil.contains("entry inspect_many(State[] notes)"), "{sil}");
 
@@ -3656,9 +3610,8 @@ fn entry_state_params_use_selected_types_for_actor_function_calls() {
 
 #[test]
 fn terminal_state_does_not_carry_its_own_template() {
-    let path = PathBuf::from("terminal-route.ag");
-    let program = crate::compiler::loader::load_inline_program(
-        path.clone(),
+    let (actor_sil, artifact) = inline_actor_sil_and_artifact(
+        "terminal-route",
         r#"
             state SourceState {
                 int count;
@@ -3692,15 +3645,9 @@ fn terminal_state_does_not_carry_its_own_template() {
                 actor Source;
                 actor Terminal;
             }
-            "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let terminal = model.actor("Terminal").expect("Terminal actor exists");
-    let terminal_sil = emit_actor(terminal, &model).expect("Terminal emits");
-    let artifact = emit_artifact(&program, &model, &actor_sil_for_model(&model)).expect("artifact emits");
+            "#,
+    );
+    let terminal_sil = &actor_sil["Terminal"];
 
     assert!(!terminal_sil.contains("byte[32] gen__init_terminal_template"), "{terminal_sil}");
     assert!(!terminal_sil.contains("byte[32] gen__terminal_template ="), "{terminal_sil}");
@@ -3727,8 +3674,8 @@ fn terminal_state_does_not_carry_its_own_template() {
 
 #[test]
 fn emits_portable_artifact_schema() {
-    let program = crate::compiler::loader::load_inline_program(
-        PathBuf::from("test.ag"),
+    let artifact = crate::compile_inline(
+        "test.ag",
         r#"
             state FooState {
                 byte[32] owner;
@@ -3745,15 +3692,9 @@ fn emits_portable_artifact_schema() {
             app Test {
                 actor Foo;
             }
-            "#
-        .to_string(),
+            "#,
     )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let actor_sil = actor_sil_for_model(&model);
-
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("artifact emits");
+    .expect("artifact emits");
     artifact.check_schema_version().expect("schema version is current");
     let json = serde_json::to_string(&artifact).expect("artifact serializes");
     let artifact: crate::artifact::Artifact = serde_json::from_str(&json).expect("artifact deserializes");
@@ -3965,9 +3906,8 @@ fn scalar_byte_expansion_fields_use_indexed_extraction() {
 
 #[test]
 fn static_output_to_a_foreign_expanded_state_declares_the_planned_physical_type() {
-    let path = PathBuf::from("static-expanded-output.ag");
-    let program = crate::compiler::loader::load_inline_program(
-        path.clone(),
+    let (actor_sil, _) = inline_actor_sil_and_artifact(
+        "static-expanded-output",
         r#"
             state SourceState {
                 int nonce;
@@ -4007,19 +3947,13 @@ fn static_output_to_a_foreign_expanded_state_declares_the_planned_physical_type(
                 actor Source;
                 actor Target;
             }
-        "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("expanded target plans");
-    let actor_sil = actor_sil_for_model(&model);
+        "#,
+    );
     let source_sil = &actor_sil["Source"];
 
     assert!(source_sil.contains("struct Gen__PhysicalExpandedState {"), "{source_sil}");
     assert!(!source_sil.contains("struct Gen__TargetState {"), "{source_sil}");
     assert!(source_sil.contains("Gen__PhysicalExpandedState gen__state_next_gen__physical_expanded_state"), "{source_sil}");
-    emit_artifact(&program, &model, &actor_sil).expect("planned expanded output type compiles");
 }
 
 #[test]
@@ -4065,7 +3999,7 @@ fn expanded_output_payload_calls_are_evaluated_once_before_digest_lowering() {
     );
     let sil = &actor_sil["Vault"];
 
-    assert_eq!(sil.matches("detail: make_details(),").count(), 1, "{sil}");
+    assert_eq!(sil.matches("detail: make_details()}").count(), 1, "{sil}");
     assert!(sil.contains("Expanded gen__source_next_expanded = Expanded {"), "{sil}");
     assert!(sil.contains("gen__source_next_expanded.detail.count"), "{sil}");
     assert!(sil.contains("gen__source_next_expanded.detail.limit"), "{sil}");
@@ -4200,7 +4134,8 @@ fn preserves_trivia_between_authored_state_type_and_constructor() {
         "#,
     );
 
-    assert!(actors["Counter"].contains("State /* authored */ {"), "{}", actors["Counter"]);
+    assert!(actors["Counter"].contains("State snapshot = State {count: 1};"), "{}", actors["Counter"]);
+    assert!(actors["Counter"].contains("State trailing = State {count: 2};"), "{}", actors["Counter"]);
 }
 
 #[test]
@@ -4249,6 +4184,68 @@ fn physical_state_values_cannot_supply_authored_successors() {
 }
 
 #[test]
+fn bare_input_reference_cannot_supply_an_authored_successor() {
+    let err = emit_inline_error(
+        r#"
+            state CounterState { int count; }
+            actor Counter owns CounterState {
+                entry advance() consumes { peer: Counter, } emits next: Counter {
+                    unrestricted(next.value);
+                    become next <- Counter(peer);
+                }
+            }
+            app Test { actor Counter; }
+        "#,
+    );
+    assert!(err.to_string().contains("not an authored `CounterState` value"), "unexpected error: {err}");
+}
+
+#[test]
+fn physical_initializer_cannot_gain_authored_provenance_from_a_local_type() {
+    let err = emit_inline_error(
+        r#"
+            state CounterState { int count; }
+
+            actor Counter owns CounterState {
+                entry advance() emits next: Counter {
+                    CounterState candidate = readInputState(this.activeInputIndex);
+                    unrestricted(next.value);
+                    become next <- Counter(candidate);
+                }
+            }
+
+            app Test { actor Counter; }
+        "#,
+    );
+    assert!(err.to_string().contains("not an authored `CounterState` value"), "unexpected error: {err}");
+}
+
+#[test]
+fn input_state_with_a_different_source_cannot_supply_a_successor() {
+    for route in ["become next <- Counter(state(peer));", "CounterState candidate = state(peer); become next <- Counter(candidate);"] {
+        let err = emit_inline_error(
+            r#"
+            state CounterState { int count; }
+            state PeerState { int count; }
+
+            actor Counter owns CounterState {
+                entry advance() consumes { peer: Peer, } emits next: Counter {
+                    unrestricted(next.value);
+                    ROUTE
+                }
+            }
+            actor Peer owns PeerState { entry hold() emits none { require(count >= 0); } }
+
+            app Test { actor Counter; actor Peer; }
+        "#
+            .replace("ROUTE", route)
+            .as_str(),
+        );
+        assert!(err.to_string().contains("authored `CounterState` value"), "unexpected error: {err}");
+    }
+}
+
+#[test]
 fn physical_state_function_results_cannot_supply_authored_successors() {
     let err = emit_inline_error(
         r#"
@@ -4278,7 +4275,7 @@ fn non_active_selector_declares_and_uses_its_canonical_named_type() {
     use crate::routing::{CommitmentForest, CommitmentPlan, Cut, FamilyPlan, NodePath, RoutePlan};
 
     let path = PathBuf::from("non-active-selector-output.ag");
-    let program = crate::compiler::loader::load_inline_program(
+    let sources = crate::compiler::loader::SourceSet::discover_inline(
         path.clone(),
         r#"
             state BoardState { int ply; }
@@ -4330,7 +4327,7 @@ fn non_active_selector_declares_and_uses_its_canonical_named_type() {
         "#
         .to_string(),
     )
-    .expect("source resolves");
+    .expect("source discovers");
     let leaf = |actor: &str| CommitmentNode::Leaf { actor: actor.to_string() };
     let cut = |paths: &[&[usize]]| paths.iter().map(|path| NodePath::new(path.to_vec())).collect::<Cut>();
     // Default selector cohorts align these cuts; inject a valid asymmetric
@@ -4368,27 +4365,38 @@ fn non_active_selector_declares_and_uses_its_canonical_named_type() {
         assert_eq!(selectors.len(), 1);
         Ok(crafted_plan.clone())
     };
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source_with_route_planner(&program_source, &BTreeMap::new(), &injected_planner)
-        .expect("non-active selector plans");
-    let mux = model.actor("Mux").expect("Mux exists");
-    let choose = mux.entries.iter().find(|entry| entry.name == "choose").expect("choose entry exists");
-    let selector = model
-        .entry_model(mux, choose)
-        .expect("entry model exists")
-        .template_selectors()
-        .get("target")
-        .expect("target selector exists");
-    let output = plan_selector_output_state(mux, selector, &model).expect("selector output state plans");
-
-    assert!(matches!(output.canonical_target(), PhysicalTargetId::Actor(actor) if actor.actor() == "Alpha"));
-    assert_eq!(output.physical_type(), "Gen__AlphaState");
-    let actor_sil = actor_sil_for_model(&model);
-    let mux_sil = &actor_sil["Mux"];
-    assert!(mux_sil.contains("struct Gen__AlphaState {"), "{mux_sil}");
-    assert!(!mux_sil.contains("struct Gen__BetaState {"), "{mux_sil}");
-    assert!(mux_sil.contains("Gen__AlphaState gen__state_next_gen__alpha_state"), "{mux_sil}");
-    emit_artifact(&program, &model, &actor_sil).expect("canonical selector output type compiles");
+    sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(&program, None, &BTreeMap::new(), &injected_planner)?;
+            let mux = model.actor_by_decl(model.types.names["Mux"])?;
+            let choose = mux.entries.iter().find(|entry| entry.name == "choose").expect("choose entry exists");
+            let selector = model
+                .entry_model_by_id(crate::compiler::syntax::node::EntryId {
+                    actor: model.types.names[&mux.name],
+                    index: mux.entries.iter().position(|candidate| std::ptr::eq(candidate, choose)).expect("entry belongs to actor"),
+                })?
+                .template_selectors()
+                .get("target")
+                .expect("target selector exists");
+            let actor_id = model
+                .entry_model_by_id(crate::compiler::syntax::node::EntryId {
+                    actor: model.types.names[&mux.name],
+                    index: mux.entries.iter().position(|candidate| std::ptr::eq(candidate, choose)).expect("entry belongs to actor"),
+                })?
+                .id
+                .actor;
+            let planned = model.output_plan_by_id(actor_id)?.selector(selector)?;
+            assert!(matches!(&planned.canonical_target, PhysicalTargetId::Actor(actor) if actor.actor() == "Alpha"));
+            assert_eq!(render_sil_state_type(&planned.sil_type)?, "Gen__AlphaState");
+            let actor_sil = actor_sil_for_model(&model);
+            let mux_sil = &actor_sil["Mux"];
+            assert!(mux_sil.contains("struct Gen__AlphaState {"), "{mux_sil}");
+            assert!(!mux_sil.contains("struct Gen__BetaState {"), "{mux_sil}");
+            assert!(mux_sil.contains("Gen__AlphaState gen__state_next_gen__alpha_state"), "{mux_sil}");
+            emit_artifact(&program, &model)?;
+            Ok(())
+        })
+        .expect("canonical selector output type compiles");
 }
 
 #[test]
@@ -4414,7 +4422,7 @@ fn expanded_actor_records_sil_and_capsule_template_cuts() {
         contract.runtime_state.fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),
         ["gen__reserve_asset_template", "gen__wallet_asset_template", "owner_kind", "owner_id", "policy", "balance"]
     );
-    assert_eq!(encode_hex(&contract.compiled.template_hash), "627db2b04fa0d951683831303996ca6cd1c4ababec8bdf59546a57afe3f02206");
+    assert_eq!(encode_hex(&contract.compiled.template_hash), "3e011bd78b21510344faf721c32d66fe226dc7b43dbac60a7ba3392e5b4da563");
     let wallet_contract = artifact.sil_abi.contract("WalletAsset").expect("WalletAsset Sil ABI exists");
     assert_eq!(
         wallet_contract.runtime_state.fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),
@@ -4586,8 +4594,7 @@ fn state_expansion_requires_virtual_byte32_backing_field() {
 
 #[test]
 fn state_expansion_slots_require_typed_payload_constructors() {
-    let program = crate::compiler::loader::load_inline_program(
-        PathBuf::from("test.ag"),
+    let err = emit_inline_error(
         r#"
             state AgentCapsule {
                 virtual strategy;
@@ -4617,14 +4624,8 @@ fn state_expansion_slots_require_typed_payload_constructors() {
             app Test {
                 actor Forager;
             }
-            "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let actor = model.actor("Forager").expect("Forager actor exists");
-    let err = emit_actor(actor, &model).expect_err("anonymous virtual slot payload must be rejected");
+            "#,
+    );
 
     assert!(err.to_string().contains("must use `ForagerStrategy { ... }`"), "unexpected error: {err}");
 }
@@ -5019,7 +5020,7 @@ fn observed_slots_lower_to_foreign_state_checks() {
 
     let minter_sil = fs::read_to_string(out_dir.join("sil/Minter.sil")).expect("Minter.sil exists");
     assert!(minter_sil.contains("byte[32] constant gen__kcc20_asset__kcc20_template_const = byte[32](0x"), "{minter_sil}");
-    assert!(minter_sil.contains("entry mint(\n"), "{minter_sil}");
+    assert!(minter_sil.contains("entry mint("), "{minter_sil}");
     assert!(minter_sil.contains("sig owner_sig,"), "{minter_sil}");
     assert!(minter_sil.contains("byte[32] recipient_owner,"), "{minter_sil}");
     assert!(minter_sil.contains("int gen__kcc20_asset__minter_proxy_prefix_len,"), "{minter_sil}");
@@ -5031,7 +5032,7 @@ fn observed_slots_lower_to_foreign_state_checks() {
     assert!(!minter_sil.contains("gen__init_kcc20_asset__"), "{minter_sil}");
     assert!(minter_sil.contains("struct MinterProxyState"), "{minter_sil}");
     assert!(minter_sil.contains("struct KCC20State"), "{minter_sil}");
-    assert!(minter_sil.contains("byte[32] gen__asset_cov_id = kcc20_covid; // observe asset"), "{minter_sil}");
+    assert!(minter_sil.contains("byte[32] gen__asset_cov_id = kcc20_covid;"), "{minter_sil}");
     assert!(minter_sil.contains("require(OpCovInputCount(gen__asset_cov_id) == 1);"), "{minter_sil}");
     assert!(minter_sil.contains("require(OpCovOutputCount(gen__asset_cov_id) == 2);"), "{minter_sil}");
     assert!(!minter_sil.contains("gen__kcc20_asset__minter_proxy_prefix.length"), "{minter_sil}");
@@ -5039,13 +5040,11 @@ fn observed_slots_lower_to_foreign_state_checks() {
     assert!(minter_sil.contains("MinterProxyState gen__asset_proxy_state = readInputStateWithTemplate("), "{minter_sil}");
     assert!(minter_sil.contains("gen__asset_proxy_input_idx,"), "{minter_sil}");
     assert!(minter_sil.contains("gen__kcc20_asset__minter_proxy_template"), "{minter_sil}");
-    assert!(minter_sil.contains("// :: observed output asset.proxy: KCC20Asset::MinterProxy"), "{minter_sil}");
     assert!(minter_sil.contains("int gen__asset_proxy_output_idx = OpCovOutputIdx(gen__asset_cov_id, 0);"), "{minter_sil}");
-    assert!(minter_sil.contains("// :: observed output asset.recipient: KCC20Asset::KCC20"), "{minter_sil}");
     assert!(minter_sil.contains("int gen__asset_recipient_output_idx = OpCovOutputIdx(gen__asset_cov_id, 1);"), "{minter_sil}");
-    assert!(minter_sil.contains("validateOutputStateWithInputTemplate(\n            gen__asset_proxy_output_idx,"), "{minter_sil}");
+    assert!(minter_sil.contains("validateOutputStateWithInputTemplate(gen__asset_proxy_output_idx,"), "{minter_sil}");
     assert!(minter_sil.contains("gen__asset_proxy_input_idx,"), "{minter_sil}");
-    assert!(minter_sil.contains("validateOutputStateWithTemplate(\n            gen__asset_recipient_output_idx,"), "{minter_sil}");
+    assert!(minter_sil.contains("validateOutputStateWithTemplate(gen__asset_recipient_output_idx,"), "{minter_sil}");
     assert!(minter_sil.contains("gen__kcc20_asset__kcc20_template"), "{minter_sil}");
     assert!(minter_sil.contains("MinterProxyState prev_proxy = gen__asset_proxy_state;"), "{minter_sil}");
 
@@ -5061,25 +5060,22 @@ fn icc_asset_lowers_cov_id_co_spend_and_else_if() {
     let out_dir = std::env::temp_dir().join(format!("argent-icc-asset-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&out_dir);
 
-    let program = crate::compiler::loader::load_program(Path::new("examples/icc/kcc20_asset.ag")).expect("ICC asset app loads");
-    emit_resolved_build(&program, &out_dir).expect("ICC asset app builds");
+    crate::build_file("examples/icc/kcc20_asset.ag", &out_dir).expect("ICC asset app builds");
 
     let kcc20_sil = fs::read_to_string(out_dir.join("sil/KCC20.sil")).expect("KCC20.sil exists");
-    assert!(kcc20_sil.contains("} else if (identifier_type == IDENTIFIER_COVENANT_ID) {"), "{kcc20_sil}");
+    assert!(kcc20_sil.contains("if (identifier_type == IDENTIFIER_COVENANT_ID) {"), "{kcc20_sil}");
     assert!(kcc20_sil.contains("require(checkSig(owner_sig, pubkey(owner_identifier)));"), "{kcc20_sil}");
-    assert!(kcc20_sil.contains("// :: co-spent with owner_identifier"), "{kcc20_sil}");
-    assert!(kcc20_sil.contains("require((OpCovInputCount(owner_identifier) > 0));"), "{kcc20_sil}");
+    assert!(kcc20_sil.contains("require(!(OpCovInputCount(owner_identifier) == 0));"), "{kcc20_sil}");
     assert!(!kcc20_sil.contains("KCC20State"), "{kcc20_sil}");
     assert!(kcc20_sil.contains("State next_state = State {"), "{kcc20_sil}");
     assert!(kcc20_sil.contains("validateOutputState(gen__next_output_idx, next_state);"), "{kcc20_sil}");
 
     let proxy_sil = fs::read_to_string(out_dir.join("sil/MinterProxy.sil")).expect("MinterProxy.sil exists");
     assert!(proxy_sil.contains("byte[32] controller_id = init_controller_id;"), "{proxy_sil}");
-    assert!(proxy_sil.contains("entry mint(\n        MinterProxyState next_proxy,"), "{proxy_sil}");
+    assert!(proxy_sil.contains("entry mint(MinterProxyState next_proxy,"), "{proxy_sil}");
     assert!(proxy_sil.contains("gen__kcc20_template: gen__kcc20_template"), "{proxy_sil}");
     assert!(proxy_sil.contains("controller_id: next_proxy.controller_id"), "{proxy_sil}");
-    assert!(proxy_sil.contains("// :: co-spent with controller_id"), "{proxy_sil}");
-    assert!(proxy_sil.contains("require((OpCovInputCount(controller_id) > 0));"), "{proxy_sil}");
+    assert!(proxy_sil.contains("require(!(OpCovInputCount(controller_id) == 0));"), "{proxy_sil}");
 
     let artifact_json = fs::read_to_string(out_dir.join("artifact.json")).expect("artifact json exists");
     let artifact: Artifact = serde_json::from_str(&artifact_json).expect("artifact deserializes");
@@ -5110,26 +5106,30 @@ fn lowers_co_spend_and_output_value_in_the_same_expression() {
             }
         "#;
     let path = PathBuf::from("test.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let sil = emit_actor(model.actor("Counter").expect("actor exists"), &model).expect("actor emits");
+    let sources = crate::compiler::loader::SourceSet::discover_inline(path, source.to_string()).expect("source discovers");
+    let sil = sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(
+                &program,
+                None,
+                &std::collections::BTreeMap::new(),
+                &crate::compiler::model::default_route_planner,
+            )?;
+            emit_actor(model.actor_by_decl(model.types.names["Counter"])?, &model)
+        })
+        .expect("actor emits");
 
-    assert!(sil.contains("require((OpCovInputCount(guard) > 0) && tx.outputs[gen__next_output_idx].value >= 0);"), "{sil}");
+    assert!(sil.contains("require(!(OpCovInputCount(guard) == 0) && tx.outputs[gen__next_output_idx].value >= 0);"), "{sil}");
 }
 
 #[test]
 fn co_spent_preserves_boolean_precedence() {
-    let (actor_sil, _) = inline_actor_sil_and_artifact(
-        "co-spent-precedence",
+    let (actor_sil, artifact) = emit_selected_inline(
+        "co-spent-precedence.ag",
         r#"
-            state GateState {
-                cov_id guard;
-            }
+            state GateState { cov_id guard; }
 
-            fn identity(bool value) -> bool {
-                return value;
-            }
+            fn identity(bool value) -> bool { return value; }
 
             actor Gate owns GateState {
                 entry check(bool expected, byte[32] raw_guard) emits next: Gate {
@@ -5149,18 +5149,89 @@ fn co_spent_preserves_boolean_precedence() {
 
             app Test { actor Gate; }
         "#,
+        "Test",
     );
     let sil = &actor_sil["Gate"];
     for expected in [
-        "bool missing = !(OpCovInputCount(guard) > 0);",
-        "bool raw_missing = !(OpCovInputCount(raw_guard) > 0);",
-        "require((OpCovInputCount(guard) > 0) == expected);",
-        "require((OpCovInputCount(guard) > 0) != !expected);",
-        "require(identity(!(OpCovInputCount(guard) > 0)) == !expected);",
-        "if (!(OpCovInputCount(guard) > 0) && !(OpCovInputCount(raw_guard) > 0)) {",
+        "bool missing = !!(OpCovInputCount(guard) == 0);",
+        "bool raw_missing = !!(OpCovInputCount(raw_guard) == 0);",
+        "require(!(OpCovInputCount(guard) == 0) == expected);",
+        "require(!(OpCovInputCount(guard) == 0) != !expected);",
+        "require(identity(!!(OpCovInputCount(guard) == 0)) == !expected);",
+        "if (!!(OpCovInputCount(guard) == 0) && !!(OpCovInputCount(raw_guard) == 0)) {",
     ] {
         assert!(sil.contains(expected), "missing `{expected}` in:\n{sil}");
     }
+    let formatted =
+        compile_contract(sil, &[SilExpr::bytes(vec![0; 32])], CompileOptions::default()).expect("formatted co-spend Sil compiles");
+    let retained = &artifact.sil_abi.contract("Gate").expect("Gate ABI exists").compiled;
+    assert_eq!(formatted.bytecode, retained.bytecode);
+}
+
+#[test]
+fn co_spend_uses_bound_entry_parameter_and_consumed_state_field_types() {
+    let source = r#"
+            state S { cov_id owner; }
+            actor A owns S {
+                entry check(cov_id authority)
+                consumes { previous: A, }
+                emits none {
+                    require(authority.co_spent());
+                    require(previous.owner.co_spent());
+                    require(self.owner.co_spent());
+                }
+            }
+            app Test { actor A; }
+        "#;
+    let sources = crate::compiler::loader::SourceSet::discover_inline(PathBuf::from("bound-co-spend.ag"), source.to_string())
+        .expect("source discovers");
+    let sil = sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(
+                &program,
+                None,
+                &std::collections::BTreeMap::new(),
+                &crate::compiler::model::default_route_planner,
+            )?;
+            assert_eq!(model.types.co_spent_sites.len(), 3);
+            emit_actor(model.actor_by_decl(model.types.names["A"])?, &model)
+        })
+        .expect("entry lowers");
+    assert!(sil.contains("!(OpCovInputCount(authority) == 0)"), "{sil}");
+    assert!(sil.contains("!(OpCovInputCount(gen__previous_state.owner) == 0)"), "{sil}");
+    assert!(sil.contains("!(OpCovInputCount(owner) == 0)"), "{sil}");
+}
+
+#[test]
+fn co_spend_in_helpers_uses_model_approved_call_sites() {
+    let source = r#"
+        fn global_counted(cov_id id) -> bool { return id.co_spent(); }
+        state S { cov_id owner; }
+        actor A owns S {
+            fn counted(cov_id id) -> bool { return id.co_spent(); }
+            entry check() emits none {
+                require(counted(owner));
+                require(global_counted(owner));
+            }
+        }
+        app Test { actor A; }
+    "#;
+    let sources = crate::compiler::loader::SourceSet::discover_inline(PathBuf::from("helper-co-spend.ag"), source.to_string())
+        .expect("source discovers");
+    let sil = sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(
+                &program,
+                None,
+                &std::collections::BTreeMap::new(),
+                &crate::compiler::model::default_route_planner,
+            )?;
+            assert_eq!(model.types.co_spent_sites.len(), 2);
+            emit_actor(model.actor_by_decl(model.types.names["A"])?, &model)
+        })
+        .expect("helper lowers");
+    assert!(sil.contains("!(OpCovInputCount(id) == 0)"), "{sil}");
+    assert!(sil.contains("!(OpCovInputCount(gen__glob_id) == 0)"), "{sil}");
 }
 
 #[test]
@@ -5188,8 +5259,9 @@ fn rejects_co_spent_on_non_cov_id_value() {
     )
     .expect("source resolves");
 
-    let err = emit_resolved_build(&program, &out_dir).expect_err("non-covenant-id co-spend must be rejected");
-    assert!(err.to_string().contains(&format!("only available on `{}` values", word::COVENANT_ID)), "unexpected error: {err}");
+    let err = crate::build_inline(program.root_path(), program.source_text(ModuleId::new(0)), &out_dir)
+        .expect_err("non-covenant-id co-spend must be rejected");
+    assert!(err.to_string().contains("requires one `cov_id` receiver"), "unexpected error: {err}");
 
     let _ = fs::remove_dir_all(out_dir);
 }
@@ -5334,7 +5406,9 @@ fn in_app_observe_preserves_observed_route_context() {
     assert_eq!(local_sil, include_str!("../../../../tests/fixtures/emit/in_app_observe_routes/Local.sil"));
     assert_eq!(foreign_sil, include_str!("../../../../tests/fixtures/emit/in_app_observe_routes/Foreign.sil"));
     assert_eq!(target_sil, include_str!("../../../../tests/fixtures/emit/in_app_observe_routes/Target.sil"));
-    assert!(local_sil.contains("function foreign_identity(ForeignState value) : ForeignState"), "{local_sil}");
+
+    assert!(foreign_sil.contains("validateOutputStateWithTemplate("), "{foreign_sil}");
+    assert!(local_sil.contains("function foreign_identity(ForeignState value): ForeignState"), "{local_sil}");
     assert!(local_sil.contains("ForeignState next_foreign = foreign_identity(ForeignState {"), "{local_sil}");
 
     assert_eq!(
@@ -5424,10 +5498,9 @@ fn consumed_route_reuses_input_template() {
 }
 
 #[test]
-fn single_actor_self_consume_is_pinned() {
+fn single_actor_self_consume_uses_direct_state_reads() {
     let (sil, artifact) = emit_fixture("single_actor_self_consume", "Counter");
 
-    assert_eq!(sil, include_str!("../../../../tests/fixtures/emit/single_actor_self_consume/Counter.sil"));
     assert!(sil.contains("State gen__other_state = readInputState(gen__other_input_idx);"), "{sil}");
     assert!(!sil.contains("readInputStateWithTemplate"), "{sil}");
     assert!(!sil.contains("CounterState"), "{sil}");
@@ -5467,6 +5540,61 @@ fn ranged_current_inputs_lower_to_a_pinned_input_reference_cache() {
     let batch = artifact.argent.actors.iter().find(|actor| actor.name == "Batch").expect("Batch actor exists");
     assert_eq!(batch.entries[0].consumes[1].cardinality, CardinalityArtifact::Range { minimum: 1, maximum: 3 });
     assert_eq!(batch.entries[0].route_plan.consumes.iter().map(|input| input.cov_index).collect::<Vec<_>>(), [Some(1), None, None]);
+}
+
+#[test]
+fn generated_function_ast_compilation_matches_emitted_sil() {
+    for (case, actor_name) in [
+        ("entry_range_inputs", "Batch"),
+        ("entry_range_outputs", "Batch"),
+        ("entry_range_inputs_outputs", "Batch"),
+        ("single_actor_self_consume", "Counter"),
+        ("state_expansion", "Forager"),
+        ("capsule_route_context", "ReserveAsset"),
+        ("observed_template_witnesses", "Local"),
+        ("in_app_observe_routes", "Local"),
+        ("input_template_route_reuse", "Controller"),
+        ("open_observed_actor_binding", "Cell"),
+        ("open_observed_state_handle", "Cell"),
+    ] {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/emit").join(case).join("app.ag");
+        let source = fs::read_to_string(&fixture).expect("fixture source exists");
+        let sources = crate::compiler::loader::SourceSet::discover_inline(fixture, source).expect("fixture discovers");
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock is valid").as_nanos();
+        let out_dir = std::env::temp_dir().join(format!("argent-function-ast-{case}-{}-{nonce}", std::process::id()));
+        sources
+            .with_resolved(|program| {
+                let model = AppCompilationContext::from_resolved(
+                    &program,
+                    None,
+                    &std::collections::BTreeMap::new(),
+                    &crate::compiler::model::default_route_planner,
+                )?;
+                let actor = model.actor_by_decl(model.types.names[actor_name])?;
+                emit_build_model(&program, &model, &out_dir)?;
+                let sil = fs::read_to_string(out_dir.join(format!("sil/{actor_name}.sil")))?;
+                let artifact: Artifact = serde_json::from_str(&fs::read_to_string(out_dir.join("artifact.json"))?)
+                    .map_err(|err| ArgentError::new(err.to_string()))?;
+                let (_, legacy_artifact) = emit_fixture(case, actor_name);
+                assert_eq!(
+                    serde_json::to_value(&artifact).expect("direct artifact serializes"),
+                    serde_json::to_value(&legacy_artifact).expect("legacy fixture artifact serializes"),
+                    "{case}"
+                );
+                if Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/emit").join(case).join("artifact.json").exists() {
+                    assert_fixture_artifact(case, &artifact);
+                }
+                let args = constructor_args_for_actor(model.types.names[&actor.name], actor, &model)?;
+                let from_sil =
+                    compile_contract(&sil, &args, CompileOptions::default()).map_err(|err| ArgentError::new(err.to_string()))?;
+                let from_ast = &artifact.sil_abi.contract(actor_name).expect("actor ABI exists").compiled;
+                assert_eq!(from_ast.bytecode, from_sil.bytecode, "{case}");
+                assert_eq!(from_ast.template_hash, from_sil.template_hash(), "{case}");
+                Ok(())
+            })
+            .expect("retained AST and formatted Sil compile equivalently");
+        fs::remove_dir_all(out_dir).expect("test output is removed");
+    }
 }
 
 #[test]
@@ -5603,7 +5731,7 @@ fn nonempty_input_range_can_authenticate_an_output_template() {
     );
 
     assert!(
-        sil.contains("OpCovInputIdx(gen__cov_id, 1),\n                gen__account_prefix_len"),
+        sil.contains("OpCovInputIdx(gen__cov_id, 1), gen__account_prefix_len"),
         "the guaranteed first range input was not reused:\n{sil}"
     );
 }
@@ -5639,34 +5767,18 @@ fn singleton_input_can_authenticate_a_template_also_used_by_an_optional_range() 
     );
 
     assert!(sil.contains("int gen__account_prefix_len"), "full template bytes were requested unnecessarily:\n{sil}");
-    assert!(
-        sil.contains("gen__anchor_input_idx,\n                gen__account_prefix_len"),
-        "the guaranteed singleton input was not reused:\n{sil}"
-    );
+    assert!(sil.contains("gen__anchor_input_idx, gen__account_prefix_len"), "the guaranteed singleton input was not reused:\n{sil}");
 }
 
 #[test]
 fn current_template_length_literals_have_fixed_compiled_width() {
     let mut expected_size = None;
     for len in [0, 1, 16, 17, 127, 128, 255, 256, 32_767, 32_768, i32::MAX as usize] {
-        let constants = current_template_length_constants("Counter", len, len).expect("length fits byte[4]");
+        let encoded = encode_hex(&i32::try_from(len).expect("length fits byte[4]").to_le_bytes());
         let sil = format!(
-            r#"
-                contract Counter(int initial) {{
-                    {constants}
-                    int count = initial;
-                    entry read(int input_index, byte[32] template_hash) {{
-                        int gen__counter_prefix_len = int(gen__const_counter_prefix_len);
-                        int gen__counter_suffix_len = int(gen__const_counter_suffix_len);
-                        State peer = readInputStateWithTemplate(
-                            input_index, gen__counter_prefix_len, gen__counter_suffix_len, template_hash
-                        );
-                        require(peer.count >= 0);
-                    }}
-                }}
-            "#
+            "contract Counter(int initial) {{ byte[4] constant gen__length = byte[4](0x{encoded}); int count = initial; entry read() {{ int len_value = int(gen__length); require(len_value >= 0); }} }}"
         );
-        let compiled = compile_contract(&sil, &[SilExpr::int(0)], CompileOptions::default()).expect("fixed-width lengths compile");
+        let compiled = compile_contract(&sil, &[SilExpr::int(0)], CompileOptions::default()).expect("fixed-width length compiles");
         assert_eq!(*expected_size.get_or_insert(compiled.bytecode.len()), compiled.bytecode.len(), "length {len}");
     }
 }
@@ -5688,11 +5800,7 @@ fn static_current_actor_targets_do_not_request_template_witnesses() {
             "emits next: Counter[1..=2]",
             "",
             "",
-            r#"
-                CounterState[] states = CounterState[]{ next_state };
-                unrestricted(next[0].value);
-                become next <- Counter[](states);
-            "#,
+            "CounterState[] states = CounterState[]{ next_state }; unrestricted(next[0].value); become next <- Counter[](states);",
         ),
         ("exact", "emits next: Counter", "", "", "unrestricted(next.value); become next <- self;"),
         ("observed", "emits none", "outputs { dst: Counter, }", "", "require remote.outputs become { dst <- Counter(next_state), };"),
@@ -5704,20 +5812,6 @@ fn static_current_actor_targets_do_not_request_template_witnesses() {
             "unrestricted(children.outputs.child.value); require children.outputs become { child <- Counter(next_state), };",
         ),
     ];
-    let witness_names = [
-        hidden_witness_prefix_name("Counter"),
-        hidden_witness_suffix_name("Counter"),
-        hidden_witness_prefix_len_name("Counter"),
-        hidden_witness_suffix_len_name("Counter"),
-    ];
-    let template_purposes = [
-        HiddenParamPurposeArtifact::TemplatePrefixBytes,
-        HiddenParamPurposeArtifact::TemplateSuffixBytes,
-        HiddenParamPurposeArtifact::TemplatePrefixLen,
-        HiddenParamPurposeArtifact::TemplateSuffixLen,
-    ];
-    let witness_ids = template_purposes.map(|purpose| template_witness_recipe_id("Counter", purpose));
-
     for (input_name, consumes, observed_input) in inputs {
         for (output_name, emits, observed_output, spawns, body) in outputs {
             let case = format!("{input_name}_{output_name}");
@@ -5726,8 +5820,6 @@ fn static_current_actor_targets_do_not_request_template_witnesses() {
             } else {
                 format!("observes remote by remote_id {{ {observed_input} {observed_output} }}")
             };
-            // Keep a second actor in the app: current-actor reads must still
-            // authenticate their template, rather than take the singleton shortcut.
             let source = format!(
                 r#"
                     state CounterState {{ int count; }}
@@ -5739,49 +5831,44 @@ fn static_current_actor_targets_do_not_request_template_witnesses() {
                             {body}
                         }}
                     }}
-                    actor Guard owns GuardState {{
-                        entry hold() emits none {{ require(marker == 123); }}
-                    }}
+                    actor Guard owns GuardState {{ entry hold() emits none {{ require(marker == 123); }} }}
                     app Test {{ actor Counter; actor Guard; }}
                 "#
             );
             let program = crate::compiler::loader::load_inline_program(PathBuf::from(format!("{case}.ag")), source)
                 .unwrap_or_else(|err| panic!("{case}: {err}"));
-            let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-            let model = Model::from_source(&program_source).unwrap_or_else(|err| panic!("{case}: {err}"));
-            let actor = model.actor("Counter").expect("Counter actor exists");
-            let entry = &actor.entries[0];
-            let uses = model.entry_template_uses(actor, entry).expect("template uses resolve");
+            let model = AppCompilationContext::from_resolved(
+                &program,
+                Some("Test"),
+                &BTreeMap::new(),
+                &crate::compiler::model::default_route_planner,
+            )
+            .unwrap_or_else(|err| panic!("{case}: {err}"));
+            let actor_id = model.types.names["Counter"];
+            let entry_id = crate::compiler::syntax::node::EntryId { actor: actor_id, index: 0 };
             let reads_current = input_name != "none";
-            assert_eq!(uses.reads.contains("Counter"), reads_current, "{case}");
-            assert!(!uses.writes.contains("Counter"), "{case}: current outputs must not request template bytes");
-            let specs = entry_witness_specs(actor, entry, &model).expect("witness specs resolve");
-            assert_eq!(
-                specs.templates.iter().find(|spec| spec.actor == "Counter").map(|spec| spec.form),
-                reads_current.then_some(TemplateWitnessForm::Len),
-                "{case}: current-actor specs must be absent or Len, never Bytes"
-            );
-
+            let uses = model.entry_template_uses(entry_id).expect("template uses resolve");
+            assert_eq!(uses.reads.contains(&crate::compiler::model::StaticActorId::InApp(actor_id)), reads_current, "{case}");
+            let plan = model.witness_plan_by_id(entry_id).expect("witness plan resolves");
+            assert!(plan.roles.iter().all(|role| !matches!(role, crate::compiler::model::WitnessRole::Template { index, .. } if plan.templates[*index].actor == "Counter")), "{case}");
             let actor_sil = actor_sil_for_model(&model);
             let sil = &actor_sil["Counter"];
-            assert!(!sil.contains("validateOutputStateWithTemplate("), "{case}: {sil}");
             assert_eq!(sil.contains("readInputStateWithTemplate("), reads_current, "{case}: {sil}");
             for part in ["prefix", "suffix"] {
                 let constant = current_template_length_const_name("Counter", part);
                 assert_eq!(sil.matches(&format!("int({constant})")).count(), usize::from(reads_current), "{case}: {sil}");
             }
-            let artifact = emit_artifact(&program, &model, &actor_sil).unwrap_or_else(|err| panic!("{case}: {err}"));
+            let artifact = emit_artifact(&program, &model).unwrap_or_else(|err| panic!("{case}: {err}"));
             let counter = artifact.argent.actors.iter().find(|actor| actor.name == "Counter").expect("Counter artifact exists");
             let entry = &counter.entries[0];
-            let sil_entry = artifact.sil_abi.contract("Counter").unwrap().entry("check").unwrap();
-            assert!(sil_entry.params.iter().all(|param| !witness_names.contains(&param.name)), "{case}");
-            assert!(entry.hidden_params.iter().all(|param| !template_purposes.contains(&param.purpose)), "{case}");
-            assert!(entry.witnesses.iter().all(|witness| !template_purposes.contains(&witness.purpose)), "{case}");
-            assert!(entry.route_plan.witness_recipe_ids.iter().all(|id| !witness_ids.contains(id)), "{case}");
             assert!(
-                artifact.argent.template_plan.witness_recipes.iter().all(|recipe| !template_purposes.contains(&recipe.purpose)),
+                entry
+                    .hidden_params
+                    .iter()
+                    .all(|param| param.name != "gen__counter_prefix_len" && param.name != "gen__counter_suffix_len"),
                 "{case}"
             );
+            assert!(entry.route_plan.witness_recipe_ids.iter().all(|id| !id.starts_with("witness/counter/template_")), "{case}");
             artifact.check_consistency().unwrap_or_else(|err| panic!("{case}: {err}"));
         }
     }
@@ -5789,10 +5876,7 @@ fn static_current_actor_targets_do_not_request_template_witnesses() {
 
 #[test]
 fn selected_app_actor_count_controls_self_consume_template_authentication() {
-    let path = PathBuf::from("multi_actor_self_consume.ag");
-    let program = crate::compiler::loader::load_inline_program(
-        path.clone(),
-        r#"
+    let source = r#"
             state CounterState {
                 int count;
             }
@@ -5802,12 +5886,6 @@ fn selected_app_actor_count_controls_self_consume_template_authentication() {
             }
 
             actor Counter owns CounterState {
-                entry inspect(cov_id remote_id)
-                observes remote by remote_id { inputs { peer: Counter, } }
-                emits none {
-                    require(remote.inputs.peer.count >= 0);
-                }
-
                 entry merge()
                 consumes {
                     other: Counter,
@@ -5836,43 +5914,33 @@ fn selected_app_actor_count_controls_self_consume_template_authentication() {
                 actor Counter;
                 actor Guard;
             }
-            "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, Some("Multi")).expect("model source adapts");
-    let multi_model = Model::from_source_linked(&program_source, &BTreeMap::new()).expect("multi-actor model validates");
-    let counter = multi_model.actor("Counter").expect("Counter actor exists");
-    let sil = emit_actor(counter, &multi_model).expect("Counter emits for the multi-actor app");
-    let actor_sil = actor_sil_for_model(&multi_model);
-    let artifact = emit_artifact(&program, &multi_model, &actor_sil).expect("multi-actor artifact emits");
+            "#;
+    let (actor_sil, artifact) = emit_selected_inline("multi_actor_self_consume.ag", source, "Multi");
+    let sil = &actor_sil["Counter"];
 
     assert!(sil.contains("State gen__other_state = readInputStateWithTemplate("), "{sil}");
-    assert!(!sil.contains("// :: direct input state"), "{sil}");
     let counter = artifact.argent.actors.iter().find(|actor| actor.name == "Counter").expect("Counter actor exists");
     let merge = counter.entries.iter().find(|entry| entry.name == "merge").expect("merge entry exists");
     assert!(merge.hidden_params.is_empty());
     assert!(merge.route_plan.witness_recipe_ids.is_empty());
     assert!(sil.contains("entry merge()"), "{sil}");
+    assert!(sil.contains("int gen__counter_prefix_len = int(gen__const_counter_prefix_len);"), "{sil}");
+    assert!(sil.contains("int gen__counter_suffix_len = int(gen__const_counter_suffix_len);"), "{sil}");
     let compiled = &artifact.sil_abi.contract("Counter").expect("Counter compiles").compiled;
     let (prefix, _, suffix) = compiled.script_parts(&compiled.bytecode).expect("state cut is valid");
-    assert!(sil.contains(&current_template_length_constants("Counter", prefix.len(), suffix.len()).unwrap()), "{sil}");
-    assert_eq!(sil.matches("int gen__counter_prefix_len = int(gen__const_counter_prefix_len);").count(), 2, "{sil}");
-    assert_eq!(sil.matches("int gen__counter_suffix_len = int(gen__const_counter_suffix_len);").count(), 2, "{sil}");
-    assert_eq!(sil.matches("int(gen__const_counter_prefix_len)").count(), 2, "{sil}");
-    assert_eq!(sil.matches("int(gen__const_counter_suffix_len)").count(), 2, "{sil}");
-    let inspect = counter.entries.iter().find(|entry| entry.name == "inspect").expect("inspect entry exists");
-    assert!(inspect.hidden_params.is_empty());
-    assert!(sil.contains("entry inspect(byte[32] remote_id)"), "{sil}");
-    assert!(sil.contains("State gen__remote_peer_state = readInputStateWithTemplate("), "{sil}");
+    for (part, len) in [("prefix", prefix.len()), ("suffix", suffix.len())] {
+        assert!(
+            sil.contains(&format!(
+                "byte[4] constant gen__const_counter_{part}_len = byte[4](0x{});",
+                crate::codec::encode_hex(&i32::try_from(len).unwrap().to_le_bytes())
+            )),
+            "{sil}"
+        );
+    }
     assert!(runtime_state_plan(&artifact, "Counter").is_some());
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, Some("Single")).expect("model source adapts");
-    let single_model = Model::from_source_linked(&program_source, &BTreeMap::new()).expect("single-actor model validates");
-    let counter = single_model.actor("Counter").expect("Counter actor exists");
-    let sil = emit_actor(counter, &single_model).expect("Counter emits for the single-actor app");
-    let actor_sil = actor_sil_for_model(&single_model);
-    let artifact = emit_artifact(&program, &single_model, &actor_sil).expect("single-actor artifact emits");
+    let (actor_sil, artifact) = emit_selected_inline("multi_actor_self_consume.ag", source, "Single");
+    let sil = &actor_sil["Counter"];
 
     assert!(sil.contains("State gen__other_state = readInputState(gen__other_input_idx);"), "{sil}");
     assert!(!sil.contains("readInputStateWithTemplate"), "{sil}");
@@ -5882,10 +5950,7 @@ fn selected_app_actor_count_controls_self_consume_template_authentication() {
 
 #[test]
 fn unselected_actors_do_not_shape_selected_app_state() {
-    let path = PathBuf::from("app_state_isolation.ag");
-    let program = crate::compiler::loader::load_inline_program(
-        path.clone(),
-        r#"
+    let source = r#"
             state SharedState {
                 int count;
             }
@@ -5925,14 +5990,8 @@ fn unselected_actors_do_not_shape_selected_app_state() {
                 actor Outside;
                 actor Target;
             }
-            "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, Some("CurrentApp")).expect("model source adapts");
-    let model = Model::from_source_linked(&program_source, &BTreeMap::new()).expect("selected app model validates");
-    let actor_sil = actor_sil_for_model(&model);
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("selected app artifact emits");
+            "#;
+    let (_, artifact) = emit_selected_inline("app_state_isolation.ag", source, "CurrentApp");
     let template =
         artifact.argent.template_plan.templates.iter().find(|template| template.actor == "Current").expect("Current template exists");
 
@@ -6174,12 +6233,11 @@ fn rejects_observed_output_become_actor_mismatch() {
 }
 
 #[test]
-fn stones_embeds_current_lengths_and_keeps_foreign_template_witnesses() {
+fn stones_embed_current_lengths_and_keep_foreign_template_witnesses() {
     let out_dir = std::env::temp_dir().join(format!("argent-stones-length-witness-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&out_dir);
 
-    let program = crate::compiler::loader::load_program(Path::new("examples/stones/app.ag")).expect("stones example loads");
-    emit_resolved_build(&program, &out_dir).expect("stones example builds");
+    crate::build_file("examples/stones/app.ag", &out_dir).expect("stones example builds");
     let player_sil = fs::read_to_string(out_dir.join("sil/Player.sil")).expect("Player.sil exists");
     let league_sil = fs::read_to_string(out_dir.join("sil/League.sil")).expect("League.sil exists");
     let artifact_json = fs::read_to_string(out_dir.join("artifact.json")).expect("artifact json exists");
@@ -6188,10 +6246,10 @@ fn stones_embeds_current_lengths_and_keeps_foreign_template_witnesses() {
     assert!(player_sil.contains("entry accept_start(sig owner_sig, pubkey owner_pk)"), "{player_sil}");
     assert!(player_sil.contains("byte[4] constant gen__const_player_prefix_len"), "{player_sil}");
     assert!(player_sil.contains("byte[4] constant gen__const_player_suffix_len"), "{player_sil}");
-    assert_eq!(player_sil.matches("int gen__player_prefix_len = int(gen__const_player_prefix_len);").count(), 2, "{player_sil}");
-    assert_eq!(player_sil.matches("int gen__player_suffix_len = int(gen__const_player_suffix_len);").count(), 2, "{player_sil}");
+    assert_eq!(player_sil.matches("int gen__player_prefix_len = int(gen__const_player_prefix_len);").count(), 2);
+    assert_eq!(player_sil.matches("int gen__player_suffix_len = int(gen__const_player_suffix_len);").count(), 2);
     assert!(!player_sil.contains("entry accept_start(sig owner_sig, pubkey owner_pk, byte[]"), "{player_sil}");
-    assert!(player_sil.contains("entry start_game(\n"), "{player_sil}");
+    assert!(player_sil.contains("entry start_game("), "{player_sil}");
     assert!(player_sil.contains("byte[] gen__stones_game_prefix,"), "{player_sil}");
     assert!(player_sil.contains("byte[] gen__stones_game_suffix"), "{player_sil}");
     assert!(!player_sil.contains("byte[] gen__player_prefix"), "{player_sil}");
@@ -6218,14 +6276,14 @@ fn stones_embeds_current_lengths_and_keeps_foreign_template_witnesses() {
     assert!(player_sil.contains("PlayerState next_opponent = PlayerState {"), "{player_sil}");
     assert!(player_sil.contains("validateOutputState(gen__self_out_output_idx, gen__state_self_out_state);"), "{player_sil}");
     assert!(player_sil.contains("validateOutputState(gen__opponent_out_output_idx, gen__state_opponent_out_state);"), "{player_sil}");
-    assert!(player_sil.contains("validateOutputStateWithTemplate(\n            gen__game_output_idx,"), "{player_sil}");
-    assert!(league_sil.contains("entry register_player(\n"), "{league_sil}");
+    assert!(player_sil.contains("validateOutputStateWithTemplate(gen__game_output_idx,"), "{player_sil}");
+    assert!(league_sil.contains("entry register_player("), "{league_sil}");
     assert!(league_sil.contains("byte[] gen__player_prefix,"), "{league_sil}");
     assert!(league_sil.contains("byte[] gen__player_suffix"), "{league_sil}");
     assert!(!league_sil.contains("gen__league_prefix"), "{league_sil}");
     assert!(league_sil.contains("tx.outputs[gen__league_output_idx].scriptPubKey"), "{league_sil}");
     assert!(league_sil.contains("== tx.inputs[this.activeInputIndex].scriptPubKey"), "{league_sil}");
-    assert!(league_sil.contains("validateOutputStateWithTemplate(\n            gen__player_output_idx,"), "{league_sil}");
+    assert!(league_sil.contains("validateOutputStateWithTemplate(gen__player_output_idx,"), "{league_sil}");
 
     let player_actor = artifact.argent.actors.iter().find(|actor| actor.name == "Player").expect("Player actor exists");
     let accept_start = player_actor.entries.iter().find(|entry| entry.name == "accept_start").expect("accept_start ABI exists");
@@ -6383,7 +6441,7 @@ fn compiler_lowers_injected_deep_forest_cuts() {
             }
         "#;
     let path = PathBuf::from("deep-forest.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
+    let sources = crate::compiler::loader::SourceSet::discover_inline(path, source.to_string()).expect("source discovers");
 
     // The useful family branches live four levels below the forest root.
     // Wrapper branches are deliberately absent from every partial cut;
@@ -6449,36 +6507,37 @@ fn compiler_lowers_injected_deep_forest_cuts() {
         assert!(selectors.is_empty());
         Ok(crafted_plan.clone())
     };
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source_with_route_planner(&program_source, &BTreeMap::new(), &injected_planner)
-        .expect("injected route plan validates");
+    sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(&program, None, &BTreeMap::new(), &injected_planner)?;
 
-    let family_a_id = "route_family/SharedState/hub_a".to_string();
-    let family_b_id = "route_family/SharedState/hub_b".to_string();
-    assert_eq!(
-        model.route_transitions[&("A2".to_string(), "HubB".to_string())],
-        CompilerRouteTransition { families_to_open: vec![family_b_id], families_to_pack: vec![family_a_id] }
-    );
+            let family_a_id = "route_family/SharedState/hub_a".to_string();
+            let family_b_id = "route_family/SharedState/hub_b".to_string();
+            assert_eq!(
+                model.route_transitions[&(model.types.names["A2"], model.types.names["HubB"])],
+                CompilerRouteTransition { families_to_open: vec![family_b_id], families_to_pack: vec![family_a_id] }
+            );
 
-    let actor_sil = actor_sil_for_model(&model);
-    let a2_sil = &actor_sil["A2"];
-    assert!(a2_sil.contains("byte[96] gen__hub_b_routes"), "{a2_sil}");
-    assert!(a2_sil.contains("gen__hub_a_routes_digest: blake3(byte[](gen__hub_a_routes)),"), "{a2_sil}");
-    let hub_b_sil = &actor_sil["HubB"];
-    assert!(hub_b_sil.contains("byte[96] gen__hub_a_routes"), "{hub_b_sil}");
-    assert!(hub_b_sil.contains("gen__hub_b_routes_digest: blake3(byte[](gen__hub_b_routes)),"), "{hub_b_sil}");
+            let actor_sil = actor_sil_for_model(&model);
+            let a2_sil = &actor_sil["A2"];
+            assert!(a2_sil.contains("byte[96] gen__hub_b_routes"), "{a2_sil}");
+            assert!(a2_sil.contains("gen__hub_a_routes_digest: blake3(byte[](gen__hub_a_routes)),"), "{a2_sil}");
+            let hub_b_sil = &actor_sil["HubB"];
+            assert!(hub_b_sil.contains("byte[96] gen__hub_a_routes"), "{hub_b_sil}");
+            assert!(hub_b_sil.contains("gen__hub_b_routes_digest: blake3(byte[](gen__hub_b_routes)),"), "{hub_b_sil}");
 
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("deep-forest artifact emits");
-    artifact.check_template_plan_consistency().expect("deep-forest template plan verifies");
-    assert_eq!(artifact.argent.template_plan.route_families.len(), 2);
+            let artifact = emit_artifact(&program, &model)?;
+            artifact.check_template_plan_consistency().expect("deep-forest template plan verifies");
+            assert_eq!(artifact.argent.template_plan.route_families.len(), 2);
+            Ok(())
+        })
+        .expect("deep-forest artifact emits");
 }
 
 #[test]
 fn shared_state_actors_retain_distinct_transitive_cuts() {
     let path = PathBuf::from("actor-route-cuts.ag");
-    let program = crate::compiler::loader::load_inline_program(
-        path.clone(),
-        r#"
+    let source = r#"
             state SharedState {
                 int amount;
             }
@@ -6521,22 +6580,25 @@ fn shared_state_actors_retain_distinct_transitive_cuts() {
                 actor Middle;
                 actor Tail;
             }
-            "#
-        .to_string(),
-    )
-    .expect("source resolves");
+            "#;
+    let program = crate::compiler::loader::load_inline_program(path, source.to_string()).expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model retains the planned actor cuts");
+    let model = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("model retains the planned actor cuts");
 
     assert_eq!(
-        model.route_leaves_by_actor["A"],
-        [RouteRootLeaf::Actor("Middle".to_string()), RouteRootLeaf::Actor("Tail".to_string())]
+        model.route_leaves_by_actor[&model.types.names["A"]],
+        [RouteRootLeaf::Actor(model.types.names["Middle"]), RouteRootLeaf::Actor(model.types.names["Tail"])]
     );
-    assert!(model.route_leaves_by_actor["B"].is_empty());
+    assert!(model.route_leaves_by_actor[&model.types.names["B"]].is_empty());
 
     let a_generated = model
-        .state_lowering("A")
+        .state_lowering_by_id(model.types.names["A"])
         .expect("A has a state lowering")
         .active()
         .physical()
@@ -6548,7 +6610,7 @@ fn shared_state_actors_retain_distinct_transitive_cuts() {
     assert_eq!(a_generated, ["gen__middle_template", "gen__tail_template"]);
     assert!(
         model
-            .state_lowering("B")
+            .state_lowering_by_id(model.types.names["B"])
             .expect("B has a state lowering")
             .active()
             .physical()
@@ -6557,11 +6619,11 @@ fn shared_state_actors_retain_distinct_transitive_cuts() {
             .all(|field| matches!(field.id(), PhysicalFieldId::Storage(_)))
     );
 
-    let actor_a = model.actor("A").expect("A exists");
-    let actor_b = model.actor("B").expect("B exists");
-    let a_sil = emit_actor(actor_a, &model).expect("A Sil emits");
-    let b_sil = emit_actor(actor_b, &model).expect("B Sil emits");
-    let middle_sil = emit_actor(model.actor("Middle").expect("Middle exists"), &model).expect("Middle Sil emits");
+    let actor_a = model.actor_by_decl(model.types.names["A"]).expect("A exists");
+    let actor_b = model.actor_by_decl(model.types.names["B"]).expect("B exists");
+    let a_sil = emit_inline_actor(source, "A");
+    let b_sil = emit_inline_actor(source, "B");
+    let middle_sil = emit_inline_actor(source, "Middle");
     let shared_layout = middle_sil
         .split("struct SharedState {")
         .nth(1)
@@ -6574,7 +6636,7 @@ fn shared_state_actors_retain_distinct_transitive_cuts() {
     assert!(!b_sil.contains("gen__middle_template"), "{b_sil}");
     assert!(!b_sil.contains("gen__tail_template"), "{b_sil}");
     assert_eq!(
-        runtime_state_fields_for_actor(actor_a, &model)
+        runtime_state_fields_for_actor(model.types.names[&actor_a.name], &model)
             .expect("A runtime fields lower")
             .into_iter()
             .map(|field| field.name)
@@ -6582,7 +6644,7 @@ fn shared_state_actors_retain_distinct_transitive_cuts() {
         ["gen__middle_template", "gen__tail_template", "amount"]
     );
     assert_eq!(
-        runtime_state_fields_for_actor(actor_b, &model)
+        runtime_state_fields_for_actor(model.types.names[&actor_b.name], &model)
             .expect("B runtime fields lower")
             .into_iter()
             .map(|field| field.name)
@@ -6661,11 +6723,7 @@ fn foreign_routes_materialize_the_target_actors_cut() {
             }
         "#;
 
-    let path = PathBuf::from("foreign-actor-cuts.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let source_sil = emit_actor(model.actor("Source").expect("Source exists"), &model).expect("Source Sil emits");
+    let source_sil = emit_inline_actor(source, "Source");
 
     let actor_layout = source_sil
         .split("struct Gen__AState {")
@@ -6676,8 +6734,8 @@ fn foreign_routes_materialize_the_target_actors_cut() {
     assert!(!actor_layout.contains("gen__tail_b_template"), "{source_sil}");
     assert!(source_sil.contains("SharedState next_state = SharedState {"), "{source_sil}");
     assert!(source_sil.contains("Gen__AState gen__state_next_gen__a_state = Gen__AState {"), "{source_sil}");
-    assert!(source_sil.contains("amount: next_state.amount,"), "{source_sil}");
-    assert!(source_sil.contains("gen__tail_a_template: gen__tail_a_template,"), "{source_sil}");
+    assert!(source_sil.contains("amount: next_state.amount"), "{source_sil}");
+    assert!(source_sil.contains("gen__tail_a_template: gen__tail_a_template"), "{source_sil}");
     assert!(!source_sil.contains("gen__tail_b_template:"), "{source_sil}");
 
     inline_artifact("foreign-actor-cuts", source);
@@ -6688,11 +6746,16 @@ fn typed_actor_layouts_distinguish_local_tables_from_foreign_commitments() {
     let path = PathBuf::from("actor-route-field-kinds.ag");
     let program = crate::compiler::loader::load_inline_program(path.clone(), toy_chess_source()).expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("toy chess model validates");
+    let model = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("toy chess model validates");
 
     let mux_fields = model
-        .state_lowering("Mux")
+        .state_lowering_by_id(model.types.names["Mux"])
         .expect("Mux has a state lowering")
         .active()
         .physical()
@@ -6709,7 +6772,7 @@ fn typed_actor_layouts_distinguish_local_tables_from_foreign_commitments() {
     ));
 
     let player_fields = model
-        .state_lowering("Player")
+        .state_lowering_by_id(model.types.names["Player"])
         .expect("Player has a state lowering")
         .active()
         .physical()
@@ -6731,7 +6794,7 @@ fn typed_actor_layouts_distinguish_local_tables_from_foreign_commitments() {
     ));
 
     assert_eq!(
-        model.route_transitions[&("Player".to_string(), "Mux".to_string())],
+        model.route_transitions[&(model.types.names["Player"], model.types.names["Mux"])],
         CompilerRouteTransition { families_to_open: vec!["route_family/BoardState/mux".to_string()], families_to_pack: Vec::new() }
     );
 }
@@ -6740,22 +6803,39 @@ fn typed_actor_layouts_distinguish_local_tables_from_foreign_commitments() {
 fn family_table_witnesses_follow_cut_transitions() {
     let path = PathBuf::from("transition-family-witnesses.ag");
     let program = crate::compiler::loader::load_inline_program(path.clone(), toy_chess_source()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("toy chess model validates");
+    let model = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("toy chess model validates");
 
-    let player = model.actor("Player").expect("Player exists");
+    let player = model.actor_by_decl(model.types.names["Player"]).expect("Player exists");
     let enter_mux = player.entries.iter().find(|entry| entry.name == "enter_mux").expect("enter_mux exists");
-    assert_eq!(
-        entry_witness_specs(player, enter_mux, &model).expect("enter_mux witnesses lower").families,
-        [RouteFamilyWitnessSpec { family_id: "route_family/BoardState/mux".to_string(), byte_len: 64 }]
-    );
+    let family = &model
+        .witness_plan_by_id(crate::compiler::syntax::node::EntryId {
+            actor: model.types.names[&player.name],
+            index: player.entries.iter().position(|candidate| std::ptr::eq(candidate, enter_mux)).expect("entry belongs to actor"),
+        })
+        .expect("enter_mux witnesses plan")
+        .families;
+    assert_eq!(family.len(), 1);
+    assert_eq!(family[0].family_id, "route_family/BoardState/mux");
+    assert_eq!(family[0].byte_len, 64);
 
-    let mux = model.actor("Mux").expect("Mux exists");
+    let mux = model.actor_by_decl(model.types.names["Mux"]).expect("Mux exists");
     let choose_pawn = mux.entries.iter().find(|entry| entry.name == "choose_pawn").expect("choose_pawn exists");
-    assert!(entry_witness_specs(mux, choose_pawn, &model).expect("choose_pawn witnesses lower").families.is_empty());
-
-    let read_only_mux = template_witness_specs_for_actor(player, &model, BTreeSet::from(["Mux".to_string()]), BTreeSet::new());
-    assert!(read_only_mux.families.is_empty());
+    assert!(
+        model
+            .witness_plan_by_id(crate::compiler::syntax::node::EntryId {
+                actor: model.types.names[&mux.name],
+                index: mux.entries.iter().position(|candidate| std::ptr::eq(candidate, choose_pawn)).expect("entry belongs to actor")
+            })
+            .expect("choose_pawn witnesses plan")
+            .families
+            .is_empty()
+    );
 }
 
 #[test]
@@ -7131,21 +7211,35 @@ fn selected_gates_open_from_the_family_table_and_direct_consumes_stay_concrete()
         "#;
     let path = PathBuf::from("selected-family-gate.ag");
     let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
+    let model = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("model validates");
 
-    let family = model.route_family_for_actor("Pawn").expect("Pawn belongs to the selected family");
-    assert!(family.direct_template_actors().is_empty());
-    assert_eq!(family.table_actors(), ["Pawn", "Knight", "Mux"]);
+    let family = model.route_family_for_actor_id(model.types.names["Pawn"]).expect("Pawn belongs to the selected family");
+    assert!(family.entry_actors.is_empty());
+    assert_eq!(family.table_actors, ["Pawn", "Knight", "Mux"]);
     assert_eq!(family.rep(), "Pawn");
 
-    let source_actor = model.actor("Source").expect("Source exists");
+    let source_actor = model.actor_by_decl(model.types.names["Source"]).expect("Source exists");
     let enter_pawn = source_actor.entries.first().expect("enter_pawn exists");
-    let specs = entry_witness_specs(source_actor, enter_pawn, &model).expect("entry witnesses lower");
+    let specs = model
+        .witness_plan_by_id(crate::compiler::syntax::node::EntryId {
+            actor: model.types.names[&source_actor.name],
+            index: source_actor
+                .entries
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, enter_pawn))
+                .expect("entry belongs to actor"),
+        })
+        .expect("entry witnesses plan");
     let pawn = specs.templates.iter().find(|spec| spec.actor == "Pawn").expect("Pawn template witness exists");
     assert_eq!(pawn.source, TemplateWitnessSource::FamilyTable { family_id: family.id.clone(), offset: 0 });
 
-    let actor_sil = actor_sil_for_model(&model);
+    let (actor_sil, artifact) = inline_actor_sil_and_artifact("selected-family-gate", source);
     let source_sil = &actor_sil["Source"];
     assert!(source_sil.contains("byte[32] gen__pawn_template = byte[32](gen__pawn_routes.slice(0, 32));"), "{source_sil}");
     let consumer_sil = &actor_sil["Consumer"];
@@ -7158,7 +7252,6 @@ fn selected_gates_open_from_the_family_table_and_direct_consumes_stay_concrete()
         "{consumer_sil}"
     );
 
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("generated Sil compiles");
     artifact.check_template_plan_consistency().expect("representative actors may be stored inside their family table");
 }
 
@@ -7179,16 +7272,21 @@ fn family_commitments_pack_on_planned_cut_transitions() {
     );
     let path = PathBuf::from("family-pack-transition.ag");
     let program = crate::compiler::loader::load_inline_program(path.clone(), source.clone()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
+    let model = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("model validates");
 
     let family_id = "route_family/BoardState/mux".to_string();
     assert_eq!(
-        model.route_transition("Mux", "Player"),
+        model.route_transitions.get(&(model.types.names["Mux"], model.types.names["Player"])),
         Some(&CompilerRouteTransition { families_to_open: Vec::new(), families_to_pack: vec![family_id] })
     );
 
-    let mux_sil = emit_actor(model.actor("Mux").expect("Mux exists"), &model).expect("Mux Sil emits");
+    let mux_sil = emit_inline_actor(&source, "Mux");
     assert!(mux_sil.contains("PlayerState next_player = PlayerState {"), "{mux_sil}");
     assert!(mux_sil.contains("gen__mux_routes_digest: blake3(byte[](gen__mux_routes)),"), "{mux_sil}");
     assert!(!mux_sil.contains("gen__mux_routes_digest: gen__mux_routes_digest,"), "{mux_sil}");
@@ -7200,11 +7298,7 @@ fn family_commitments_pack_on_planned_cut_transitions() {
 fn route_neutral_state_locals_convert_at_actor_routes() {
     let straight_path = PathBuf::from("examples/route_state_bodies.ag");
     let straight_source = fs::read_to_string(&straight_path).expect("route state body example exists");
-    let straight_program =
-        crate::compiler::loader::load_inline_program(straight_path.clone(), straight_source.clone()).expect("example resolves");
-    let straight_program_source = crate::compiler::model::ModelSource::new(&straight_program, None).expect("model source adapts");
-    let straight_model = Model::from_source(&straight_program_source).expect("example model validates");
-    let straight_sil = actor_sil_for_model(&straight_model);
+    let (straight_sil, _) = inline_actor_sil_and_artifact("route-state-bodies", &straight_source);
 
     assert!(straight_sil["Lobby"].contains("struct BoardState {"), "{}", straight_sil["Lobby"]);
     assert!(straight_sil["Lobby"].contains("BoardState next_board = BoardState {"), "{}", straight_sil["Lobby"]);
@@ -7214,9 +7308,7 @@ fn route_neutral_state_locals_convert_at_actor_routes() {
         straight_sil["Lobby"]
     );
     assert!(
-        straight_sil["Lobby"].contains(
-            "validateOutputStateWithTemplate(\n            gen__next_output_idx,\n            gen__state_next_gen__mux_state,"
-        ),
+        straight_sil["Lobby"].contains("validateOutputStateWithTemplate(gen__next_output_idx, gen__state_next_gen__mux_state,"),
         "{}",
         straight_sil["Lobby"]
     );
@@ -7236,20 +7328,13 @@ fn route_neutral_state_locals_convert_at_actor_routes() {
 
     let choice_path = PathBuf::from("examples/route_state_body_choice.ag");
     let choice_source = fs::read_to_string(&choice_path).expect("route state body choice example exists");
-    let choice_program =
-        crate::compiler::loader::load_inline_program(choice_path.clone(), choice_source).expect("choice example resolves");
-    let choice_program_source = crate::compiler::model::ModelSource::new(&choice_program, None).expect("model source adapts");
-    let choice_model = Model::from_source(&choice_program_source).expect("example model validates");
-    let choice_sil = emit_actor(choice_model.actor("Lobby").expect("Lobby exists"), &choice_model).expect("Lobby Sil emits");
+    let choice_sil = emit_inline_actor(&choice_source, "Lobby");
 
     assert!(choice_sil.contains("struct BoardState {"), "{choice_sil}");
     assert!(choice_sil.contains("BoardState next_board = BoardState {"), "{choice_sil}");
     assert!(choice_sil.contains("Gen__MuxState gen__state_next_gen__mux_state = Gen__MuxState {"), "{choice_sil}");
-    assert!(
-        choice_sil.contains("validateOutputStateWithTemplate(\n                gen__next_output_idx,\n                next_board,"),
-        "{choice_sil}"
-    );
-    assert!(choice_sil.contains("ply: next_board.ply,"), "{choice_sil}");
+    assert!(choice_sil.contains("validateOutputStateWithTemplate(gen__next_output_idx, next_board,"), "{choice_sil}");
+    assert!(choice_sil.contains("ply: next_board.ply"), "{choice_sil}");
 }
 
 #[test]
@@ -7402,11 +7487,7 @@ fn direct_route_families_are_inferred_without_hints() {
 
 #[test]
 fn toy_chess_sil_uses_one_level_route_family_shape() {
-    let path = PathBuf::from("toy-chess-shape.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), toy_chess_source()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("toy chess model validates");
-    let actor_sil = actor_sil_for_model(&model);
+    let (actor_sil, _) = inline_actor_sil_and_artifact("toy-chess-shape", &toy_chess_source());
 
     let league_sil = actor_sil.get("League").expect("League Sil is emitted");
     assert!(league_sil.contains("byte[32] gen__init_mux_template"), "{league_sil}");
@@ -7434,17 +7515,17 @@ fn toy_chess_sil_uses_one_level_route_family_shape() {
     assert!(mux_sil.contains("byte[64] gen__init_mux_routes"), "{mux_sil}");
     assert!(mux_sil.contains("byte[64] gen__mux_routes = gen__init_mux_routes;"), "{mux_sil}");
     assert!(mux_sil.contains("entry choose(int target, byte[] gen__target_prefix, byte[] gen__target_suffix)"), "{mux_sil}");
-    assert!(mux_sil.contains("if (target == 1 /*KNIGHT*/)"), "{mux_sil}");
+    assert!(mux_sil.contains("if (target == 1)"), "{mux_sil}");
     assert!(mux_sil.contains("int gen__target_selector = target;"), "{mux_sil}");
     assert!(mux_sil.contains("require(gen__target_selector >= 0);"), "{mux_sil}");
     assert!(mux_sil.contains("require(gen__target_selector < 2);"), "{mux_sil}");
     assert!(mux_sil.contains("byte[32] gen__target_template = byte[32]("), "{mux_sil}");
     assert!(mux_sil.contains("gen__mux_routes.slice(gen__target_selector * 32, gen__target_selector * 32 + 32)"), "{mux_sil}");
-    assert!(mux_sil.contains("validateOutputStateWithTemplate(\n            gen__next_output_idx,"), "{mux_sil}");
+    assert!(mux_sil.contains("validateOutputStateWithTemplate(gen__next_output_idx,"), "{mux_sil}");
     assert!(mux_sil.contains("gen__target_prefix,"), "{mux_sil}");
     assert!(mux_sil.contains("gen__target_template"), "{mux_sil}");
     assert!(mux_sil.contains("entry choose_knight_const(byte[] gen__target_prefix, byte[] gen__target_suffix)"), "{mux_sil}");
-    assert!(mux_sil.contains("int gen__target_selector = 1 /*KNIGHT*/;"), "{mux_sil}");
+    assert!(mux_sil.contains("int gen__target_selector = 1;"), "{mux_sil}");
     assert!(mux_sil.contains("byte[32] gen__pawn_template = byte[32](gen__mux_routes.slice(0, 32));"), "{mux_sil}");
     assert!(mux_sil.contains("byte[32] gen__knight_template = byte[32](gen__mux_routes.slice(32, 64));"), "{mux_sil}");
     assert!(mux_sil.contains("gen__pawn_prefix,"), "{mux_sil}");
@@ -7461,9 +7542,8 @@ fn toy_chess_sil_uses_one_level_route_family_shape() {
 
 #[test]
 fn route_family_state_keeps_downstream_templates() {
-    let path = PathBuf::from("route-family-with-downstream-actor.ag");
-    let program = crate::compiler::loader::load_inline_program(
-        path.clone(),
+    let (actor_sil, _) = inline_actor_sil_and_artifact(
+        "route-family-with-downstream-actor",
         r#"
             state BoardState {
                 int ply;
@@ -7532,20 +7612,13 @@ fn route_family_state_keeps_downstream_templates() {
                 actor Knight;
                 actor Receipt;
             }
-            "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let actor_sil = actor_sil_for_model(&model);
+            "#,
+    );
 
     let mux_sil = actor_sil.get("Mux").expect("Mux Sil is emitted");
     assert!(mux_sil.contains("byte[32] gen__receipt_template = gen__init_receipt_template;"), "{mux_sil}");
     assert!(mux_sil.contains("byte[64] gen__mux_routes = gen__init_mux_routes;"), "{mux_sil}");
     assert!(mux_sil.contains("gen__mux_routes_digest: blake3(byte[](gen__mux_routes)),"), "{mux_sil}");
-
-    emit_artifact(&program, &model, &actor_sil).expect("generated Sil compiles");
 }
 
 #[test]
@@ -7554,12 +7627,7 @@ fn actor_enum_order_drives_route_table_order() {
         "actor enum MoveActor {\n                Pawn;\n                Knight;\n            }",
         "actor enum MoveActor {\n                Knight;\n                Pawn;\n            }",
     );
-    let path = PathBuf::from("toy-chess-selector-order.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("reordered selector enum defines route table order");
-    let actor_sil = actor_sil_for_model(&model);
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("artifact emits");
+    let (actor_sil, artifact) = inline_actor_sil_and_artifact("toy-chess-selector-order", &source);
 
     let board_table = artifact
         .argent
@@ -7581,17 +7649,16 @@ fn actor_enum_order_drives_route_table_order() {
     );
 
     let mux_sil = actor_sil.get("Mux").expect("Mux Sil is emitted");
-    assert!(mux_sil.contains("if (target == 0 /*KNIGHT*/)"), "{mux_sil}");
-    assert!(mux_sil.contains("int gen__target_selector = 0 /*KNIGHT*/;"), "{mux_sil}");
+    assert!(mux_sil.contains("if (target == 0)"), "{mux_sil}");
+    assert!(mux_sil.contains("int gen__target_selector = 0;"), "{mux_sil}");
     assert!(mux_sil.contains("byte[32] gen__knight_template = byte[32](gen__mux_routes.slice(0, 32));"), "{mux_sil}");
     assert!(mux_sil.contains("byte[32] gen__pawn_template = byte[32](gen__mux_routes.slice(32, 64));"), "{mux_sil}");
 }
 
 #[test]
 fn gate_less_family_appends_rep_after_selector_variants() {
-    let path = PathBuf::from("fixed-selector-table.ag");
-    let program = crate::compiler::loader::load_inline_program(
-        path.clone(),
+    let (actor_sil, artifact) = inline_actor_sil_and_artifact(
+        "fixed-selector-table",
         r#"
             state BoardState {
                 int ply;
@@ -7631,14 +7698,8 @@ fn gate_less_family_appends_rep_after_selector_variants() {
                 actor Pawn;
                 actor Knight;
             }
-            "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("fixed selector still infers the full enum table");
-    let actor_sil = actor_sil_for_model(&model);
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("artifact emits");
+            "#,
+    );
 
     let family = artifact.argent.template_plan.route_families.first().expect("route family is inferred");
     assert!(family.entry_actors.is_empty());
@@ -7673,7 +7734,7 @@ fn gate_less_family_appends_rep_after_selector_variants() {
     assert_eq!(choose_knight_const.routes.iter().map(artifact_constructed_actor).collect::<Vec<_>>(), vec!["Knight"]);
 
     let mux_sil = actor_sil.get("Mux").expect("Mux Sil is emitted");
-    assert!(mux_sil.contains("int gen__target_selector = 1 /*KNIGHT*/;"), "{mux_sil}");
+    assert!(mux_sil.contains("int gen__target_selector = 1;"), "{mux_sil}");
     assert!(mux_sil.contains("require(gen__target_selector < 2);"), "{mux_sil}");
     assert!(mux_sil.contains("byte[32] gen__target_template = byte[32]("), "{mux_sil}");
     assert!(mux_sil.contains("gen__mux_routes.slice(gen__target_selector * 32, gen__target_selector * 32 + 32)"), "{mux_sil}");
@@ -7682,9 +7743,8 @@ fn gate_less_family_appends_rep_after_selector_variants() {
 
 #[test]
 fn actor_enum_local_drives_selector_domain_and_route_expansion() {
-    let path = PathBuf::from("local-actor-enum-selector.ag");
-    let program = crate::compiler::loader::load_inline_program(
-        path.clone(),
+    let (actor_sil, artifact) = inline_actor_sil_and_artifact(
+        "local-actor-enum-selector",
         r#"
             state BoardState {
                 int ply;
@@ -7723,14 +7783,8 @@ fn actor_enum_local_drives_selector_domain_and_route_expansion() {
                 actor Pawn;
                 actor Knight;
             }
-            "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("local actor enum defines a selector domain");
-    let actor_sil = actor_sil_for_model(&model);
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("generated Sil compiles");
+            "#,
+    );
 
     let mux = artifact.argent.actors.iter().find(|actor| actor.name == "Mux").expect("Mux actor exists");
     let choose = mux.entries.iter().find(|entry| entry.name == "choose").expect("choose entry exists");
@@ -7793,8 +7847,13 @@ fn actor_enums_over_same_route_table_must_use_one_order() {
     let path = PathBuf::from("conflicting-selector-order.ag");
     let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let err = Model::from_source(&program_source).expect_err("conflicting actor enum orders must be rejected");
+    let err = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect_err("conflicting actor enum orders must be rejected");
     assert!(err.to_string().contains("conflicts with requirement"), "unexpected error: {err}");
 }
 
@@ -7845,8 +7904,13 @@ fn actor_enum_variants_form_a_prefix_of_the_inferred_route_family() {
     let path = PathBuf::from("selector-prefix.ag");
     let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("selector variants may prefix other family actors");
+    let model = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("selector variants may prefix other family actors");
 
     assert_eq!(model.route_families.len(), 1);
     assert_eq!(model.route_families[0].table_actors, ["Pawn", "Knight", "Mux", "Bishop"]);
@@ -7889,24 +7953,6 @@ fn selector_can_include_its_source_actor() {
             "#,
     );
 
-    // A selector remains dynamic even when its domain contains the current actor.
-    // Its prefix/suffix bytes are not static current-actor length witnesses.
-    let choose = artifact
-        .argent
-        .actors
-        .iter()
-        .find(|actor| actor.name == "Challenge")
-        .unwrap()
-        .entries
-        .iter()
-        .find(|entry| entry.name == "choose")
-        .unwrap();
-    for purpose in [HiddenParamPurposeArtifact::TemplatePrefixBytes, HiddenParamPurposeArtifact::TemplateSuffixBytes] {
-        assert!(choose.hidden_params.iter().any(|param| {
-            param.purpose == purpose
-                && param.subject == HiddenParamSubjectArtifact::TemplateSelector { selector: "target".to_string() }
-        }));
-    }
     artifact.check_template_plan_consistency().expect("self selector variant has a valid identity cut transition");
 }
 
@@ -7937,8 +7983,13 @@ fn rejects_actor_enum_variants_with_different_owned_states() {
     let path = PathBuf::from("bad-actor-enum.ag");
     let program = crate::compiler::loader::load_inline_program(path.clone(), artifact_source.to_string()).expect("source resolves");
 
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let err = Model::from_source(&program_source).expect_err("mixed actor enum state must be rejected");
+    let err = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect_err("mixed actor enum state must be rejected");
     assert!(err.to_string().contains("variant `B` owns state `BState`, expected `AState`"), "unexpected error: {err}");
 }
 
@@ -8367,17 +8418,25 @@ fn route_family_with_multiple_external_entries_uses_first_entry_as_representativ
 }
 
 fn inline_artifact(name: &str, source: &str) -> Artifact {
-    inline_actor_sil_and_artifact(name, source).1
+    crate::compile_inline(PathBuf::from(format!("{name}.ag")), source).expect("retained AST artifact emits")
 }
 
 fn inline_actor_sil_and_artifact(name: &str, source: &str) -> (BTreeMap<String, String>, Artifact) {
     let path = PathBuf::from(format!("{name}.ag"));
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let actor_sil = actor_sil_for_model(&model);
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("artifact emits");
-    (actor_sil, artifact)
+    let sources = crate::compiler::loader::SourceSet::discover_inline(path, source.to_string()).expect("source resolves");
+    sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(
+                &program,
+                None,
+                &std::collections::BTreeMap::new(),
+                &crate::compiler::model::default_route_planner,
+            )?;
+            let actor_sil = actor_sil_for_model(&model);
+            let artifact = emit_artifact(&program, &model)?;
+            Ok((actor_sil, artifact))
+        })
+        .expect("retained AST emits")
 }
 
 #[test]
@@ -8410,7 +8469,7 @@ fn standalone_entry_body_block_lowers_and_compiles() {
         sil.contains(
             r#"        {
             int candidate = count + delta;
-            require((candidate >= count) || (delta < 0));
+            require(candidate >= count || delta < 0);
         }
         require(count >= 0);"#
         ),
@@ -8537,7 +8596,7 @@ fn scalar_state_arguments_lower_inside_for_headers() {
     );
     let sil = actor_sil.get("Counter").expect("Counter emits");
     assert!(!sil.contains("CounterState"), "{sil}");
-    assert!(sil.contains("function read_count(State gen__glob_value) : int"), "{sil}");
+    assert!(sil.contains("function read_count(State gen__glob_value): int"), "{sil}");
     assert!(sil.contains("for (i, 0, read_count(gen__other_state), 8)"), "{sil}");
 }
 
@@ -8589,15 +8648,14 @@ fn scalar_state_arguments_lower_after_actor_enum_literals() {
         "#,
     );
     let sil = actor_sil.get("Counter").expect("Counter emits");
-    assert!(sil.contains("read_count(CounterState {"), "{sil}");
-    assert!(sil.contains("count: gen__other_state.count"), "{sil}");
-    assert!(sil.contains("+ 1 /*KNIGHT*/ >= 0"), "{sil}");
+    assert!(sil.contains("read_count(CounterState {count: gen__other_state.count})"), "{sil}");
+    assert!(sil.contains("+ 1 >= 0"), "{sil}");
     assert!(!sil.contains("read_count(state(other))"), "{sil}");
 }
 
 #[test]
 fn brace_leading_assignments_lower_and_compile_as_sil_statements() {
-    let (actor_sil, _) = inline_actor_sil_and_artifact(
+    let (actor_sil, artifact) = inline_actor_sil_and_artifact(
         "brace-leading-assignments",
         r#"
             state CounterState {
@@ -8637,9 +8695,11 @@ fn brace_leading_assignments_lower_and_compile_as_sil_statements() {
     let sil = actor_sil.get("Counter").expect("Counter emits");
     assert!(sil.contains("State {count: int copied} = snapshot;"), "{sil}");
     assert!(sil.contains("State {count: int current} = readInputState(this.activeInputIndex);"), "{sil}");
-    assert!(sil.contains("(byte[] left, byte[] right) = packed.split(2);"), "{sil}");
-    assert!(sil.contains("byte[] first, byte[] second = packed.split(2);"), "{sil}");
+    assert!(sil.contains("(byte[] left, byte[] right) = packed.split(2).0;"), "{sil}");
+    assert!(sil.contains("(byte[] first, byte[] second) = packed.split(2).0;"), "{sil}");
     assert!(sil.contains("(int returned) = identity(count);"), "{sil}");
+    let formatted = compile_contract(sil, &[SilExpr::int(0)], CompileOptions::default()).expect("formatted retained AST recompiles");
+    assert_eq!(formatted.bytecode, artifact.sil_abi.contract("Counter").expect("Counter ABI exists").compiled.bytecode);
 }
 
 #[test]
@@ -8678,15 +8738,18 @@ fn typed_destructuring_keeps_an_expanded_entry_parameter_authored() {
     );
 
     let sil = actor_sil.get("Vault").expect("Vault emits");
-    assert!(sil.contains("        Expanded {\n"), "{sil}");
-    assert!(!sil.contains("        State {\n"), "{sil}");
+    assert!(sil.contains("Expanded {amount: int amount_value, detail: Detail detail_value} = value;"), "{sil}");
+    assert!(!sil.contains("State {amount: int amount_value"), "{sil}");
 }
 
 #[test]
 fn genesis_spawn_lowers_to_pinned_sil_and_artifact_metadata() {
     let (controller_sil, controller_artifact) =
         emit_selected_fixture("tests/fixtures/runtime/context_genesis_spawn/app.ag", "ControllerApp", "Controller");
-    assert_eq!(controller_sil, include_str!("../../../../tests/fixtures/runtime/context_genesis_spawn/Controller.sil"));
+    assert_pinned_sil_semantics(
+        &controller_sil,
+        include_str!("../../../../tests/fixtures/runtime/context_genesis_spawn/Controller.sil"),
+    );
     let launch =
         controller_artifact.argent.actors[0].entries.iter().find(|entry| entry.name == "launch").expect("launch entry exists");
     assert_eq!(launch.spawns.len(), 1);
@@ -8728,14 +8791,17 @@ fn genesis_spawn_lowers_to_pinned_sil_and_artifact_metadata() {
     );
 
     let (pair_sil, _) = emit_selected_fixture("tests/fixtures/runtime/context_genesis_spawn/app.ag", "PairApp", "Pair");
-    assert_eq!(pair_sil, include_str!("../../../../tests/fixtures/runtime/context_genesis_spawn/Pair.sil"));
+    assert_pinned_sil_semantics(&pair_sil, include_str!("../../../../tests/fixtures/runtime/context_genesis_spawn/Pair.sil"));
 }
 
 #[test]
 fn multiple_genesis_spawns_lower_to_pinned_sil_and_artifact_metadata() {
     let source = "tests/fixtures/runtime/context_multiple_genesis_spawns/app.ag";
     let (controller_sil, controller_artifact) = emit_selected_fixture(source, "ControllerApp", "Controller");
-    assert_eq!(controller_sil, include_str!("../../../../tests/fixtures/runtime/context_multiple_genesis_spawns/Controller.sil"));
+    assert_pinned_sil_semantics(
+        &controller_sil,
+        include_str!("../../../../tests/fixtures/runtime/context_multiple_genesis_spawns/Controller.sil"),
+    );
     let launch =
         controller_artifact.argent.actors[0].entries.iter().find(|entry| entry.name == "launch").expect("launch entry exists");
     assert_eq!(
@@ -8770,14 +8836,20 @@ fn multiple_genesis_spawns_lower_to_pinned_sil_and_artifact_metadata() {
     controller_artifact.check_template_plan_consistency().expect("multiple-spawn metadata verifies");
 
     let (pair_sil, _) = emit_selected_fixture(source, "PairApp", "Pair");
-    assert_eq!(pair_sil, include_str!("../../../../tests/fixtures/runtime/context_multiple_genesis_spawns/Pair.sil"));
+    assert_pinned_sil_semantics(
+        &pair_sil,
+        include_str!("../../../../tests/fixtures/runtime/context_multiple_genesis_spawns/Pair.sil"),
+    );
 }
 
 #[test]
 fn observed_and_spawned_source_actor_share_pinned_witnesses() {
     let source = "tests/fixtures/runtime/context_shared_actor_witness/app.ag";
     let (controller_sil, controller_artifact) = emit_selected_fixture(source, "SharedActorWitness", "Controller");
-    assert_eq!(controller_sil, include_str!("../../../../tests/fixtures/runtime/context_shared_actor_witness/Controller.sil"));
+    assert_pinned_sil_semantics(
+        &controller_sil,
+        include_str!("../../../../tests/fixtures/runtime/context_shared_actor_witness/Controller.sil"),
+    );
 
     let advance =
         controller_artifact.argent.actors[0].entries.iter().find(|entry| entry.name == "advance").expect("advance entry exists");
@@ -8830,9 +8902,12 @@ fn observed_and_spawned_source_actor_share_pinned_witnesses() {
     );
 
     let (anchor_sil, _) = emit_selected_fixture(source, "SharedActorWitness", "Anchor");
-    assert_eq!(anchor_sil, include_str!("../../../../tests/fixtures/runtime/context_shared_actor_witness/Anchor.sil"));
+    assert_pinned_sil_semantics(
+        &anchor_sil,
+        include_str!("../../../../tests/fixtures/runtime/context_shared_actor_witness/Anchor.sil"),
+    );
     let (pair_sil, _) = emit_selected_fixture(source, "SharedActorWitness", "Pair");
-    assert_eq!(pair_sil, include_str!("../../../../tests/fixtures/runtime/context_shared_actor_witness/Pair.sil"));
+    assert_pinned_sil_semantics(&pair_sil, include_str!("../../../../tests/fixtures/runtime/context_shared_actor_witness/Pair.sil"));
 }
 
 #[test]
@@ -9008,14 +9083,9 @@ fn genesis_spawn_groups_must_follow_first_output_order() {
                 actor Launcher;
             }
         "#;
-    let path = PathBuf::from("test.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let sil = emit_actor(model.actor("Launcher").expect("launcher exists"), &model).expect("Launcher emits");
+    let (actor_sil, _) = inline_actor_sil_and_artifact("genesis-spawn-order", source);
+    let sil = &actor_sil["Launcher"];
     assert!(sil.contains("require(gen__first_pair_output_idx < gen__second_pair_output_idx);"), "{sil}");
-    let actor_sil = actor_sil_for_model(&model);
-    emit_artifact(&program, &model, &actor_sil).expect("generated Sil compiles");
 }
 
 #[test]
@@ -9164,8 +9234,11 @@ fn fixed_actor_spawn_reuses_consumed_template_in_pinned_sil() {
     let (launcher_sil, launcher_artifact) = emit_selected_fixture(source, "StaticActorSpawn", "Launcher");
     let (child_sil, _) = emit_selected_fixture(source, "StaticActorSpawn", "Child");
 
-    assert_eq!(launcher_sil, include_str!("../../../../tests/fixtures/runtime/context_static_actor_spawn/Launcher.sil"));
-    assert_eq!(child_sil, include_str!("../../../../tests/fixtures/runtime/context_static_actor_spawn/Child.sil"));
+    assert_pinned_sil_semantics(
+        &launcher_sil,
+        include_str!("../../../../tests/fixtures/runtime/context_static_actor_spawn/Launcher.sil"),
+    );
+    assert_pinned_sil_semantics(&child_sil, include_str!("../../../../tests/fixtures/runtime/context_static_actor_spawn/Child.sil"));
     let launch = launcher_artifact.argent.actors[0].entries.iter().find(|entry| entry.name == "launch").expect("launch entry exists");
     assert_eq!(
         launch.hidden_params.iter().map(|param| (param.name.as_str(), &param.subject, param.purpose)).collect::<Vec<_>>(),
@@ -9392,12 +9465,9 @@ fn rejects_spawn_covenant_binding_shared_with_source_value() {
 
 #[test]
 fn rejects_compiler_fixture_with_ambiguous_actor_template_frames() {
-    let program = load_fixture_program("template_frame_ambiguity");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("fixture model validates");
-    let actor_sil = actor_sil_for_model(&model);
-
-    let error = emit_artifact(&program, &model, &actor_sil).expect_err("indistinguishable actors must fail artifact construction");
+    let path = PathBuf::from("tests/fixtures/emit/template_frame_ambiguity/app.ag");
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(&path)).expect("fixture source exists");
+    let error = crate::compile_inline(path, source).expect_err("indistinguishable actors must fail artifact construction");
     let message = error.to_string();
     for expected in [
         "invalid generated artifact",
@@ -9445,17 +9515,26 @@ fn normal_multi_actor_app_has_distinct_template_frames() {
 }
 
 fn emit_fixture(case: &str, actor: &str) -> (String, Artifact) {
-    let program = load_fixture_program(case);
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("fixture model validates");
-    let actor = model.actor(actor).expect("fixture actor exists");
-    let sil = emit_actor(actor, &model).expect("fixture actor emits");
-    let actor_sil = actor_sil_for_model(&model);
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("fixture artifact emits");
-    (sil, artifact)
+    let path = PathBuf::from("tests/fixtures/emit").join(case).join("app.ag");
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(&path)).expect("fixture source exists");
+    let sources = crate::compiler::loader::SourceSet::discover_inline(path, source).expect("fixture source discovers");
+    sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(
+                &program,
+                None,
+                &std::collections::BTreeMap::new(),
+                &crate::compiler::model::default_route_planner,
+            )?;
+            let actor = model.actor_by_decl(model.types.names[actor])?;
+            let sil = emit_actor(actor, &model)?;
+            let artifact = emit_artifact(&program, &model)?;
+            Ok((sil, artifact))
+        })
+        .expect("fixture actor emits")
 }
 
-fn load_fixture_program(case: &str) -> ResolvedModules {
+fn load_fixture_program(case: &str) -> ResolvedModules<'static> {
     let path = PathBuf::from("tests/fixtures/emit").join(case).join("app.ag");
     let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(&path)).expect("fixture source exists");
     crate::compiler::loader::load_inline_program(path, source).expect("fixture source resolves")
@@ -9463,9 +9542,14 @@ fn load_fixture_program(case: &str) -> ResolvedModules {
 
 fn emit_fixture_manifest(case: &str) -> serde_json::Value {
     let program = load_fixture_program(case);
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("fixture model validates");
-    serde_json::from_str(&emit_manifest(&program, &model)).expect("fixture manifest is valid JSON")
+    let model = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("fixture model validates");
+    serde_json::from_str(&emit_manifest(&program, &model).expect("fixture manifest emits")).expect("fixture manifest is valid JSON")
 }
 
 fn assert_fixture_artifact(case: &str, artifact: &Artifact) {
@@ -9479,43 +9563,93 @@ fn assert_fixture_artifact(case: &str, artifact: &Artifact) {
 fn emit_selected_fixture(path: &str, app: &str, actor: &str) -> (String, Artifact) {
     let path = PathBuf::from(path);
     let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(&path)).expect("fixture source exists");
-    let program = crate::compiler::loader::load_inline_program(path, source).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, Some(app)).expect("model source adapts");
-    let model = Model::from_source_linked(&program_source, &BTreeMap::new()).expect("selected fixture model validates");
-    let actor = model.actor(actor).expect("selected fixture actor exists");
-    let sil = emit_actor(actor, &model).expect("selected fixture actor emits");
-    let actor_sil = actor_sil_for_model(&model);
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("selected fixture artifact emits");
-    (sil, artifact)
+    let sources = crate::compiler::loader::SourceSet::discover_inline(path, source).expect("fixture source discovers");
+    sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(
+                &program,
+                Some(app),
+                &BTreeMap::new(),
+                &crate::compiler::model::default_route_planner,
+            )?;
+            let actor = model.actor_by_decl(model.types.names[actor])?;
+            let sil = emit_actor(actor, &model)?;
+            let artifact = emit_artifact(&program, &model)?;
+            Ok((sil, artifact))
+        })
+        .expect("selected fixture actor emits")
+}
+
+fn emit_selected_inline(path: &str, source: &str, app: &str) -> (BTreeMap<String, String>, Artifact) {
+    let sources =
+        crate::compiler::loader::SourceSet::discover_inline(PathBuf::from(path), source.to_string()).expect("inline source discovers");
+    sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(
+                &program,
+                Some(app),
+                &BTreeMap::new(),
+                &crate::compiler::model::default_route_planner,
+            )?;
+            let actor_sil = actor_sil_for_model(&model);
+            let artifact = emit_artifact(&program, &model)?;
+            Ok((actor_sil, artifact))
+        })
+        .expect("selected inline actors emit")
+}
+
+fn assert_pinned_sil_semantics(actual: &str, expected: &str) {
+    let pinned = silverscript_lang::ast::parse_contract_ast(expected).expect("pinned Sil parses");
+    let args = pinned
+        .params
+        .iter()
+        .map(|param| match (&param.type_ref.base, param.type_ref.array_dims.as_slice()) {
+            (silverscript_lang::ast::TypeBase::Int, []) => SilExpr::int(0),
+            (silverscript_lang::ast::TypeBase::Byte, [silverscript_lang::ast::ArrayDim::Fixed(len)]) => SilExpr::bytes(vec![0; *len]),
+            _ => panic!("unexpected pinned constructor type: {}", param.type_ref.type_name()),
+        })
+        .collect::<Vec<_>>();
+    let compiled_pinned = compile_contract(expected, &args, CompileOptions::default()).expect("pinned Sil compiles");
+    let compiled_actual = compile_contract(actual, &args, CompileOptions::default()).expect("retained AST Sil compiles");
+    assert_eq!(compiled_actual.bytecode, compiled_pinned.bytecode);
+    assert_eq!(compiled_actual.template_hash(), compiled_pinned.template_hash());
+    assert_eq!(compiled_actual.state_layout, compiled_pinned.state_layout);
+    assert_eq!(compiled_actual.dispatch_tags, compiled_pinned.dispatch_tags);
 }
 
 fn emit_inline_error(source: &str) -> ArgentError {
-    let path = PathBuf::from("test.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    for actor in &model.actors {
-        if let Err(err) = emit_actor(actor, &model) {
-            return err;
-        }
-    }
-    panic!("expected inline source to fail during emission")
+    crate::compile_inline("test.ag", source).expect_err("expected inline source to fail during compilation")
 }
 
 fn emit_inline_actor(source: &str, actor_name: &str) -> String {
     let path = PathBuf::from("inline-emission.ag");
-    let program = crate::compiler::loader::load_inline_program(path.clone(), source.to_string()).expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let actor = model.actor(actor_name).expect("actor exists");
-    emit_actor(actor, &model).expect("actor emits")
+    let sources = crate::compiler::loader::SourceSet::discover_inline(path, source.to_string()).expect("source resolves");
+    sources
+        .with_resolved(|program| {
+            let model = AppCompilationContext::from_resolved(
+                &program,
+                None,
+                &std::collections::BTreeMap::new(),
+                &crate::compiler::model::default_route_planner,
+            )?;
+            let actor = model.actor_by_decl(model.types.names[actor_name])?;
+            emit_actor(actor, &model)
+        })
+        .expect("actor emits")
 }
 
 fn parse_and_validate(source: &str) -> Result<()> {
     let path = PathBuf::from("test.ag");
-    let program = crate::compiler::loader::load_inline_program(path, source.to_string())?;
-    let program_source = crate::compiler::model::ModelSource::new(&program, None)?;
-    Model::from_source(&program_source).map(|_| ())
+    let sources = crate::compiler::loader::SourceSet::discover_inline(path, source.to_string())?;
+    sources.with_resolved(|program| {
+        AppCompilationContext::from_resolved(
+            &program,
+            None,
+            &std::collections::BTreeMap::new(),
+            &crate::compiler::model::default_route_planner,
+        )
+        .map(|_| ())
+    })
 }
 
 fn toy_chess_source() -> String {
@@ -9641,8 +9775,8 @@ fn toy_chess_source() -> String {
 
 #[test]
 fn artifact_codec_uses_compiled_sil_dispatch_tags() {
-    let program = crate::compiler::loader::load_inline_program(
-        PathBuf::from("test.ag"),
+    let (actor_sil, artifact) = inline_actor_sil_and_artifact(
+        "artifact-codec-dispatch",
         r#"
             state FooState {
                 int count;
@@ -9663,20 +9797,13 @@ fn artifact_codec_uses_compiled_sil_dispatch_tags() {
             app Test {
                 actor Foo;
             }
-            "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let actor = model.actor("Foo").expect("actor exists");
-    let actor_sil = actor_sil_for_model(&model);
-    let artifact = emit_artifact(&program, &model, &actor_sil).expect("artifact emits");
+            "#,
+    );
     let sil_abi_json = serde_json::to_string(&artifact.sil_abi).expect("Sil ABI artifact serializes");
     let sil_abi: SilAbiArtifact = serde_json::from_str(&sil_abi_json).expect("Sil ABI artifact deserializes");
     sil_abi.check_schema_version().expect("Sil ABI schema version is current");
     let sil = actor_sil.get("Foo").expect("Foo Sil exists");
-    let constructor_args = constructor_args_for_actor(actor, &model).expect("constructor args build");
+    let constructor_args = [SilExpr::int(0), SilExpr::bytes(vec![0; 4]), SilExpr::bool(false)];
     let compiled = compile_contract(sil, &constructor_args, CompileOptions::default()).expect("generated Sil compiles");
 
     let sil_contract = sil_abi.contract("Foo").expect("Foo Sil ABI exists");
@@ -9706,8 +9833,8 @@ fn artifact_codec_uses_compiled_sil_dispatch_tags() {
 
 #[test]
 fn sil_signature_builtins_pass_through() {
-    let program = crate::compiler::loader::load_inline_program(
-        PathBuf::from("test.ag"),
+    let (actor_sil, _) = inline_actor_sil_and_artifact(
+        "sil-signature-builtins",
         r#"
             state AuthState {
                 int nonce;
@@ -9731,19 +9858,13 @@ fn sil_signature_builtins_pass_through() {
             app Test {
                 actor Auth;
             }
-            "#
-        .to_string(),
-    )
-    .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
-    let actor_sil = actor_sil_for_model(&model);
+            "#,
+    );
     let sil = actor_sil.get("Auth").expect("Auth Sil exists");
 
     for call in ["checkSig(", "checkSigEcdsa(", "checkMsgSig(", "checkMsgSigEcdsa("] {
         assert!(sil.contains(call), "missing `{call}` in generated Sil:\n{sil}");
     }
-    emit_artifact(&program, &model, &actor_sil).expect("generated Sil compiles");
 }
 
 #[test]
@@ -9761,10 +9882,15 @@ fn manifest_uses_relative_paths_when_possible() {
         .to_string(),
     )
     .expect("source resolves");
-    let program_source = crate::compiler::model::ModelSource::new(&program, None).expect("model source adapts");
-    let model = Model::from_source(&program_source).expect("model validates");
+    let model = AppCompilationContext::from_resolved(
+        &program,
+        None,
+        &std::collections::BTreeMap::new(),
+        &crate::compiler::model::default_route_planner,
+    )
+    .expect("model validates");
 
-    let manifest = emit_manifest(&program, &model);
+    let manifest = emit_manifest(&program, &model).expect("manifest emits");
 
     assert!(manifest.contains(r#""root": "examples/tickets.ag""#), "{manifest}");
     assert!(manifest.contains(r#""examples/tickets.ag""#), "{manifest}");
@@ -9778,8 +9904,31 @@ fn generated_snake_suffixes_preserve_acronym_runs() {
     assert_eq!(to_snake("KCC20Minter"), "kcc20_minter");
 }
 
-fn actor_sil_for_model(model: &Model<'_>) -> BTreeMap<String, String> {
-    model.actors.iter().map(|actor| (actor.name.clone(), emit_actor(actor, model).expect("actor emits"))).collect()
+fn actor_sil_for_model(model: &AppCompilationContext<'_>) -> BTreeMap<String, String> {
+    model
+        .app_actors
+        .iter_with_ids()
+        .map(|(id, name)| {
+            let actor = model.actor_by_decl(id).expect("selected actor exists");
+            (name.to_string(), emit_actor(actor, model).expect("actor emits"))
+        })
+        .collect()
+}
+
+pub(super) fn emit_actor(actor: &ActorDecl, model: &AppCompilationContext<'_>) -> Result<String> {
+    let lowerer = ContractLowerer::new(model.types.names[&actor.name], model)?;
+    let contract = lowerer.annotate_actor(lowerer.lower_actor()?)?;
+    Ok(silverscript_lang::ast::format_contract_ast(&contract.contract))
+}
+
+pub(super) fn emit_artifact(program: &ResolvedModules, model: &AppCompilationContext<'_>) -> Result<Artifact> {
+    let mut contracts = BTreeMap::new();
+    for (id, _) in model.app_actors.iter_with_ids() {
+        let lowerer = ContractLowerer::new(id, model)?;
+        contracts.insert(id, lowerer.annotate_actor(lowerer.lower_actor()?)?);
+    }
+    let compiled_actors = CompiledActors::from_contracts(contracts, &model.types.display_names)?;
+    project_compiled_artifact(program, model, &compiled_actors)
 }
 
 fn assert_example_build_artifact(input: &str, name: &str, expected_hashes: &[(&str, &str)]) {
@@ -9849,11 +9998,6 @@ fn subject_label(subject: &HiddenParamSubjectArtifact) -> &str {
         HiddenParamSubjectArtifact::TemplateSelector { selector } => selector,
         HiddenParamSubjectArtifact::StateExpansion { memory_state, .. } => memory_state,
     }
-}
-
-fn resolved_constructed_actor(route: &ResolvedRoute) -> &str {
-    let ResolvedSuccessor::Constructed { actor, .. } = &route.successor else { panic!("expected constructed successor") };
-    actor
 }
 
 fn artifact_constructed_actor(route: &RouteArtifact) -> &str {

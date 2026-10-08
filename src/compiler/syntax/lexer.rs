@@ -41,39 +41,24 @@ impl std::fmt::Display for Span {
     }
 }
 
-pub fn lex(source: &str) -> Result<Vec<Token>> {
-    lex_with_policy(source, IdentifierPolicy::Any)
-}
-
 pub fn lex_argent_source(source: &str) -> Result<Vec<Token>> {
-    lex_with_policy(source, IdentifierPolicy::ArgentSource)
-}
-
-pub(crate) fn parse_int_literal(source: &str) -> Option<i64> {
-    let tokens = lex(source).ok()?;
-    let (negative, digits) = match tokens.as_slice() {
-        [Token { kind: TokenKind::Number(digits), .. }, Token { kind: TokenKind::Eof, .. }] => (false, digits),
-        [
-            Token { kind: TokenKind::Symbol('-'), .. },
-            Token { kind: TokenKind::Number(digits), .. },
-            Token { kind: TokenKind::Eof, .. },
-        ] => (true, digits),
-        _ => return None,
-    };
-    let magnitude = digits.parse::<i64>().ok()?;
-    if negative { magnitude.checked_neg() } else { Some(magnitude) }
-}
-
-fn lex_with_policy(source: &str, identifier_policy: IdentifierPolicy) -> Result<Vec<Token>> {
-    let mut lexer = Lexer { source, bytes: source.as_bytes(), pos: 0, tokens: Vec::new(), identifier_policy };
+    let mut lexer = Lexer { source, bytes: source.as_bytes(), pos: 0, tokens: Vec::new() };
     lexer.run()?;
     Ok(lexer.tokens)
 }
 
-#[derive(Clone, Copy)]
-enum IdentifierPolicy {
-    Any,
-    ArgentSource,
+/// Interpret a complete number token for consumers that still need an owned integer.
+pub(crate) fn parse_number_value(raw: &str) -> Option<i64> {
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        return i64::from_str_radix(hex, 16).ok();
+    }
+    let (base, exponent) = raw.split_once(['e', 'E']).map_or((raw, None), |(base, exponent)| (base, Some(exponent)));
+    let mut value = base.replace('_', "").parse::<i128>().ok()?;
+    if let Some(exponent) = exponent {
+        let exponent = exponent.replace('_', "").parse::<u32>().ok()?;
+        value = value.checked_mul(10_i128.checked_pow(exponent)?)?;
+    }
+    i64::try_from(value).ok()
 }
 
 struct Lexer<'a> {
@@ -81,7 +66,6 @@ struct Lexer<'a> {
     bytes: &'a [u8],
     pos: usize,
     tokens: Vec<Token>,
-    identifier_policy: IdentifierPolicy,
 }
 
 impl Lexer<'_> {
@@ -105,8 +89,8 @@ impl Lexer<'_> {
                     self.pos += 2;
                     self.push(TokenKind::LeftArrow, start, self.pos);
                 }
-                b'{' | b'}' | b'(' | b')' | b'[' | b']' | b';' | b':' | b',' | b'|' | b'&' | b'!' | b'=' | b'+' | b'-' | b'*'
-                | b'/' | b'%' | b'<' | b'>' | b'.' => {
+                b'{' | b'}' | b'(' | b')' | b'[' | b']' | b';' | b':' | b',' | b'|' | b'&' | b'^' | b'!' | b'=' | b'+' | b'-'
+                | b'*' | b'/' | b'%' | b'<' | b'>' | b'.' => {
                     let start = self.pos;
                     self.pos += 1;
                     self.push(TokenKind::Symbol(b as char), start, self.pos);
@@ -159,24 +143,21 @@ impl Lexer<'_> {
     fn lex_string(&mut self) -> Result<()> {
         let start = self.pos;
         self.pos += 1;
-        let mut out = String::new();
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
                 b'"' => {
                     self.pos += 1;
-                    self.push(TokenKind::Str(out), start, self.pos);
+                    let value = serde_json::from_str::<String>(&self.source[start..self.pos])
+                        .map_err(|err| self.error_at(start, format!("invalid string literal: {err}")))?;
+                    self.push(TokenKind::Str(value), start, self.pos);
                     return Ok(());
                 }
                 b'\\' => {
                     self.pos += 1;
-                    let escaped = *self.bytes.get(self.pos).ok_or_else(|| self.error_at(self.pos, "unterminated string escape"))?;
-                    out.push(escaped as char);
+                    self.bytes.get(self.pos).ok_or_else(|| self.error_at(self.pos, "unterminated string escape"))?;
                     self.pos += 1;
                 }
-                b => {
-                    out.push(b as char);
-                    self.pos += 1;
-                }
+                _ => self.pos += 1,
             }
         }
         Err(self.error_at(start, "unterminated string"))
@@ -184,8 +165,21 @@ impl Lexer<'_> {
 
     fn lex_number(&mut self) {
         let start = self.pos;
-        while matches!(self.peek_byte(0), Some(b'0'..=b'9')) {
-            self.pos += 1;
+        if self.peek_byte(0) == Some(b'0') && matches!(self.peek_byte(1), Some(b'x' | b'X')) {
+            self.pos += 2;
+            while matches!(self.peek_byte(0), Some(b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')) {
+                self.pos += 1;
+            }
+        } else {
+            while matches!(self.peek_byte(0), Some(b'0'..=b'9' | b'_')) {
+                self.pos += 1;
+            }
+            if matches!(self.peek_byte(0), Some(b'e' | b'E')) {
+                self.pos += 1;
+                while matches!(self.peek_byte(0), Some(b'0'..=b'9' | b'_')) {
+                    self.pos += 1;
+                }
+            }
         }
         self.push(TokenKind::Number(self.source[start..self.pos].to_string()), start, self.pos);
     }
@@ -196,17 +190,13 @@ impl Lexer<'_> {
             self.pos += 1;
         }
         let ident = self.source[start..self.pos].to_string();
-        if matches!(self.identifier_policy, IdentifierPolicy::ArgentSource) {
-            if ident == word::LEGACY_COVENANT_ID {
-                return Err(self.error_at(start, format!("`{}` was renamed to `{}`", word::LEGACY_COVENANT_ID, word::COVENANT_ID)));
-            }
-            let generated_prefix =
-                [RESERVED_GENERATED_PREFIX, RESERVED_GENERATED_TYPE_PREFIX].into_iter().find(|prefix| ident.starts_with(prefix));
-            if let Some(generated_prefix) = generated_prefix {
-                return Err(
-                    self.error_at(start, format!("identifier `{ident}` uses reserved generated namespace `{generated_prefix}`"))
-                );
-            }
+        if ident == word::LEGACY_COVENANT_ID {
+            return Err(self.error_at(start, format!("`{}` was renamed to `{}`", word::LEGACY_COVENANT_ID, word::COVENANT_ID)));
+        }
+        let generated_prefix =
+            [RESERVED_GENERATED_PREFIX, RESERVED_GENERATED_TYPE_PREFIX].into_iter().find(|prefix| ident.starts_with(prefix));
+        if let Some(generated_prefix) = generated_prefix {
+            return Err(self.error_at(start, format!("identifier `{ident}` uses reserved generated namespace `{generated_prefix}`")));
         }
         self.push(TokenKind::Ident(ident), start, self.pos);
         Ok(())

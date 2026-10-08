@@ -6,8 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::artifact::*;
 use crate::compiler::loader::SymbolKind;
+use crate::compiler::resolve::{AppMember, ResolvedModules, ResolvedName};
+use crate::compiler::syntax::node::DeclId;
 use crate::compiler::syntax::*;
 use crate::error::{ArgentError, Result};
+
+use super::{SourceFieldId, SourceStateId};
 
 #[derive(Debug, Clone)]
 pub(crate) struct LinkedActor {
@@ -16,6 +20,23 @@ pub(crate) struct LinkedActor {
     pub state: String,
     pub interface: ActorInterfaceArtifact,
     pub template: ActorTemplateArtifact,
+}
+
+/// Portable identity of an actor exported by a linked app.
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct LinkedActorId {
+    pub(crate) app: String,
+    pub(crate) actor: String,
+}
+
+impl LinkedActorId {
+    /// Translate a bound source member to its portable linked-artifact identity.
+    pub(crate) fn from_member(member: AppMember, resolution: &ResolvedModules<'_>) -> Self {
+        Self {
+            app: resolution.declaration(member.app).name().to_string(),
+            actor: resolution.declaration(member.actor).name().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,10 +58,13 @@ pub(crate) struct LinkedDependency<'a> {
     pub origins: &'a BTreeMap<String, DeclarationOrigin>,
 }
 
+type LocalStateSource<'a, 'src> = (&'a BTreeMap<String, DeclId>, &'a ResolvedModules<'src>, &'a BTreeMap<DeclId, String>);
+
 pub(crate) struct LinkedContext {
     pub states: BTreeMap<String, StateDecl>,
-    pub actor_decls: BTreeMap<String, ActorDecl>,
-    pub actors: BTreeMap<String, LinkedActor>,
+    pub state_field_sources: BTreeMap<SourceFieldId, SourceStateId>,
+    pub actors: BTreeMap<LinkedActorId, LinkedActor>,
+    pub actor_names: BTreeMap<String, LinkedActorId>,
     pub actor_enums: BTreeMap<String, LinkedActorEnum>,
     pub origins: BTreeMap<String, DeclarationOrigin>,
 }
@@ -48,15 +72,31 @@ pub(crate) struct LinkedContext {
 impl LinkedContext {
     pub(super) fn new(
         dependencies: &BTreeMap<String, LinkedDependency<'_>>,
-        origins: BTreeMap<String, DeclarationOrigin>,
-        unbound_names: &BTreeSet<String>,
+        reserved_names: &BTreeSet<String>,
         local_states: &BTreeMap<String, &StateDecl>,
+        local_state_ids: &BTreeMap<String, DeclId>,
         local_actors: &BTreeMap<String, &ActorDecl>,
+        resolution: &ResolvedModules<'_>,
+        display_names: &BTreeMap<DeclId, String>,
     ) -> Result<Self> {
+        let origins = display_names
+            .iter()
+            .map(|(id, name)| {
+                (
+                    name.clone(),
+                    DeclarationOrigin::Source {
+                        path: resolution.declaration_path(*id).to_path_buf(),
+                        kind: id.kind(),
+                        index: id.index,
+                    },
+                )
+            })
+            .collect();
         let mut context = Self {
             states: BTreeMap::new(),
-            actor_decls: BTreeMap::new(),
+            state_field_sources: BTreeMap::new(),
             actors: BTreeMap::new(),
+            actor_names: BTreeMap::new(),
             actor_enums: BTreeMap::new(),
             origins,
         };
@@ -92,7 +132,7 @@ impl LinkedContext {
                 } else {
                     let mut candidate = name.clone();
                     let mut suffix = 0;
-                    while context.origins.contains_key(&candidate) || unbound_names.contains(&candidate) {
+                    while context.origins.contains_key(&candidate) || reserved_names.contains(&candidate) {
                         suffix += 1;
                         candidate = format!("Argent__linked__{suffix}__{name}");
                     }
@@ -128,15 +168,19 @@ impl LinkedContext {
                     .ok_or_else(|| ArgentError::new(format!("app `{app}` has no template receipt for actor `{actor_name}`")))?;
 
                 // add linked actor's state, and its potential sub-states (expansion)
-                context.import_state_closure(artifact, &actor.state, &names, local_states)?;
+                context.import_state_closure(
+                    artifact,
+                    &actor.state,
+                    &names,
+                    local_states,
+                    Some((local_state_ids, resolution, display_names)),
+                )?;
 
                 let state = names[&actor.state].clone();
-                context.actor_decls.insert(
-                    reference.clone(),
-                    ActorDecl { name: reference.clone(), state: state.clone(), functions: Vec::new(), entries: Vec::new() },
-                );
+                let id = LinkedActorId { app: app.clone(), actor: actor_name.clone() };
+                context.actor_names.insert(reference, id.clone());
                 context.actors.insert(
-                    reference,
+                    id,
                     LinkedActor {
                         app: app.clone(),
                         actor: actor_name.clone(),
@@ -192,6 +236,7 @@ impl LinkedContext {
         root: &str,
         names: &BTreeMap<String, String>,
         local_states: &BTreeMap<String, &StateDecl>,
+        local_source: Option<LocalStateSource<'_, '_>>,
     ) -> Result<()> {
         let states = artifact.argent.states.iter().map(|state| (state.name.as_str(), state)).collect::<BTreeMap<_, _>>();
         let expansions =
@@ -253,8 +298,35 @@ impl LinkedContext {
                 .transpose()?;
             let model_name = names[&name].clone();
             let decl = StateDecl { name: model_name.clone(), fields, expansion };
+            let owner_origin = self
+                .origins
+                .get(&model_name)
+                .ok_or_else(|| ArgentError::new(format!("linked state `{model_name}` has no declaration origin")))?;
+            let owner = SourceStateId::from_origin(model_name.clone(), owner_origin.clone());
+            for field in &decl.fields {
+                let Some(target_origin) = self.origins.get(&field.ty.name) else { continue };
+                if !matches!(
+                    target_origin,
+                    DeclarationOrigin::Source { kind: SymbolKind::State, .. }
+                        | DeclarationOrigin::Dependency { kind: SymbolKind::State, .. }
+                ) {
+                    continue;
+                }
+                let target = SourceStateId::from_origin(field.ty.name.clone(), target_origin.clone());
+                let key = SourceFieldId::new(owner.clone(), &field.name);
+                if let Some(previous) = self.state_field_sources.insert(key, target.clone())
+                    && previous != target
+                {
+                    return Err(ArgentError::new(format!(
+                        "linked state `{model_name}` field `{}` has conflicting source identities",
+                        field.name
+                    )));
+                }
+            }
             if let Some(local) = local_states.get(&model_name) {
-                if !same_state_decl(local, &decl) {
+                let (local_state_ids, resolution, display_names) = local_source
+                    .ok_or_else(|| ArgentError::new(format!("linked state `{model_name}` has no local source bindings")))?;
+                if !same_source_state_decl(local, &decl, local_state_ids[&model_name], resolution, display_names) {
                     return Err(ArgentError::new(format!(
                         "linked app `{}` state `{name}` conflicts with its imported source declaration",
                         artifact.app
@@ -340,4 +412,96 @@ fn same_state_decl(left: &StateDecl, right: &StateDecl) -> bool {
             }
             _ => false,
         }
+}
+
+/// Compare an authored state with its linked artifact after resolving source type references.
+fn same_source_state_decl(
+    source: &StateDecl,
+    linked: &StateDecl,
+    owner: DeclId,
+    resolution: &ResolvedModules<'_>,
+    display_names: &BTreeMap<DeclId, String>,
+) -> bool {
+    let name = |source: &str| match resolution.bindings(owner).names.get(source) {
+        Some(ResolvedName::Declaration(id)) => display_names.get(id).cloned().unwrap_or_else(|| source.to_string()),
+        _ => source.to_string(),
+    };
+    display_names.get(&owner) == Some(&linked.name)
+        && source.fields.len() == linked.fields.len()
+        && source.fields.iter().zip(&linked.fields).all(|(left, right)| {
+            left.name == right.name
+                && left.virtual_slot == right.virtual_slot
+                && left.ty.array == right.ty.array
+                && if left.ty.is_builtin() { left.ty.name == right.ty.name } else { name(&left.ty.name) == right.ty.name }
+                && left.ty.actor_state.as_deref().map(name) == right.ty.actor_state
+        })
+        && match (&source.expansion, &linked.expansion) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                name(&left.base) == right.base
+                    && left.digests.len() == right.digests.len()
+                    && left
+                        .digests
+                        .iter()
+                        .zip(&right.digests)
+                        .all(|(left, right)| left.field == right.field && name(&left.state) == right.state)
+            }
+            _ => false,
+        }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linked_nested_fields_retain_distinct_source_origins() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock after epoch").as_nanos();
+        let directory = std::env::temp_dir().join(format!("argent-linked-field-origins-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("test directory created");
+        let mut artifacts = Vec::new();
+        for (app, field) in [("Left", "int amount"), ("Right", "bool active")] {
+            let path = directory.join(format!("{app}.ag"));
+            std::fs::write(
+                &path,
+                format!(
+                    "state Inner {{ {field}; }} state S {{ Inner nested; }} state R {{ int nonce; }} \
+                     actor A owns R {{ entry hold() emits none {{}} }} app {app} {{ actor A; }}"
+                ),
+            )
+            .expect("source written");
+            artifacts.push((app, crate::build_file(&path, directory.join(format!("out-{app}"))).expect("dependency builds")));
+        }
+        let mut origins = BTreeMap::new();
+        for (app, _) in &artifacts {
+            for state in ["Inner", "S"] {
+                origins.insert(
+                    format!("{app}{state}"),
+                    DeclarationOrigin::Dependency { app: (*app).to_string(), name: state.to_string(), kind: SymbolKind::State },
+                );
+            }
+        }
+        let mut context = LinkedContext {
+            states: BTreeMap::new(),
+            state_field_sources: BTreeMap::new(),
+            actors: BTreeMap::new(),
+            actor_names: BTreeMap::new(),
+            actor_enums: BTreeMap::new(),
+            origins,
+        };
+        for (app, artifact) in &artifacts {
+            let names = [("Inner".to_string(), format!("{app}Inner")), ("S".to_string(), format!("{app}S"))].into_iter().collect();
+            context.import_state_closure(artifact, "S", &names, &BTreeMap::new(), None).expect("nested state closure imports");
+        }
+        let owners =
+            ["Left", "Right"].map(|app| SourceStateId::from_origin(format!("{app}S"), context.origins[&format!("{app}S")].clone()));
+        let targets = owners
+            .iter()
+            .map(|owner| context.state_field_sources[&SourceFieldId::new(owner.clone(), "nested")].clone())
+            .collect::<Vec<_>>();
+        assert_ne!(targets[0], targets[1]);
+        assert_eq!(targets[0], SourceStateId::from_origin("LeftInner", context.origins["LeftInner"].clone()));
+        assert_eq!(targets[1], SourceStateId::from_origin("RightInner", context.origins["RightInner"].clone()));
+        std::fs::remove_dir_all(directory).expect("test directory removed");
+    }
 }

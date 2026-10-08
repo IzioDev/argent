@@ -1,7 +1,13 @@
 use std::path::PathBuf;
 
-use super::parse_module;
 use super::{Cardinality, CardinalityBound, EmitSpec, TypeRef};
+use crate::compiler::loader::SourceSet;
+
+fn parse_module(path: PathBuf, source: String) -> crate::error::Result<super::Module> {
+    let sources = SourceSet::discover_inline(path, source)?;
+    let program = sources.parse_modules()?;
+    Ok(program.modules.into_iter().next().expect("inline source has a root module").legacy)
+}
 
 #[test]
 fn parses_type_first_function_entry_and_delegate_parameters() {

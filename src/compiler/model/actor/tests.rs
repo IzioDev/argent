@@ -1,5 +1,14 @@
 use super::*;
-use crate::compiler::syntax::{EmitSpec, EntryBody, EntryDecl, EntryKind, FunctionDecl, TypeRef};
+use crate::compiler::loader::load_inline_program;
+use crate::compiler::syntax::node::{DeclId, ModuleId, SymbolKind};
+use crate::compiler::syntax::{EmitSpec, EntryDecl, EntryKind, FunctionDecl, TypeRef};
+
+fn actor_model<'a>(actor: &'a ActorDecl) -> Result<ActorModel<'a>> {
+    let module = ModuleId::new(0);
+    let program = load_inline_program("empty.ag".into(), String::new())?;
+    let consts = ConstResolver::from_resolved(&program, &BTreeMap::new());
+    ActorModel::build(DeclId::new(module, SymbolKind::Actor, 0), DeclId::new(module, SymbolKind::State, 0), actor, &consts)
+}
 
 fn entry(name: &str) -> EntryDecl {
     EntryDecl {
@@ -10,14 +19,13 @@ fn entry(name: &str) -> EntryDecl {
         observes: Vec::new(),
         spawns: Vec::new(),
         emits: EmitSpec::None,
-        body: EntryBody::default(),
         routes: Vec::new(),
         terminal_route_sets: Vec::new(),
     }
 }
 
 fn function(name: &str) -> FunctionDecl {
-    FunctionDecl { name: name.to_string(), params: Vec::new(), return_ty: Some(TypeRef::new("int")), body: "return 0;".to_string() }
+    FunctionDecl { name: name.to_string(), params: Vec::new(), return_ty: Some(TypeRef::new("int")) }
 }
 
 #[test]
@@ -28,10 +36,10 @@ fn indexes_entries_without_changing_source_order() {
         functions: Vec::new(),
         entries: vec![entry("z"), entry("a")],
     };
-    let model = ActorModel::build(&actor, &BTreeMap::new(), &ConstResolver::new(&[])).expect("actor model");
+    let model = actor_model(&actor).expect("actor model");
 
     assert_eq!(model.entries().map(|entry| entry.source().name.as_str()).collect::<Vec<_>>(), ["z", "a"]);
-    assert_eq!(model.entry("a").expect("indexed entry").source().name, "a");
+    assert_eq!(model.entry_by_id(EntryId { actor: model.id, index: 1 }).expect("indexed entry").source().name, "a");
 }
 
 #[test]
@@ -43,7 +51,7 @@ fn rejects_duplicate_entry_names() {
         entries: vec![entry("step"), entry("step")],
     };
 
-    let err = ActorModel::build(&actor, &BTreeMap::new(), &ConstResolver::new(&[])).expect_err("duplicate entries must be rejected");
+    let err = actor_model(&actor).expect_err("duplicate entries must be rejected");
 
     assert_eq!(err.message, "actor `Worker` declares entry `step` more than once");
 }
@@ -56,7 +64,7 @@ fn indexes_functions_without_changing_source_order() {
         functions: vec![function("z"), function("a")],
         entries: Vec::new(),
     };
-    let model = ActorModel::build(&actor, &BTreeMap::new(), &ConstResolver::new(&[])).expect("actor model");
+    let model = actor_model(&actor).expect("actor model");
 
     assert_eq!(model.functions().map(|function| function.name.as_str()).collect::<Vec<_>>(), ["z", "a"]);
 }
@@ -70,7 +78,7 @@ fn rejects_duplicate_function_names() {
         entries: Vec::new(),
     };
 
-    let err = ActorModel::build(&actor, &BTreeMap::new(), &ConstResolver::new(&[])).expect_err("duplicate functions must be rejected");
+    let err = actor_model(&actor).expect_err("duplicate functions must be rejected");
 
     assert_eq!(err.message, "actor `Worker` declares function `step` more than once");
 }
@@ -84,8 +92,7 @@ fn rejects_function_and_entry_with_the_same_name() {
         entries: vec![entry("step")],
     };
 
-    let err =
-        ActorModel::build(&actor, &BTreeMap::new(), &ConstResolver::new(&[])).expect_err("function and entry names must not collide");
+    let err = actor_model(&actor).expect_err("function and entry names must not collide");
 
     assert_eq!(err.message, "actor `Worker` declares both a function and an entry named `step`");
 }

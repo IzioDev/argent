@@ -6,8 +6,6 @@ use crate::{
         TypeArtifact, route_template_proof_receipt_id, route_template_table_receipt_id,
     },
     codec::{CodecError, decode_hex, encode_entry_sig_script},
-    compiler::codegen::emit_build_app_linked,
-    compiler::loader::load_program,
 };
 use std::{
     cell::Cell,
@@ -33,6 +31,30 @@ use kaspa_txscript::{
     opcodes::codes::OpTrue, parse_script, pay_to_script_hash_signature_script_with_flags, script_builder::ScriptBuilder,
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
+use silverscript_lang::ast::parse_contract_ast;
+
+fn fixture_ast(source: &str) -> serde_json::Value {
+    fn strip_spans(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                fields.retain(|name, _| !name.ends_with("span"));
+                for field in fields.values_mut() {
+                    strip_spans(field);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    strip_spans(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut ast = serde_json::to_value(parse_contract_ast(source).expect("pinned Sil fixture parses")).expect("Sil AST serializes");
+    strip_spans(&mut ast);
+    ast
+}
 
 mod genesis_proof;
 
@@ -2180,16 +2202,16 @@ fn context_spawns_a_static_actor_from_a_linked_app() {
         "linked spawn metadata must agree with its shared actor-template witnesses"
     );
     assert_eq!(
-        fs::read_to_string(out_dir.join("sil/Launcher.sil")).expect("generated launcher Sil exists"),
-        include_str!("../../tests/fixtures/runtime/context_static_linked_spawn/Launcher.sil")
+        fixture_ast(&fs::read_to_string(out_dir.join("sil/Launcher.sil")).expect("generated launcher Sil exists")),
+        fixture_ast(include_str!("../../tests/fixtures/runtime/context_static_linked_spawn/Launcher.sil"))
     );
     assert_eq!(
-        fs::read_to_string(out_dir.join("sil/Relay.sil")).expect("generated relay Sil exists"),
-        include_str!("../../tests/fixtures/runtime/context_static_linked_spawn/Relay.sil")
+        fixture_ast(&fs::read_to_string(out_dir.join("sil/Relay.sil")).expect("generated relay Sil exists")),
+        fixture_ast(include_str!("../../tests/fixtures/runtime/context_static_linked_spawn/Relay.sil"))
     );
     assert_eq!(
-        fs::read_to_string(out_dir.join("apps/ChildApp/sil/Child.sil")).expect("generated child Sil exists"),
-        include_str!("../../tests/fixtures/runtime/context_static_linked_spawn/Child.sil")
+        fixture_ast(&fs::read_to_string(out_dir.join("apps/ChildApp/sil/Child.sil")).expect("generated child Sil exists")),
+        fixture_ast(include_str!("../../tests/fixtures/runtime/context_static_linked_spawn/Child.sil"))
     );
 
     let bundle = compiled.runtime_bundle().expect("compiled artifacts form a runtime bundle");
@@ -3614,9 +3636,12 @@ fn observed_self_merge_actor_composes_with_its_defining_app() {
             "controller_app.ag" => include_str!("../../tests/fixtures/runtime/context_observed_self_merge/CtrlAppImport.sil"),
             _ => unreachable!("the test lists every controller fixture"),
         };
-        assert_eq!(controller_sil, expected_controller_sil);
+        assert_eq!(fixture_ast(&controller_sil), fixture_ast(expected_controller_sil));
         let asset_sil = fs::read_to_string(out_dir.join("apps/AssetApp/sil/Asset.sil")).expect("generated dependency Sil exists");
-        assert_eq!(asset_sil, include_str!("../../tests/fixtures/runtime/context_observed_self_merge/Asset.sil"));
+        assert_eq!(
+            fixture_ast(&asset_sil),
+            fixture_ast(include_str!("../../tests/fixtures/runtime/context_observed_self_merge/Asset.sil"))
+        );
 
         let signer = keypair_from_byte(0x41);
         let signer_pk = signer.x_only_public_key().0.serialize().to_vec();
@@ -4143,8 +4168,7 @@ fn selected_app_artifact(input: &str, app: &str, name: &str) -> Artifact {
     if out_dir.exists() {
         fs::remove_dir_all(&out_dir).expect("old temp dir removed");
     }
-    let program = load_program(PathBuf::from(input).as_path()).expect("fixture source loads");
-    emit_build_app_linked(&program, app, &BTreeMap::new(), &out_dir).expect("selected app artifact builds");
+    crate::build_file_app(input, app, &out_dir).expect("selected app artifact builds");
     let json = fs::read_to_string(out_dir.join("artifact.json")).expect("artifact json exists");
     let artifact = serde_json::from_str(&json).expect("artifact deserializes");
     fs::remove_dir_all(out_dir).expect("temp build dir removed");

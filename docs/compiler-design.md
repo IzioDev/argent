@@ -4,6 +4,37 @@ This document records the current internal architecture of the Argent
 compiler. It describes established compiler boundaries and invariants. It will
 grow as other compiler areas become stable enough to document.
 
+## Overview
+
+```mermaid
+flowchart TD
+    API["lib.rs build APIs<br/>Start the build"]
+    SRC["SourceSet<br/>Load source text and imports"]
+    AST["syntax::Program<br/>Parse each source once"]
+    RES["ResolvedModules<br/>Match each name to its definition"]
+    GRAPH["AppGraphPlanner<br/>Find app dependencies and build order"]
+    LINK["LinkedContext<br/>Check results from dependent apps"]
+    MODEL["AppCompilationContext<br/>Plan types, routes, inputs, outputs, and state"]
+    LOW["ContractLowerer<br/>Make one contract tree for each actor"]
+    ANN["AnnotatedContractAst<br/>Retain comment anchors beside the contract tree"]
+    FMT["Sil formatter<br/>Format .sil without comments"]
+    CMP["CompiledActors<br/>Compile with placeholder values<br/>Compile again with known route values if needed"]
+    ART["codegen::artifact<br/>Combine the plans and compiled results"]
+    WRITE["codegen::emitter<br/>Write the output files"]
+    API --> SRC --> AST --> RES
+    RES -->|File app| GRAPH
+    RES -->|No app graph| MODEL
+    GRAPH -->|For each app, dependencies first| LINK --> MODEL
+    MODEL --> LOW
+    LOW --> ANN --> FMT --> WRITE
+    ANN --> CMP --> ART --> WRITE
+    MODEL --> ART
+```
+
+Sil does not currently have comment nodes. Argent retains generated comment
+text and AST anchors in `AnnotatedContractAst`; the formatter and compiler use
+the contract tree directly, so emitted `.sil` contains no comments.
+
 ## State layout and lowering
 
 Argent separates user-authored state from the state that a generated contract
@@ -293,14 +324,17 @@ The implementation divides this work across these modules:
 - `src/compiler/codegen/sil/state_boundary.rs` owns authenticated input
   projection, authored reconstruction, output materialization, template-proof
   selection, and exact preservation.
-- `src/compiler/codegen/sil/state_values.rs` plans state-valued signatures,
-  bindings, and array shapes.
+- `src/compiler/model/types.rs` plans state-valued signatures, bindings,
+  arrays, and authored expression provenance before lowering.
 - `src/compiler/codegen/sil/state_types.rs` applies checked Silverscript AST
   edits to authored type and constructor positions.
 - `src/compiler/codegen/sil/body.rs` preserves source control-flow order and
   requests typed boundary operations.
-- `src/compiler/codegen/emitter.rs` emits contract declarations, entries, and
-  artifacts from the completed plans.
+- `src/compiler/codegen/sil/contract.rs` constructs generated contract ASTs.
+- `src/compiler/codegen/compile.rs` retains final ASTs for base and context
+  compilation and formatted Sil output.
+- `src/compiler/codegen/emitter.rs` writes Sil, manifests, and artifacts from
+  the completed plans.
 
 Physical layout knowledge is limited to layout planning, the state boundary,
 contract declaration emission, artifact emission, and runtime physical-state
