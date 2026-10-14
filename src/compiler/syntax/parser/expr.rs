@@ -18,13 +18,14 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_expression_bp(&mut self, min_bp: u8) -> Result<Expr<'src>> {
+        let start = self.current().span.start;
         let mut left = self.parse_prefix()?;
         loop {
             if self.expression_end.is_some_and(|end| self.pos >= end) {
                 break;
             }
             if min_bp <= 10 && self.check_expression_postfix() {
-                left = self.parse_postfix(left)?;
+                left = self.parse_postfix(left, start)?;
                 continue;
             }
             let Some((operator, left_bp, width)) = self.binary_operator() else {
@@ -37,7 +38,7 @@ impl<'src> Parser<'src> {
                 self.advance();
             }
             let right = self.parse_expression_bp(left_bp + 1)?;
-            let span = self.sil_span(left.span.start(), right.span.end());
+            let span = self.sil_span(start, self.previous().span.end);
             left = Expr::new(ExprKind::Binary { op: operator, left: Box::new(left), right: Box::new(right) }, span);
         }
         Ok(left)
@@ -175,9 +176,6 @@ impl<'src> Parser<'src> {
             return Ok(None);
         }
         let digits = &raw[2..];
-        if digits.is_empty() {
-            return Err(self.file.error_at(literal.span.start, format!("invalid hex literal `{raw}`")));
-        }
         let normalized = if digits.len().is_multiple_of(2) { digits.to_string() } else { format!("0{digits}") };
         let byte_span = self.sil_span(literal.span.start, literal.span.end);
         let values = normalized
@@ -196,8 +194,14 @@ impl<'src> Parser<'src> {
         let span = self.sil_span(start, self.previous().span.end);
         if is_byte_array {
             let mut type_ref = ty.clone();
-            if matches!(type_ref.array_dims[0], ArrayDim::Inferred) {
-                type_ref.array_dims[0] = ArrayDim::Fixed(values.len());
+            match &mut type_ref.array_dims[0] {
+                ArrayDim::Fixed(expected) if *expected != values.len() => {
+                    return Err(self
+                        .file
+                        .error_at(start, format!("array literal size mismatch: expected {expected}, got {}", values.len())));
+                }
+                dim @ ArrayDim::Inferred => *dim = ArrayDim::Fixed(values.len()),
+                ArrayDim::Dynamic | ArrayDim::Constant(_) | ArrayDim::Fixed(_) => {}
             }
             return Ok(Some(Expr::new(ExprKind::Array { type_ref, values, type_span }, span)));
         }
@@ -284,8 +288,7 @@ impl<'src> Parser<'src> {
         self.check_symbol('.') || self.check_symbol('[') || self.check_ident("as")
     }
 
-    fn parse_postfix(&mut self, source: Expr<'src>) -> Result<Expr<'src>> {
-        let start = source.span.start();
+    fn parse_postfix(&mut self, source: Expr<'src>, start: usize) -> Result<Expr<'src>> {
         if self.consume_symbol('[') {
             let index = self.parse_expression()?;
             self.expect_symbol(']')?;

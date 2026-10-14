@@ -122,6 +122,53 @@ fn unknown_initializer_name_is_rejected_before_it_becomes_a_local() {
 }
 
 #[test]
+fn sil_opcode_builtins_resolve() {
+    for name in [
+        "OpTxSubnetId",
+        "OpTxGas",
+        "OpTxPayloadLen",
+        "OpTxLockTime",
+        "OpTxPayloadSubstr",
+        "OpOutpointTxId",
+        "OpOutpointIndex",
+        "OpTxInputScriptSigLen",
+        "OpTxInputScriptSigSubstr",
+        "OpTxInputSeq",
+        "OpTxInputDaaScore",
+        "OpTxInputIsCoinbase",
+        "OpTxInputSpkLen",
+        "OpTxInputSpkSubstr",
+        "OpTxOutputSpkLen",
+        "OpTxOutputSpkSubstr",
+        "OpAuthOutputCount",
+        "OpAuthOutputIdx",
+        "OpInputCovenantId",
+        "OpOutputCovenantId",
+        "OpCovInputCount",
+        "OpCovInputIdx",
+        "OpCovOutputCount",
+        "OpCovOutputIdx",
+        "OpNum2Bin",
+        "OpBin2Num",
+        "OpChainblockSeqCommit",
+    ] {
+        load_inline_program(PathBuf::from("sil-opcode.ag"), format!("const int VALUE = {name}(0);"))
+            .unwrap_or_else(|error| panic!("{name} should resolve: {error}"));
+    }
+}
+
+#[test]
+fn primitive_array_casts_resolve_without_accepting_unknown_types() {
+    for name in ["int[]", "int[2]", "int[_]", "temporal[]", "bool[]", "string[]", "pubkey[]", "sig[]", "datasig[]", "byte[]"] {
+        load_inline_program(PathBuf::from("array-cast.ag"), format!("const int VALUE = {name}(0);"))
+            .unwrap_or_else(|error| panic!("{name} should resolve: {error}"));
+    }
+    let error = load_inline_program(PathBuf::from("array-cast.ag"), "const int VALUE = Missing[](0);".to_string())
+        .expect_err("unknown array cast type must not become a builtin");
+    assert!(error.to_string().contains("unknown reference `Missing[]`"), "unexpected error: {error}");
+}
+
+#[test]
 fn source_bindings_respect_lexical_scopes_and_preserve_authored_text() {
     let program = load_inline_program(
         PathBuf::from("scopes.ag"),

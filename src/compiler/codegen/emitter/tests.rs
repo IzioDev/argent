@@ -2751,6 +2751,7 @@ fn empty_input_state_digest_uses_explicit_empty_bytes() {
             actor EmptyActor owns Empty {
                 entry verify(byte[32] expected) emits none {
                     require(digest(state(self)) == expected);
+                    require(blake3(byte[](0x)) == expected);
                 }
             }
             app Test { actor EmptyActor; }
@@ -2759,6 +2760,7 @@ fn empty_input_state_digest_uses_explicit_empty_bytes() {
     let sil = &actors["EmptyActor"];
 
     assert!(sil.contains("require(blake3(byte[](byte[0](0x))) == expected);"), "{sil}");
+    assert!(sil.contains("require(blake3(byte[](0x)) == expected);"), "{sil}");
 }
 
 #[test]
@@ -9856,6 +9858,7 @@ fn sil_signature_builtins_pass_through() {
                     require(checkSigEcdsa(tx_signature, ecdsa_key));
                     require(checkMsgSig(message_signature, digest, schnorr_key));
                     require(checkMsgSigEcdsa(message_signature, digest, ecdsa_key));
+                    require(OpBin2Num(byte[](0x01)) == 1);
                 }
             }
 
@@ -9866,9 +9869,28 @@ fn sil_signature_builtins_pass_through() {
     );
     let sil = actor_sil.get("Auth").expect("Auth Sil exists");
 
-    for call in ["checkSig(", "checkSigEcdsa(", "checkMsgSig(", "checkMsgSigEcdsa("] {
+    for call in ["checkSig(", "checkSigEcdsa(", "checkMsgSig(", "checkMsgSigEcdsa(", "OpBin2Num("] {
         assert!(sil.contains(call), "missing `{call}` in generated Sil:\n{sil}");
     }
+}
+
+#[test]
+fn int_array_cast_compiles() {
+    let (actors, _) = inline_actor_sil_and_artifact(
+        "primitive-array-casts",
+        r#"
+            state Empty {}
+            actor Arrays owns Empty {
+                entry verify(int[2] values) emits none {
+                    int[] copied = int[](values);
+                    require(copied.length == 2);
+                }
+            }
+            app Test { actor Arrays; }
+        "#,
+    );
+    let sil = &actors["Arrays"];
+    assert!(sil.contains("int[] copied = int[](values);"), "{sil}");
 }
 
 #[test]

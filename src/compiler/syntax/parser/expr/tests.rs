@@ -71,6 +71,56 @@ fn qualified_calls_keep_the_authored_path_and_span() {
 }
 
 #[test]
+fn parenthesized_composites_keep_their_complete_source_spans() {
+    for expression in [
+        "(left + right) * factor",
+        "left + (right * factor)",
+        "left + ((right))",
+        "(value).field",
+        "(values)[index].length",
+        "(buffer).slice(1, 2).length",
+        "((value)) as byte[4]",
+        "-((value))",
+        "((value))",
+    ] {
+        let source = format!("const int SAMPLE = {expression};");
+        let sources = SourceSet::discover_inline(PathBuf::from("parenthesized.ag"), source).expect("source discovery");
+        let program = sources.parse_modules().expect("source parser");
+        let parsed = &program.modules[0].const_values[0];
+        let upstream = parse_expression_ast(expression).expect("upstream expression");
+        assert_eq!(parsed.span.as_str(), upstream.span.as_str(), "expression: {expression}");
+    }
+}
+
+#[test]
+fn empty_hex_byte_array_literal_has_zero_elements() {
+    for (literal, dimension) in [
+        ("byte[](0x)", silverscript_lang::ast::ArrayDim::Dynamic),
+        ("byte[0](0x)", silverscript_lang::ast::ArrayDim::Fixed(0)),
+        ("byte[_](0X)", silverscript_lang::ast::ArrayDim::Fixed(0)),
+    ] {
+        let source = format!("const int SAMPLE = blake3({literal});");
+        let sources = SourceSet::discover_inline(PathBuf::from("empty-hex.ag"), source).expect("source discovery");
+        let program = sources.parse_modules().expect("empty hex byte array parses");
+        let ExprKind::Call { args, .. } = &program.modules[0].const_values[0].kind else {
+            panic!("blake3 must be a call");
+        };
+        let ExprKind::Array { type_ref, values, .. } = &args[0].kind else {
+            panic!("{literal} must be a byte array");
+        };
+        assert_eq!(type_ref.array_dims, [dimension]);
+        assert!(values.is_empty(), "{literal}");
+    }
+
+    for (literal, message) in [("byte[1](0x)", "size mismatch"), ("0x", "invalid hex literal")] {
+        let sources = SourceSet::discover_inline(PathBuf::from("invalid-empty-hex.ag"), format!("const int SAMPLE = {literal};"))
+            .expect("source discovery");
+        let error = sources.parse_modules().expect_err("empty hex literal must be invalid here");
+        assert!(error.to_string().contains(message), "{literal}: {error}");
+    }
+}
+
+#[test]
 fn malformed_constant_expression_reports_the_authored_file() {
     let source = "const int SAMPLE = 1 + ;";
     let sources = SourceSet::discover_inline(PathBuf::from("invalid.ag"), source.to_string()).expect("source discovery");

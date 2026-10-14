@@ -154,11 +154,38 @@ impl DeclarationBinder<'_, '_> {
                 | "r0.succinct.blake2b.verify"
                 | "r0.succinct.poseidon2.verify"
                 | "r0.succinct.sha256.verify"
-                // The bundled std::core source uses these two SIL primitives.
+                // SIL opcode builtins supported by the pinned Silverscript compiler.
+                | "OpTxSubnetId"
+                | "OpTxGas"
+                | "OpTxPayloadLen"
+                | "OpTxLockTime"
+                | "OpTxPayloadSubstr"
                 | "OpOutpointIndex"
                 | "OpOutpointTxId"
+                | "OpTxInputScriptSigLen"
+                | "OpTxInputScriptSigSubstr"
+                | "OpTxInputSeq"
+                | "OpTxInputDaaScore"
+                | "OpTxInputIsCoinbase"
+                | "OpTxInputSpkLen"
+                | "OpTxInputSpkSubstr"
+                | "OpTxOutputSpkLen"
+                | "OpTxOutputSpkSubstr"
+                | "OpAuthOutputCount"
+                | "OpAuthOutputIdx"
+                | "OpInputCovenantId"
+                | "OpOutputCovenantId"
+                | "OpCovInputCount"
+                | "OpCovInputIdx"
+                | "OpCovOutputCount"
+                | "OpCovOutputIdx"
+                | "OpNum2Bin"
+                | "OpBin2Num"
+                | "OpChainblockSeqCommit"
         ) || name.starts_with("__as_cast_")
-            || (name.starts_with("byte[") && name.ends_with(']'));
+            || (name.contains('[')
+                && sil::parse_type_ref(name)
+                    .is_ok_and(|ty| ty.is_array() && !matches!(ty.base, sil::TypeBase::Custom(_) | sil::TypeBase::Tuple(_))));
         if builtin {
             self.bindings.sites.insert(id, Binding::Builtin);
             return Ok(());
