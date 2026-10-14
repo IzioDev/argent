@@ -31,10 +31,6 @@ flowchart TD
     MODEL --> ART
 ```
 
-Sil does not currently have comment nodes. Argent retains generated comment
-text and AST anchors in `AnnotatedContractAst`; the formatter and compiler use
-the contract tree directly, so emitted `.sil` contains no comments.
-
 ## State layout and lowering
 
 Argent separates user-authored state from the state that a generated contract
@@ -104,12 +100,12 @@ storage      ────route lowering────>  physical state
 
 Each relation is an identity or a transformation.
 
-| Case | Source to storage | Storage to physical |
-| --- | --- | --- |
-| Ordinary state, no route fields | Identity | Identity |
-| Expanded state, no route fields | Transformation | Identity |
-| Ordinary state with route fields | Identity | Augmented |
-| Expanded state with route fields | Transformation | Augmented |
+| Case                             | Source to storage | Storage to physical |
+| -------------------------------- | ----------------- | ------------------- |
+| Ordinary state, no route fields  | Identity          | Identity            |
+| Expanded state, no route fields  | Transformation    | Identity            |
+| Ordinary state with route fields | Identity          | Augmented           |
+| Expanded state with route fields | Transformation    | Augmented           |
 
 An identity between storage and physical state does not make physical `State`
 an authored value. An expanded state without route fields is the main example.
@@ -286,11 +282,11 @@ validation builtin.
 
 Physical materialization and template authentication are independent.
 
-| Available template proof | Output builtin |
-| --- | --- |
-| Current template | `validateOutputState` |
+| Available template proof  | Output builtin                         |
+| ------------------------- | -------------------------------------- |
+| Current template          | `validateOutputState`                  |
 | Authenticated bound input | `validateOutputStateWithInputTemplate` |
-| Explicit template witness | `validateOutputStateWithTemplate` |
+| Explicit template witness | `validateOutputStateWithTemplate`      |
 
 Each builtin receives a complete physical state value. The target layout plan
 selects its physical type. The proof plan selects the builtin and its template
