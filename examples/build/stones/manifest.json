@@ -1,6 +1,288 @@
 {
+  "actors": [
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "League"
+                ],
+                "auth_index": 0,
+                "name": "league"
+              },
+              {
+                "actors": [
+                  "Player"
+                ],
+                "auth_index": 1,
+                "name": "player"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "register_player",
+          "routes": [
+            {
+              "output": "league",
+              "successor": {
+                "kind": "exact_self"
+              }
+            },
+            {
+              "output": "player",
+              "successor": {
+                "actor": "Player",
+                "kind": "constructed",
+                "state": "next_player"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "League",
+      "sil": "sil/League.sil",
+      "state": "LeagueState"
+    },
+    {
+      "entries": [
+        {
+          "consumes": [
+            {
+              "actor": "Player",
+              "name": "opponent"
+            }
+          ],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Player"
+                ],
+                "auth_index": 0,
+                "name": "self_out"
+              },
+              {
+                "actors": [
+                  "Player"
+                ],
+                "auth_index": 1,
+                "name": "opponent_out"
+              },
+              {
+                "actors": [
+                  "StonesGame"
+                ],
+                "auth_index": 2,
+                "name": "game"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "start_game",
+          "routes": [
+            {
+              "output": "self_out",
+              "successor": {
+                "actor": "Player",
+                "kind": "constructed",
+                "state": "next_self"
+              }
+            },
+            {
+              "output": "opponent_out",
+              "successor": {
+                "actor": "Player",
+                "kind": "constructed",
+                "state": "next_opponent"
+              }
+            },
+            {
+              "output": "game",
+              "successor": {
+                "actor": "StonesGame",
+                "kind": "constructed",
+                "state": "next_game"
+              }
+            }
+          ]
+        },
+        {
+          "consumes": [
+            {
+              "actor": "Player",
+              "name": "starter"
+            }
+          ],
+          "emits": {
+            "kind": "none"
+          },
+          "kind": "delegate",
+          "name": "accept_start",
+          "routes": []
+        },
+        {
+          "consumes": [
+            {
+              "actor": "StonesSettle",
+              "name": "settle"
+            }
+          ],
+          "emits": {
+            "kind": "none"
+          },
+          "kind": "delegate",
+          "name": "settle",
+          "routes": []
+        },
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "none"
+          },
+          "kind": "leader",
+          "name": "retire",
+          "routes": []
+        }
+      ],
+      "name": "Player",
+      "sil": "sil/Player.sil",
+      "state": "PlayerState"
+    },
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "StonesGame",
+                  "StonesSettle"
+                ],
+                "auth_index": 0,
+                "name": "next"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "take",
+          "routes": [
+            {
+              "output": "next",
+              "successor": {
+                "actor": "StonesSettle",
+                "kind": "constructed",
+                "state": "ticket"
+              }
+            },
+            {
+              "output": "next",
+              "successor": {
+                "actor": "StonesGame",
+                "kind": "constructed",
+                "state": "next_game"
+              }
+            }
+          ]
+        },
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "StonesSettle"
+                ],
+                "auth_index": 0,
+                "name": "settle"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "concede",
+          "routes": [
+            {
+              "output": "settle",
+              "successor": {
+                "actor": "StonesSettle",
+                "kind": "constructed",
+                "state": "ticket"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "StonesGame",
+      "sil": "sil/StonesGame.sil",
+      "state": "GameState"
+    },
+    {
+      "entries": [
+        {
+          "consumes": [
+            {
+              "actor": "Player",
+              "name": "player_a_in"
+            },
+            {
+              "actor": "Player",
+              "name": "player_b_in"
+            }
+          ],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Player"
+                ],
+                "auth_index": 0,
+                "name": "player_a_out"
+              },
+              {
+                "actors": [
+                  "Player"
+                ],
+                "auth_index": 1,
+                "name": "player_b_out"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "settle",
+          "routes": [
+            {
+              "output": "player_a_out",
+              "successor": {
+                "actor": "Player",
+                "kind": "constructed",
+                "state": "next_player_a"
+              }
+            },
+            {
+              "output": "player_b_out",
+              "successor": {
+                "actor": "Player",
+                "kind": "constructed",
+                "state": "next_player_b"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "StonesSettle",
+      "sil": "sil/StonesSettle.sil",
+      "state": "SettleState"
+    }
+  ],
   "app": "Stones",
-  "root": "examples/stones/app.ag",
   "modules": [
     "examples/stones/app.ag",
     "examples/stones/types.ag",
@@ -10,96 +292,27 @@
     "examples/stones/game.ag",
     "examples/stones/settle.ag"
   ],
+  "root": "examples/stones/app.ag",
   "templates": [
-    { "actor": "League", "symbol": "gen__league_template", "hash": null },
-    { "actor": "Player", "symbol": "gen__player_template", "hash": null },
-    { "actor": "StonesGame", "symbol": "gen__stones_game_template", "hash": null },
-    { "actor": "StonesSettle", "symbol": "gen__stones_settle_template", "hash": null }
-  ],
-  "actors": [
     {
-      "name": "League",
-      "state": "LeagueState",
-      "sil": "sil/League.sil",
-      "entries": [
-        {
-          "name": "register_player",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "league", "auth_index": 0, "actors": ["League"] }, { "name": "player", "auth_index": 1, "actors": ["Player"] }] },
-          "consumes": [],
-          "routes": [{ "output": "league", "successor": { "kind": "exact_self" } }, { "output": "player", "successor": { "kind": "constructed", "actor": "Player", "state": "next_player" } }]
-        }
-      ]
+      "actor": "League",
+      "hash": null,
+      "symbol": "gen__league_template"
     },
     {
-      "name": "Player",
-      "state": "PlayerState",
-      "sil": "sil/Player.sil",
-      "entries": [
-        {
-          "name": "start_game",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "self_out", "auth_index": 0, "actors": ["Player"] }, { "name": "opponent_out", "auth_index": 1, "actors": ["Player"] }, { "name": "game", "auth_index": 2, "actors": ["StonesGame"] }] },
-          "consumes": [{ "name": "opponent", "actor": "Player" }],
-          "routes": [{ "output": "self_out", "successor": { "kind": "constructed", "actor": "Player", "state": "next_self" } }, { "output": "opponent_out", "successor": { "kind": "constructed", "actor": "Player", "state": "next_opponent" } }, { "output": "game", "successor": { "kind": "constructed", "actor": "StonesGame", "state": "next_game" } }]
-        },
-        {
-          "name": "accept_start",
-          "kind": "delegate",
-          "emits": { "kind": "none" },
-          "consumes": [{ "name": "starter", "actor": "Player" }],
-          "routes": []
-        },
-        {
-          "name": "settle",
-          "kind": "delegate",
-          "emits": { "kind": "none" },
-          "consumes": [{ "name": "settle", "actor": "StonesSettle" }],
-          "routes": []
-        },
-        {
-          "name": "retire",
-          "kind": "leader",
-          "emits": { "kind": "none" },
-          "consumes": [],
-          "routes": []
-        }
-      ]
+      "actor": "Player",
+      "hash": null,
+      "symbol": "gen__player_template"
     },
     {
-      "name": "StonesGame",
-      "state": "GameState",
-      "sil": "sil/StonesGame.sil",
-      "entries": [
-        {
-          "name": "take",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["StonesGame", "StonesSettle"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "StonesSettle", "state": "ticket" } }, { "output": "next", "successor": { "kind": "constructed", "actor": "StonesGame", "state": "next_game" } }]
-        },
-        {
-          "name": "concede",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "settle", "auth_index": 0, "actors": ["StonesSettle"] }] },
-          "consumes": [],
-          "routes": [{ "output": "settle", "successor": { "kind": "constructed", "actor": "StonesSettle", "state": "ticket" } }]
-        }
-      ]
+      "actor": "StonesGame",
+      "hash": null,
+      "symbol": "gen__stones_game_template"
     },
     {
-      "name": "StonesSettle",
-      "state": "SettleState",
-      "sil": "sil/StonesSettle.sil",
-      "entries": [
-        {
-          "name": "settle",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "player_a_out", "auth_index": 0, "actors": ["Player"] }, { "name": "player_b_out", "auth_index": 1, "actors": ["Player"] }] },
-          "consumes": [{ "name": "player_a_in", "actor": "Player" }, { "name": "player_b_in", "actor": "Player" }],
-          "routes": [{ "output": "player_a_out", "successor": { "kind": "constructed", "actor": "Player", "state": "next_player_a" } }, { "output": "player_b_out", "successor": { "kind": "constructed", "actor": "Player", "state": "next_player_b" } }]
-        }
-      ]
+      "actor": "StonesSettle",
+      "hash": null,
+      "symbol": "gen__stones_settle_template"
     }
   ]
 }

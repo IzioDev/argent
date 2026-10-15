@@ -1,107 +1,287 @@
 {
+  "actors": [
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Player"
+                ],
+                "auth_index": 0,
+                "name": "next"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "register",
+          "routes": [
+            {
+              "output": "next",
+              "successor": {
+                "actor": "Player",
+                "kind": "constructed",
+                "state": "next_player"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "League",
+      "sil": "sil/League.sil",
+      "state": "LeagueState"
+    },
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Mux"
+                ],
+                "auth_index": 0,
+                "name": "next"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "enter_mux",
+          "routes": [
+            {
+              "output": "next",
+              "successor": {
+                "actor": "Mux",
+                "kind": "constructed",
+                "state": "next_board"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "Player",
+      "sil": "sil/Player.sil",
+      "state": "PlayerState"
+    },
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "MoveActor"
+                ],
+                "auth_index": 0,
+                "name": "next"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "choose",
+          "routes": [
+            {
+              "output": "next",
+              "successor": {
+                "actor": "target",
+                "kind": "constructed",
+                "state": "next_board"
+              }
+            }
+          ]
+        },
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "MoveActor"
+                ],
+                "auth_index": 0,
+                "name": "next"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "choose_knight_const",
+          "routes": [
+            {
+              "output": "next",
+              "successor": {
+                "actor": "target",
+                "kind": "constructed",
+                "state": "next_board"
+              }
+            }
+          ]
+        },
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Pawn"
+                ],
+                "auth_index": 0,
+                "name": "next"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "choose_pawn",
+          "routes": [
+            {
+              "output": "next",
+              "successor": {
+                "actor": "Pawn",
+                "kind": "constructed",
+                "state": "next_board"
+              }
+            }
+          ]
+        },
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Knight"
+                ],
+                "auth_index": 0,
+                "name": "next"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "choose_knight",
+          "routes": [
+            {
+              "output": "next",
+              "successor": {
+                "actor": "Knight",
+                "kind": "constructed",
+                "state": "next_board"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "Mux",
+      "sil": "sil/Mux.sil",
+      "state": "BoardState"
+    },
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Mux"
+                ],
+                "auth_index": 0,
+                "name": "next"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "back_to_mux",
+          "routes": [
+            {
+              "output": "next",
+              "successor": {
+                "actor": "Mux",
+                "kind": "constructed",
+                "state": "next_board"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "Pawn",
+      "sil": "sil/Pawn.sil",
+      "state": "BoardState"
+    },
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Mux"
+                ],
+                "auth_index": 0,
+                "name": "next"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "back_to_mux",
+          "routes": [
+            {
+              "output": "next",
+              "successor": {
+                "actor": "Mux",
+                "kind": "constructed",
+                "state": "next_board"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "Knight",
+      "sil": "sil/Knight.sil",
+      "state": "BoardState"
+    }
+  ],
   "app": "ToyChess",
-  "root": "examples/toy_chess/app.ag",
   "modules": [
     "examples/toy_chess/app.ag"
   ],
+  "root": "examples/toy_chess/app.ag",
   "templates": [
-    { "actor": "League", "symbol": "gen__league_template", "hash": null },
-    { "actor": "Player", "symbol": "gen__player_template", "hash": null },
-    { "actor": "Mux", "symbol": "gen__mux_template", "hash": null },
-    { "actor": "Pawn", "symbol": "gen__pawn_template", "hash": null },
-    { "actor": "Knight", "symbol": "gen__knight_template", "hash": null }
-  ],
-  "actors": [
     {
-      "name": "League",
-      "state": "LeagueState",
-      "sil": "sil/League.sil",
-      "entries": [
-        {
-          "name": "register",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Player"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Player", "state": "next_player" } }]
-        }
-      ]
+      "actor": "League",
+      "hash": null,
+      "symbol": "gen__league_template"
     },
     {
-      "name": "Player",
-      "state": "PlayerState",
-      "sil": "sil/Player.sil",
-      "entries": [
-        {
-          "name": "enter_mux",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Mux"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Mux", "state": "next_board" } }]
-        }
-      ]
+      "actor": "Player",
+      "hash": null,
+      "symbol": "gen__player_template"
     },
     {
-      "name": "Mux",
-      "state": "BoardState",
-      "sil": "sil/Mux.sil",
-      "entries": [
-        {
-          "name": "choose",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["MoveActor"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "target", "state": "next_board" } }]
-        },
-        {
-          "name": "choose_knight_const",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["MoveActor"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "target", "state": "next_board" } }]
-        },
-        {
-          "name": "choose_pawn",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Pawn"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Pawn", "state": "next_board" } }]
-        },
-        {
-          "name": "choose_knight",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Knight"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Knight", "state": "next_board" } }]
-        }
-      ]
+      "actor": "Mux",
+      "hash": null,
+      "symbol": "gen__mux_template"
     },
     {
-      "name": "Pawn",
-      "state": "BoardState",
-      "sil": "sil/Pawn.sil",
-      "entries": [
-        {
-          "name": "back_to_mux",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Mux"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Mux", "state": "next_board" } }]
-        }
-      ]
+      "actor": "Pawn",
+      "hash": null,
+      "symbol": "gen__pawn_template"
     },
     {
-      "name": "Knight",
-      "state": "BoardState",
-      "sil": "sil/Knight.sil",
-      "entries": [
-        {
-          "name": "back_to_mux",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Mux"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Mux", "state": "next_board" } }]
-        }
-      ]
+      "actor": "Knight",
+      "hash": null,
+      "symbol": "gen__knight_template"
     }
   ]
 }

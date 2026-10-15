@@ -1,27 +1,51 @@
 {
+  "actors": [
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Minter"
+                ],
+                "auth_index": 0,
+                "name": "controller"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "mint",
+          "routes": [
+            {
+              "output": "controller",
+              "successor": {
+                "actor": "Minter",
+                "kind": "constructed",
+                "state": "next_controller"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "Minter",
+      "sil": "sil/Minter.sil",
+      "state": "MinterState"
+    }
+  ],
   "app": "KCC20MintController",
-  "root": "examples/icc/minter.ag",
   "modules": [
     "examples/icc/minter.ag",
     "examples/icc/kcc20_asset.ag"
   ],
+  "root": "examples/icc/minter.ag",
   "templates": [
-    { "actor": "Minter", "symbol": "gen__minter_template", "hash": null }
-  ],
-  "actors": [
     {
-      "name": "Minter",
-      "state": "MinterState",
-      "sil": "sil/Minter.sil",
-      "entries": [
-        {
-          "name": "mint",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "controller", "auth_index": 0, "actors": ["Minter"] }] },
-          "consumes": [],
-          "routes": [{ "output": "controller", "successor": { "kind": "constructed", "actor": "Minter", "state": "next_controller" } }]
-        }
-      ]
+      "actor": "Minter",
+      "hash": null,
+      "symbol": "gen__minter_template"
     }
   ]
 }

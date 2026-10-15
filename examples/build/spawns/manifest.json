@@ -1,41 +1,87 @@
 {
+  "actors": [
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Controller"
+                ],
+                "auth_index": 0,
+                "name": "next"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "launch",
+          "routes": [
+            {
+              "output": "next",
+              "successor": {
+                "actor": "Controller",
+                "kind": "constructed",
+                "state": "next_state"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "Controller",
+      "sil": "sil/Controller.sil",
+      "state": "ControllerState"
+    },
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Pair"
+                ],
+                "auth_index": 0,
+                "name": "next"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "keep",
+          "routes": [
+            {
+              "output": "next",
+              "successor": {
+                "kind": "exact_self"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "Pair",
+      "sil": "sil/Pair.sil",
+      "state": "PairState"
+    }
+  ],
   "app": "Spawns",
-  "root": "examples/spawns.ag",
   "modules": [
     "examples/spawns.ag"
   ],
+  "root": "examples/spawns.ag",
   "templates": [
-    { "actor": "Controller", "symbol": "gen__controller_template", "hash": null },
-    { "actor": "Pair", "symbol": "gen__pair_template", "hash": null }
-  ],
-  "actors": [
     {
-      "name": "Controller",
-      "state": "ControllerState",
-      "sil": "sil/Controller.sil",
-      "entries": [
-        {
-          "name": "launch",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Controller"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Controller", "state": "next_state" } }]
-        }
-      ]
+      "actor": "Controller",
+      "hash": null,
+      "symbol": "gen__controller_template"
     },
     {
-      "name": "Pair",
-      "state": "PairState",
-      "sil": "sil/Pair.sil",
-      "entries": [
-        {
-          "name": "keep",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Pair"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "exact_self" } }]
-        }
-      ]
+      "actor": "Pair",
+      "hash": null,
+      "symbol": "gen__pair_template"
     }
   ]
 }

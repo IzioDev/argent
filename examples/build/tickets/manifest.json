@@ -1,41 +1,104 @@
 {
+  "actors": [
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Issuer"
+                ],
+                "auth_index": 0,
+                "name": "issuer"
+              },
+              {
+                "actors": [
+                  "Ticket"
+                ],
+                "auth_index": 1,
+                "name": "ticket"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "issue",
+          "routes": [
+            {
+              "output": "issuer",
+              "successor": {
+                "actor": "Issuer",
+                "kind": "constructed",
+                "state": "next_issuer"
+              }
+            },
+            {
+              "output": "ticket",
+              "successor": {
+                "actor": "Ticket",
+                "kind": "constructed",
+                "state": "new_ticket"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "Issuer",
+      "sil": "sil/Issuer.sil",
+      "state": "IssuerState"
+    },
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Ticket"
+                ],
+                "auth_index": 0,
+                "name": "next"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "redeem",
+          "routes": [
+            {
+              "output": "next",
+              "successor": {
+                "actor": "Ticket",
+                "kind": "constructed",
+                "state": "redeemed_ticket"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "Ticket",
+      "sil": "sil/Ticket.sil",
+      "state": "TicketState"
+    }
+  ],
   "app": "Tickets",
-  "root": "examples/tickets.ag",
   "modules": [
     "examples/tickets.ag"
   ],
+  "root": "examples/tickets.ag",
   "templates": [
-    { "actor": "Issuer", "symbol": "gen__issuer_template", "hash": null },
-    { "actor": "Ticket", "symbol": "gen__ticket_template", "hash": null }
-  ],
-  "actors": [
     {
-      "name": "Issuer",
-      "state": "IssuerState",
-      "sil": "sil/Issuer.sil",
-      "entries": [
-        {
-          "name": "issue",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "issuer", "auth_index": 0, "actors": ["Issuer"] }, { "name": "ticket", "auth_index": 1, "actors": ["Ticket"] }] },
-          "consumes": [],
-          "routes": [{ "output": "issuer", "successor": { "kind": "constructed", "actor": "Issuer", "state": "next_issuer" } }, { "output": "ticket", "successor": { "kind": "constructed", "actor": "Ticket", "state": "new_ticket" } }]
-        }
-      ]
+      "actor": "Issuer",
+      "hash": null,
+      "symbol": "gen__issuer_template"
     },
     {
-      "name": "Ticket",
-      "state": "TicketState",
-      "sil": "sil/Ticket.sil",
-      "entries": [
-        {
-          "name": "redeem",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "next", "auth_index": 0, "actors": ["Ticket"] }] },
-          "consumes": [],
-          "routes": [{ "output": "next", "successor": { "kind": "constructed", "actor": "Ticket", "state": "redeemed_ticket" } }]
-        }
-      ]
+      "actor": "Ticket",
+      "hash": null,
+      "symbol": "gen__ticket_template"
     }
   ]
 }

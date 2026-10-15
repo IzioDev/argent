@@ -1,42 +1,90 @@
 {
+  "actors": [
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Agent"
+                ],
+                "auth_index": 0,
+                "name": "agent"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "step",
+          "routes": [
+            {
+              "output": "agent",
+              "successor": {
+                "actor": "Agent",
+                "kind": "constructed",
+                "state": "next_agent"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "Agent",
+      "sil": "sil/Agent.sil",
+      "state": "AgentCapsule"
+    },
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Forager"
+                ],
+                "auth_index": 0,
+                "name": "agent"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "step",
+          "routes": [
+            {
+              "output": "agent",
+              "successor": {
+                "actor": "Forager",
+                "kind": "constructed",
+                "state": "next_agent"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "Forager",
+      "sil": "sil/Forager.sil",
+      "state": "ForagerState"
+    }
+  ],
   "app": "OpenAgent",
-  "root": "examples/open_icc/agent.ag",
   "modules": [
     "examples/open_icc/agent.ag",
     "examples/open_icc/core.ag"
   ],
+  "root": "examples/open_icc/agent.ag",
   "templates": [
-    { "actor": "Agent", "symbol": "gen__agent_template", "hash": null },
-    { "actor": "Forager", "symbol": "gen__forager_template", "hash": null }
-  ],
-  "actors": [
     {
-      "name": "Agent",
-      "state": "AgentCapsule",
-      "sil": "sil/Agent.sil",
-      "entries": [
-        {
-          "name": "step",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "agent", "auth_index": 0, "actors": ["Agent"] }] },
-          "consumes": [],
-          "routes": [{ "output": "agent", "successor": { "kind": "constructed", "actor": "Agent", "state": "next_agent" } }]
-        }
-      ]
+      "actor": "Agent",
+      "hash": null,
+      "symbol": "gen__agent_template"
     },
     {
-      "name": "Forager",
-      "state": "ForagerState",
-      "sil": "sil/Forager.sil",
-      "entries": [
-        {
-          "name": "step",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "agent", "auth_index": 0, "actors": ["Forager"] }] },
-          "consumes": [],
-          "routes": [{ "output": "agent", "successor": { "kind": "constructed", "actor": "Forager", "state": "next_agent" } }]
-        }
-      ]
+      "actor": "Forager",
+      "hash": null,
+      "symbol": "gen__forager_template"
     }
   ]
 }

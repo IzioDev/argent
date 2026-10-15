@@ -1,33 +1,97 @@
 {
+  "actors": [
+    {
+      "entries": [
+        {
+          "consumes": [],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Cell"
+                ],
+                "auth_index": 0,
+                "name": "cell"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "advance",
+          "routes": [
+            {
+              "output": "cell",
+              "successor": {
+                "actor": "Cell",
+                "kind": "constructed",
+                "state": "next_cell"
+              }
+            }
+          ]
+        },
+        {
+          "consumes": [
+            {
+              "actor": "Cell",
+              "name": "target_input"
+            }
+          ],
+          "emits": {
+            "kind": "outputs",
+            "outputs": [
+              {
+                "actors": [
+                  "Cell"
+                ],
+                "auth_index": 0,
+                "name": "source_cell"
+              },
+              {
+                "actors": [
+                  "Cell"
+                ],
+                "auth_index": 1,
+                "name": "target_cell"
+              }
+            ]
+          },
+          "kind": "leader",
+          "name": "move",
+          "routes": [
+            {
+              "output": "source_cell",
+              "successor": {
+                "actor": "Cell",
+                "kind": "constructed",
+                "state": "next_source"
+              }
+            },
+            {
+              "output": "target_cell",
+              "successor": {
+                "actor": "Cell",
+                "kind": "constructed",
+                "state": "next_target"
+              }
+            }
+          ]
+        }
+      ],
+      "name": "Cell",
+      "sil": "sil/Cell.sil",
+      "state": "CellState"
+    }
+  ],
   "app": "OpenCore",
-  "root": "examples/open_icc/core.ag",
   "modules": [
     "examples/open_icc/core.ag"
   ],
+  "root": "examples/open_icc/core.ag",
   "templates": [
-    { "actor": "Cell", "symbol": "gen__cell_template", "hash": null }
-  ],
-  "actors": [
     {
-      "name": "Cell",
-      "state": "CellState",
-      "sil": "sil/Cell.sil",
-      "entries": [
-        {
-          "name": "advance",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "cell", "auth_index": 0, "actors": ["Cell"] }] },
-          "consumes": [],
-          "routes": [{ "output": "cell", "successor": { "kind": "constructed", "actor": "Cell", "state": "next_cell" } }]
-        },
-        {
-          "name": "move",
-          "kind": "leader",
-          "emits": { "kind": "outputs", "outputs": [{ "name": "source_cell", "auth_index": 0, "actors": ["Cell"] }, { "name": "target_cell", "auth_index": 1, "actors": ["Cell"] }] },
-          "consumes": [{ "name": "target_input", "actor": "Cell" }],
-          "routes": [{ "output": "source_cell", "successor": { "kind": "constructed", "actor": "Cell", "state": "next_source" } }, { "output": "target_cell", "successor": { "kind": "constructed", "actor": "Cell", "state": "next_target" } }]
-        }
-      ]
+      "actor": "Cell",
+      "hash": null,
+      "symbol": "gen__cell_template"
     }
   ]
 }
