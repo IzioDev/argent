@@ -183,32 +183,53 @@ impl<'m, 'src> SilNames<'m, 'src> {
         } else {
             BTreeMap::new()
         };
+
         let mut occupied = model.types.display_names.values().cloned().collect::<BTreeSet<_>>();
         occupied.extend(["State", "this", "tx"].into_iter().map(str::to_string));
         occupied.extend(generated_fields.values().cloned());
+        let mut source_names = BTreeMap::new();
+
         if let Some(actor) = model.actor_models.get(&owner) {
             occupied.extend(actor.functions().map(|function| function.name.clone()));
             if let Ok(source) = model.source_state_id_by_decl(actor.state)
                 && let Ok(state) = model.storage_state_by_source(&source)
             {
                 occupied.extend(state.fields.iter().map(|field| field.name.clone()));
+                source_names.extend(state.fields.iter().map(|field| (&field.name, field.name.clone())));
             }
         }
+
+        let authored = bindings
+            .local_names
+            .iter()
+            .filter(|(id, _)| id.callable == root)
+            .map(|(_, source)| if global { format!("gen__glob_{source}") } else { source.clone() })
+            .collect::<BTreeSet<_>>();
+
         let mut local_names = BTreeMap::new();
         for (id, source) in &bindings.local_names {
             if id.callable != root {
                 continue;
             }
+
+            // Preserve one spelling for every authored name so Silverscript
+            // detects source shadowing, including after hygiene renames.
+            if let Some(name) = source_names.get(source) {
+                local_names.insert(*id, String::clone(name));
+                continue;
+            }
+
             let base = if global { format!("gen__glob_{source}") } else { source.clone() };
             let mut name = base.clone();
             if !matches!(root, RootSlot::Entry(_)) {
                 let mut suffix = id.index;
-                while occupied.contains(&name) {
+                while occupied.contains(&name) || name != base && authored.contains(&name) {
                     name = format!("{base}__{suffix}");
                     suffix += 1;
                 }
             }
             occupied.insert(name.clone());
+            source_names.insert(source, name.clone());
             local_names.insert(*id, name);
         }
         let parameter_ids =

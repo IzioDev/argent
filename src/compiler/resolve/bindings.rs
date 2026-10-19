@@ -1,7 +1,7 @@
 //! Source reference bindings, including lexical scopes in the retained AST.
 
 use super::*;
-use crate::compiler::syntax::node::{ChildEdge, NodeId, RootSlot, SourceNodeCursor};
+use crate::compiler::syntax::node::{ChildEdge, NodeId, ReferenceRole, RootSlot, SourceNodeCursor};
 use crate::compiler::syntax::source::Origin;
 use silverscript_lang::ast::{self as sil, ExprKind, Statement};
 
@@ -143,7 +143,6 @@ impl DeclarationBinder<'_, '_> {
                 | "cov_id"
                 | "unrestricted"
                 | "State"
-                | "invocation_uid"
                 | "readInputState"
                 | "ScriptPubKeyP2PK"
                 | "ScriptPubKeyP2SH"
@@ -186,11 +185,13 @@ impl DeclarationBinder<'_, '_> {
             || (name.contains('[')
                 && sil::parse_type_ref(name)
                     .is_ok_and(|ty| ty.is_array() && !matches!(ty.base, sil::TypeBase::Custom(_) | sil::TypeBase::Tuple(_))));
-        if builtin {
+        if builtin && matches!(self.program.nodes().node(id).reference_role, Some(ReferenceRole::Call | ReferenceRole::Type)) {
             self.bindings.sites.insert(id, Binding::Builtin);
             return Ok(());
         }
-        if matches!(name, "self" | "this" | "tx" | "r0") {
+        // `self` is an actor binding. Other runtime roots are only valid in
+        // syntax the parser represents as introspection or builtin calls.
+        if name == "self" && self.owner.kind() == SymbolKind::Actor {
             self.bindings.sites.insert(id, Binding::RuntimeRoot);
             return Ok(());
         }

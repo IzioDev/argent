@@ -122,6 +122,25 @@ fn unknown_initializer_name_is_rejected_before_it_becomes_a_local() {
 }
 
 #[test]
+fn global_helpers_reject_bare_builtin_and_runtime_names() {
+    for name in ["co_spent", "tx", "this", "r0", "self", "length", "sha256", "OpTxGas"] {
+        let source = format!(
+            "state S {{ int {name}; }} fn shared() -> int {{ return {name}; }} \
+             actor A owns S {{ entry check() emits none {{ require(shared() > 0); }} }} app Test {{ actor A; }}"
+        );
+        let error = load_inline_program(PathBuf::from("global-runtime-value.ag"), source)
+            .expect_err("runtime and builtin names cannot capture actor fields");
+        assert!(error.to_string().contains(&format!("unknown reference `{name}`")), "{name}: {error}");
+    }
+    for root in ["self", "this", "tx", "r0"] {
+        let error =
+            load_inline_program(PathBuf::from("global-runtime-field.ag"), format!("fn shared() -> int {{ return {root}.count; }}"))
+                .expect_err("an arbitrary field access does not qualify as a runtime expression");
+        assert!(error.to_string().contains(&format!("unknown reference `{root}`")), "{root}: {error}");
+    }
+}
+
+#[test]
 fn sil_opcode_builtins_resolve() {
     for name in [
         "OpTxSubnetId",

@@ -358,6 +358,65 @@ fn build_inline_loads_explicit_standard_module() {
 }
 
 #[test]
+fn global_helpers_support_declared_invocation_uid_and_runtime_introspection() {
+    let source = r#"
+        import "std::core";
+        fn shared(byte[] domain) -> byte[32] { return invocation_uid(domain); }
+        fn input_count() -> int {
+            return this.activeInputIndex + tx.version + tx.inputs.length + tx.outputs.length
+                + tx.inputs[0].value + tx.outputs[0].value;
+        }
+        state S { int count; }
+        actor A owns S {
+            entry check(byte[] domain) emits none {
+                require(shared(domain).length == 32);
+                require(input_count() >= count);
+            }
+        }
+        app Test { actor A; }
+    "#;
+    compile_inline("global-runtime.ag", source).expect("declared library calls and qualified runtime introspection compile");
+}
+
+#[test]
+fn helper_source_collisions_are_rejected() {
+    for (global, params, body, expected) in [
+        (true, "int value", "int value = 7; return value;", "already defined"),
+        (false, "int value", "int value = 7; return value;", "already defined"),
+        (true, "int value, int value", "return value;", "duplicate parameter name"),
+        (false, "int count", "return count;", "variable 'count' is already defined"),
+        (false, "", "int count = 7; return count;", "variable 'count' is already defined"),
+        (true, "int value", "{ int value = 7; } return value;", "already defined"),
+        (false, "int value", "for (value, 0, 1, 1) {} return value;", "already defined"),
+        (false, "int value", "int value, int other = 0x0001.split(1); return other;", "already defined"),
+        (false, "int INDEX", "int INDEX = 7; return INDEX;", "already defined"),
+    ] {
+        let helper = format!("fn echo({params}) -> int {{ {body} }}");
+        let args = params.split(',').filter(|param| !param.is_empty()).map(|_| "count").collect::<Vec<_>>().join(", ");
+        let source = format!(
+            "const int INDEX = 3; state S {{ int count; }} {} actor A owns S {{ {} \
+             entry check() emits none {{ require(echo({args}) >= 0); }} }} app Test {{ actor A; }}",
+            if global { &helper } else { "" },
+            if global { "" } else { &helper },
+        );
+        let error = compile_inline("helper-collision.ag", source).expect_err("source collisions must reach Silverscript validation");
+        assert!(error.to_string().contains(expected), "{helper}: {error}");
+    }
+
+    let source = r#"
+        state count { int n; }
+        state S { int count; }
+        actor A owns S {
+            fn echo(int count) -> int { return count; }
+            entry check(count other) emits none { require(echo(other.n) >= 0); }
+        }
+        app Test { actor A; }
+    "#;
+    let error = compile_inline("helper-field-collision.ag", source).expect_err("type-name hygiene cannot hide actor field shadowing");
+    assert!(error.to_string().contains("variable 'count' is already defined"), "{error}");
+}
+
+#[test]
 fn helpers_lower_co_spent_from_bound_source_ast() {
     let out_dir = std::env::temp_dir().join(format!("argent-helper-co-spent-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out_dir);
@@ -425,18 +484,18 @@ fn helper_co_spent_accepts_field_and_call_receivers_by_type() {
 }
 
 #[test]
-fn helper_local_names_follow_bound_ids_across_shadowing() {
+fn helper_local_names_preserve_disjoint_scopes() {
     let out_dir = std::env::temp_dir().join(format!("argent-helper-local-ids-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out_dir);
     let source = r#"
         state GuardState { cov_id guard; }
         actor Guard owns GuardState {
-            fn present(bool flag, cov_id guard) -> bool {
+            fn present(bool flag, cov_id id) -> bool {
                 if (flag) {
-                    cov_id copy = guard;
+                    cov_id copy = id;
                     require(copy.co_spent());
                 }
-                cov_id copy = guard;
+                cov_id copy = id;
                 return copy.co_spent() && self.guard.co_spent();
             }
             entry check() emits none { require(present(true, guard)); }
@@ -445,7 +504,8 @@ fn helper_local_names_follow_bound_ids_across_shadowing() {
     "#;
     build_inline("guard.ag", source, &out_dir).expect("distinct bound locals compile");
     let sil = std::fs::read_to_string(out_dir.join("sil/Guard.sil")).expect("generated contract exists");
-    assert!(sil.contains("guard__") && sil.contains("copy__"), "{sil}");
+    assert_eq!(sil.matches("byte[32] copy = id;").count(), 2, "{sil}");
+    assert!(sil.contains("OpCovInputCount(guard) > 0"), "{sil}");
     let _ = std::fs::remove_dir_all(out_dir);
 }
 
@@ -644,7 +704,7 @@ fn build_inline_does_not_load_standard_module_without_import() {
     let source = INVOCATION_UID_APP.replace("import \"std::core\";", "");
 
     let error = build_inline("issuer.ag", source, &out_dir).expect_err("standard function requires an explicit import");
-    assert!(error.to_string().contains("failed to compile"), "unexpected error: {error}");
+    assert!(error.to_string().contains("unknown reference `invocation_uid`"), "unexpected error: {error}");
 
     let _ = std::fs::remove_dir_all(out_dir);
 }
