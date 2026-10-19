@@ -1916,7 +1916,7 @@ pub fn execute_transaction_with_covenants(tx: &mut Transaction, entries: Vec<Utx
 
     let mass_calculator = MassCalculator::new_with_consensus_params(&MAINNET_PARAMS);
     let masses = mass_calculator.calc_non_contextual_masses(tx);
-    let limits = MAINNET_PARAMS.block_mass_limits().after();
+    let limits = MAINNET_PARAMS.block_mass_limits;
     if masses.compute_mass > limits.compute {
         return Err(BuilderError::ComputeMassLimitExceeded { compute_mass: masses.compute_mass, limit: limits.compute });
     }
@@ -1949,8 +1949,12 @@ fn measure_input_script_units_with_covenants(
     Ok(vm.used_script_units())
 }
 
+/// Engine flags for covenant-aware script execution.
+///
+/// Since rusty-kaspa v2.1.0 the engine always runs with covenants (post-Toccata
+/// script-unit metering and limits); the former `covenants_enabled` switch is gone.
 pub fn covenant_engine_flags() -> EngineFlags {
-    EngineFlags { covenants_enabled: true, ..Default::default() }
+    EngineFlags::default()
 }
 
 #[cfg(test)]
@@ -1963,6 +1967,21 @@ mod tests {
     use kaspa_txscript::opcodes::codes::OpFalse;
 
     use super::*;
+
+    /// Pins the values that the pre-v2.1.0 code selected via
+    /// `MAINNET_PARAMS.block_mass_limits().after()` and
+    /// `EngineFlags { covenants_enabled: true, ..Default::default() }`,
+    /// so the rusty-kaspa v2.1.0 migration is behavior-preserving.
+    #[test]
+    fn post_toccata_limits_and_flags_match_pre_v2_1_selection() {
+        let limits = MAINNET_PARAMS.block_mass_limits;
+        assert_eq!(limits.compute, 500_000);
+        assert_eq!(limits.storage, 500_000);
+        assert_eq!(limits.transient, 1_000_000);
+
+        let sigop_units: ScriptUnits = kaspa_consensus_core::mass::Gram(1000).into();
+        assert_eq!(covenant_engine_flags().sigop_script_units, sigop_units);
+    }
 
     #[test]
     fn state_macro_builds_artifact_value_map() {
