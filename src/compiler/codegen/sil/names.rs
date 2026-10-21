@@ -187,7 +187,13 @@ impl<'m, 'src> SilNames<'m, 'src> {
         let mut occupied = model.types.display_names.values().cloned().collect::<BTreeSet<_>>();
         occupied.extend(["State", "this", "tx"].into_iter().map(str::to_string));
         occupied.extend(generated_fields.values().cloned());
+
         let mut source_names = BTreeMap::new();
+        // keep track of constant declared name, which will detects shadowing
+        source_names.extend(model.consts.iter().map(|(id, _)| {
+            let name = &model.types.display_names[id];
+            (name, name.clone())
+        }));
 
         if let Some(actor) = model.actor_models.get(&owner) {
             occupied.extend(actor.functions().map(|function| function.name.clone()));

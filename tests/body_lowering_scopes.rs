@@ -488,7 +488,7 @@ fn lexical_shadowing_is_rejected_by_sil() {
 }
 
 #[test]
-fn actor_helper_loop_and_local_bindings_skip_occupied_constant_names() {
+fn actor_helper_bindings_cannot_shadow_constants() {
     let source = r#"
         const int INDEX = 3;
         const int INDEX__1 = 4;
@@ -496,28 +496,25 @@ fn actor_helper_loop_and_local_bindings_skip_occupied_constant_names() {
         state S { int count; }
 
         actor A owns S {
-            fn loop_sum() -> int {
-                int result = 0;
-                for (INDEX, 0, 2, 2) {
-                    result = result + INDEX;
-                }
-                return result;
-            }
-
-            fn local_sum() -> int {
-                int result = 0;
-                int INDEX = 1;
-                return result + INDEX;
-            }
+            fn echo(__PARAMS__) -> int { __BODY__ }
 
             entry check() emits none {
-                require(loop_sum() == 1);
-                require(local_sum() == 1);
+                require(echo(__ARGS__) == 1);
             }
         }
         app Test { actor A; }
     "#;
-    compile_app("actor-helper-occupied-local-names", source);
+    for (name, params, args, body) in [
+        ("parameter", "int INDEX", "count", "return INDEX;"),
+        ("local", "", "", "int INDEX = 1; return INDEX;"),
+        ("loop", "", "", "int result = 0; for (INDEX, 0, 2, 2) { result = result + INDEX; } return result;"),
+        ("nested-local", "", "", "{ int INDEX = 1; require(INDEX == 1); } return 1;"),
+        ("destructure", "", "", "S { count: int INDEX } = S { count: 1 }; return INDEX;"),
+        ("tuple", "", "", "byte[] INDEX, byte[] rest = 0x0001.split(1); return INDEX.length + rest.length;"),
+    ] {
+        let source = source.replace("__PARAMS__", params).replace("__ARGS__", args).replace("__BODY__", body);
+        assert_source_rejected(&format!("actor-helper-constant-shadow-{name}"), &source, "variable 'INDEX' is already defined");
+    }
 }
 
 #[test]
