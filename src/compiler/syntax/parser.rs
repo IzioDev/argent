@@ -109,6 +109,8 @@ pub(crate) fn parse_module<'src>(
     .parse_module()
 }
 
+#[cfg(test)]
+mod compatibility_tests;
 mod entry;
 mod expr;
 mod index;
