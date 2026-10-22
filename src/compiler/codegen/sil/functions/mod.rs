@@ -5,9 +5,9 @@
 
 use std::collections::BTreeSet;
 
-use crate::compiler::model::{AppCompilationContext, CallableId, ResolvedTypeBase};
+use crate::compiler::model::{AppCompilationContext, CallableId};
 use crate::compiler::syntax::node::{DeclId, SymbolKind};
-use crate::compiler::syntax::{ActorDecl, FunctionDecl, word};
+use crate::compiler::syntax::{ActorDecl, FunctionDecl};
 use crate::error::ArgentError;
 use crate::error::Result;
 use silverscript_lang::ast::visit::AstVisitorMut;
@@ -80,11 +80,6 @@ impl<'m, 'v, 'src> FunctionAstLowerer<'m, 'v, 'src> {
                     .ok_or_else(|| ArgentError::new(format!("missing resolved parameter {index} for helper `{}`", function.name)))?;
                 let mut type_ref = if let Some(value) = signature.param(index) {
                     self.state_values.sil_type_ref(value)
-                } else if param.ty.name == word::COVENANT_ID
-                    || param.ty.is_actor_type()
-                    || matches!(resolved_param.base, ResolvedTypeBase::ActorEnum(_))
-                {
-                    sil::TypeRef { base: sil::TypeBase::Byte, array_dims: vec![sil::ArrayDim::Fixed(32)] }
                 } else {
                     lower_bound_type(&param.ty, resolved_param)
                 };
@@ -111,11 +106,6 @@ impl<'m, 'v, 'src> FunctionAstLowerer<'m, 'v, 'src> {
                     .ok_or_else(|| ArgentError::new(format!("missing resolved result for helper `{}`", function.name)))?;
                 let mut type_ref = if let Some(value) = signature.result() {
                     self.state_values.sil_type_ref(value)
-                } else if ty.name == word::COVENANT_ID
-                    || ty.is_actor_type()
-                    || matches!(resolved_result.base, ResolvedTypeBase::ActorEnum(_))
-                {
-                    sil::TypeRef { base: sil::TypeBase::Byte, array_dims: vec![sil::ArrayDim::Fixed(32)] }
                 } else {
                     lower_bound_type(ty, resolved_result)
                 };

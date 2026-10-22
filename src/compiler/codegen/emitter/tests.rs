@@ -954,6 +954,58 @@ fn emits_actor_functions_only_in_their_owning_contract() {
 }
 
 #[test]
+fn actor_enum_helpers_preserve_integer_types_and_array_shapes() {
+    for scope in ["global", "actor"] {
+        for (suffix, argument, result) in [
+            ("", "MoveActor::Knight", "select_actor(MoveActor::Knight)"),
+            ("[2]", "MoveActor[2] { MoveActor::Pawn, MoveActor::Knight }", "select_actor(actors)[1]"),
+            ("[]", "MoveActor[] { MoveActor::Pawn, MoveActor::Knight }", "select_actor(actors)[1]"),
+        ] {
+            let helper = format!(
+                r#"
+                    fn select_actor(MoveActor{suffix} target) -> MoveActor{suffix} {{
+                        MoveActor{suffix} selected = target;
+                        MoveActor[2] variants = MoveActor[2] {{ MoveActor::Pawn, MoveActor::Knight }};
+                        require(variants[1] == MoveActor::Knight);
+                        return selected;
+                    }}
+                "#
+            );
+            let (global_helper, actor_helper) = if scope == "global" { (helper.as_str(), "") } else { ("", helper.as_str()) };
+            let setup = if suffix.is_empty() { String::new() } else { format!("MoveActor{suffix} actors = {argument};") };
+            let source = format!(
+                r#"
+                    state BoardState {{ int ply; }}
+                    actor enum MoveActor {{ Pawn; Knight; }}
+                    {global_helper}
+                    actor Pawn owns BoardState {{
+                        {actor_helper}
+                        entry check() emits none {{
+                            {setup}
+                            require({result} == MoveActor::Knight);
+                        }}
+                    }}
+                    actor Knight owns BoardState {{
+                        entry check() emits none {{ require(ply >= 0); }}
+                    }}
+                    app Test {{ actor Pawn; actor Knight; }}
+                "#
+            );
+            let (actor_sil, _) = inline_actor_sil_and_artifact("actor-enum-helpers", &source);
+            let sil = &actor_sil["Pawn"];
+            let prefix = if scope == "global" { "gen__glob_" } else { "" };
+            for expected in [
+                format!("function select_actor(int{suffix} {prefix}target): int{suffix}"),
+                format!("int{suffix} {prefix}selected = {prefix}target;"),
+                format!("int[2] {prefix}variants = int[2]{{0, 1}};"),
+            ] {
+                assert!(sil.contains(&expected), "{scope} helper with `{suffix}` is missing `{expected}`:\n{sil}");
+            }
+        }
+    }
+}
+
+#[test]
 fn global_function_variables_do_not_collide_with_actor_fields() {
     let program = global_function_program(
         r#"
