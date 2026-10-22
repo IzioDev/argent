@@ -2412,6 +2412,79 @@ fn typed_state_constant_can_supply_a_constructed_successor_directly() {
 }
 
 #[test]
+fn qualified_state_constants_preserve_bindings_in_output_routes() {
+    for (case, clauses, body) in [
+        ("current", "emits next: Counter", "unrestricted(next.value); become next <- Counter(values::INITIAL);"),
+        (
+            "observed",
+            "observes remote by remote_id { outputs { next: Counter, } } emits none",
+            "require remote.outputs become { next <- Counter(values::INITIAL), };",
+        ),
+        (
+            "spawned",
+            "spawns children by children_id { outputs { next: Counter, } } emits none",
+            "unrestricted(children.outputs.next.value); require children.outputs become { next <- Counter(values::INITIAL), };",
+        ),
+    ] {
+        for augmented in [false, true] {
+            let dir = tempfile::tempdir().expect("test source directory exists");
+            fs::write(
+                dir.path().join("values.ag"),
+                r#"
+                    state CounterState { int count; int marker; }
+                    const CounterState INITIAL = CounterState { count: 7, marker: 8 };
+                "#,
+            )
+            .expect("imported state constant is written");
+            let export = if augmented {
+                "entry export() emits next: Other { unrestricted(next.value); become next <- Other(OtherState { nonce: count }); }"
+            } else {
+                ""
+            };
+            let source = format!(
+                r#"
+                    import "./values.ag" as values;
+                    const int INITIAL = 99;
+                    state OtherState {{ int nonce; }}
+                    actor Counter owns values::CounterState {{
+                        entry reset(cov_id remote_id) {clauses} {{
+                            require(INITIAL == 99);
+                            {body}
+                        }}
+                        {export}
+                    }}
+                    actor Other owns OtherState {{ entry hold() emits none {{ require(nonce >= 0); }} }}
+                    app Test {{ actor Counter; actor Other; }}
+                "#,
+            );
+            let input = dir.path().join("app.ag");
+            fs::write(&input, source).expect("routing source is written");
+            let out = dir.path().join("build");
+            let artifact = crate::build_file(&input, &out)
+                .unwrap_or_else(|err| panic!("{case} route with augmented={augmented} must compile: {err}"));
+            artifact.check_template_plan_consistency().expect("route template plan verifies");
+            let sil = fs::read_to_string(out.join("sil/Counter.sil")).expect("Counter Sil exists");
+            let contract = silverscript_lang::ast::parse_contract_ast(&sil).expect("generated Sil parses");
+            let constant = contract
+                .constants
+                .iter()
+                .find(|constant| matches!(constant.expr.kind, silverscript_lang::ast::ExprKind::StructLiteral { .. }))
+                .expect("imported state constant exists");
+            assert_ne!(constant.name, "INITIAL", "imported constant must not capture the root int constant:\n{sil}");
+            assert!(!sil.contains("values::INITIAL"), "qualified reference must lower to its bound Sil name:\n{sil}");
+            if augmented {
+                for field in ["count", "marker"] {
+                    assert!(sil.contains(&format!("{field}: {}.{field}", constant.name)), "{sil}");
+                }
+                assert!(sil.contains("gen__other_template: gen__other_template"), "{sil}");
+            } else {
+                assert!(sil.contains(&format!(", {});", constant.name)), "{sil}");
+            }
+        }
+    }
+}
+
+#[test]
 fn body_binding_shadows_typed_state_constant_provenance() {
     let err = emit_inline_error(
         r#"
