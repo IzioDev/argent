@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use silverscript_lang::ast::visit::{AstVisitorMut, NameKind, walk_expr_mut};
-use silverscript_lang::ast::{Expr, ExprKind};
+use silverscript_lang::ast::{ArrayDim, Expr, ExprKind, TypeRef as SilTypeRef};
 use silverscript_lang::span::Span;
 
 use crate::codec::encode_hex;
@@ -84,6 +84,7 @@ pub(in crate::compiler::codegen) struct SilNames<'m, 'src> {
     model: &'m AppCompilationContext<'src>,
     sites: BTreeMap<(usize, usize), Binding>,
     type_sites: BTreeMap<usize, DeclId>,
+    dimension_types: BTreeMap<usize, SilTypeRef>,
     co_spent_sites: BTreeSet<(usize, usize)>,
     digest_operands: BTreeMap<(usize, usize), PlannedStateValue>,
     actor_field_uses: BTreeMap<(usize, usize), SourceFieldId>,
@@ -124,6 +125,16 @@ impl<'m, 'src> SilNames<'m, 'src> {
                 }
             })
             .collect();
+        let mut dimension_types = BTreeMap::new();
+        for ((site, index), constant) in &bindings.dimension_constants {
+            let Origin::Authored { start, .. } = model.resolution.nodes().node(*site).origin else {
+                unreachable!("bound array dimensions belong to authored type sites");
+            };
+            let ty = dimension_types
+                .entry(start)
+                .or_insert_with(|| model.resolution.type_use(*site).expect("bound array dimension has a parsed type").ty.clone());
+            ty.array_dims[*index] = ArrayDim::Constant(model.types.display_names[constant].clone());
+        }
         let co_spent_sites = model
             .types
             .co_spent_sites
@@ -244,6 +255,7 @@ impl<'m, 'src> SilNames<'m, 'src> {
             model,
             sites,
             type_sites,
+            dimension_types,
             co_spent_sites,
             digest_operands,
             actor_field_uses,
@@ -272,6 +284,20 @@ impl<'m, 'src> SilNames<'m, 'src> {
             Some(Binding::Local(id)) => self.local_names.get(id).cloned().unwrap_or_else(|| source.to_string()),
             _ => source.to_string(),
         }
+    }
+
+    pub(super) fn lower_type_dimensions(&self, ty: &mut SilTypeRef, span: Span<'_>) {
+        let Some(bound) = self.dimension_types.get(&span.start()) else { return };
+        for (dimension, lowered) in ty.array_dims.iter_mut().zip(&bound.array_dims) {
+            if matches!(dimension, ArrayDim::Constant(_)) {
+                *dimension = lowered.clone();
+            }
+        }
+    }
+
+    pub(super) fn as_cast_name(&self, span: Span<'_>) -> Option<String> {
+        let ty = self.dimension_types.get(&span.start())?;
+        Some(format!("__as_cast_{}", ty.type_name()))
     }
 
     pub(super) fn type_name(&self, source: &str, span: Span<'_>) -> String {
@@ -328,6 +354,15 @@ impl<'ast> AstVisitorMut<'ast> for SilNames<'_, '_> {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr<'ast>) {
+        match &mut expr.kind {
+            ExprKind::Array { type_ref, type_span, .. } => self.lower_type_dimensions(type_ref, *type_span),
+            ExprKind::Call { name, name_span, .. } if name.starts_with("__as_cast_") => {
+                if let Some(lowered) = self.as_cast_name(*name_span) {
+                    *name = lowered;
+                }
+            }
+            _ => {}
+        }
         if let ExprKind::ArrayIndex { source, index } = &expr.kind
             && matches!(&source.kind, ExprKind::Identifier(_))
             && matches!(

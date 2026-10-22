@@ -968,6 +968,7 @@ impl EntryInputStateAstLowerer<'_, '_, '_, '_> {
     }
 
     fn lower_type(&mut self, type_ref: &mut SilTypeRef, span: SilSpan<'_>) {
+        self.names.lower_type_dimensions(type_ref, span);
         if let SilTypeBase::Custom(name) = &mut type_ref.base {
             let bound = self.names.type_name(name, span);
             if bound == word::COVENANT_ID {

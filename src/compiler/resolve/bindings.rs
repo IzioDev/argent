@@ -43,6 +43,12 @@ impl DeclarationBinder<'_, '_> {
     fn type_use(&mut self, cursor: &SourceNodeCursor) -> Result<()> {
         let id = self.node_id(cursor)?;
         let Some(ty) = self.source.type_uses.get(&id) else { return Ok(()) };
+        for (index, dimension) in ty.ty.array_dims.iter().enumerate() {
+            if let sil::ArrayDim::Constant(name) = dimension {
+                let constant = self.required(name, &[SymbolKind::Const])?;
+                self.bindings.dimension_constants.insert((id, index), constant);
+            }
+        }
         let name = if let Some(state) = &ty.actor_state {
             Some((state.segments.join("::"), vec![SymbolKind::State]))
         } else if let sil::TypeBase::Custom(name) = &ty.ty.base {
@@ -61,6 +67,14 @@ impl DeclarationBinder<'_, '_> {
             self.bindings.sites.insert(id, Binding::Builtin);
         }
         Ok(())
+    }
+
+    fn call_target(&mut self, cursor: &SourceNodeCursor, name: &str, scope: &BTreeMap<String, Binding>) -> Result<()> {
+        if self.source.type_uses.contains_key(&self.node_id(cursor)?) {
+            self.type_use(cursor)
+        } else {
+            self.reference(cursor, name, scope)
+        }
     }
 
     fn reference(&mut self, cursor: &SourceNodeCursor, name: &str, scope: &BTreeMap<String, Binding>) -> Result<()> {
@@ -216,7 +230,7 @@ impl DeclarationBinder<'_, '_> {
                     let target = self.node_id(&cursor.child(ChildEdge::CallTarget))?;
                     self.bindings.sites.insert(target, Binding::Builtin);
                 } else {
-                    self.reference(&cursor.child(ChildEdge::CallTarget), name, scope)?;
+                    self.call_target(&cursor.child(ChildEdge::CallTarget), name, scope)?;
                 }
                 for (index, arg) in args.iter().enumerate() {
                     self.expr(&cursor.child(ChildEdge::Argument(index)), arg, scope)?;
@@ -364,6 +378,8 @@ pub(crate) enum Binding {
 pub(crate) struct DeclarationBindings {
     pub names: BTreeMap<String, ResolvedName>,
     pub sites: BTreeMap<NodeId, Binding>,
+    /// Named array dimensions bind independently of their type's base declaration.
+    pub dimension_constants: BTreeMap<(NodeId, usize), DeclId>,
     pub local_names: BTreeMap<LocalId, String>,
     pub parameter_ids: BTreeMap<(RootSlot, usize), LocalId>,
     pub entry_consumes: BTreeMap<(usize, usize), LocalId>,
@@ -783,7 +799,7 @@ impl DeclarationBinder<'_, '_> {
                 if let Statement::StateFunctionCallAssign { .. } = statement {
                     self.type_use(&cursor.child(ChildEdge::TypeUse))?;
                 }
-                self.reference(&cursor.child(ChildEdge::CallTarget), name, scope)?;
+                self.call_target(&cursor.child(ChildEdge::CallTarget), name, scope)?;
                 for (index, arg) in args.iter().enumerate() {
                     self.expr(&cursor.child(ChildEdge::Argument(index)), arg, scope)?;
                 }

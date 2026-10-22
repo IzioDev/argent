@@ -3214,6 +3214,74 @@ fn constant_sized_state_array_local_remains_planned() {
 }
 
 #[test]
+fn qualified_array_dimensions_lower_in_entries_and_helpers() {
+    let body = r#"
+        int[sizes::LEN] items = int[sizes::LEN]{1, 2};
+        int[other::LEN] more = int[other::LEN]{3, 4, 5};
+        int[sizes::LEN][other::LEN] grid = int[sizes::LEN][other::LEN]{
+            int[sizes::LEN]{1, 2}, int[sizes::LEN]{3, 4}, int[sizes::LEN]{5, 6},
+        };
+        CounterState[sizes::LEN] states = CounterState[sizes::LEN]{
+            CounterState { count: 1 }, CounterState { count: 2 },
+        };
+        byte[sizes::LEN] literal = byte[sizes::LEN](0x1122);
+        byte[sizes::LEN] cast = number as byte[sizes::LEN];
+        byte[sizes::LEN] copied = byte[2](buffer);
+        require(items.length == 2 && more.length == 3 && grid.length == 3);
+        require(states[0].count == 1 && states[1].count == 2);
+        require(literal.length == 2 && cast.length == 2 && copied.length == 2);
+        require(HEADER.length == 2 && LEN == 9);
+    "#;
+    for scope in ["entry", "global", "actor"] {
+        let dir = tempfile::tempdir().expect("test source directory exists");
+        fs::write(dir.path().join("sizes.ag"), "const int LEN = 2;").expect("first dimension constant is written");
+        fs::write(dir.path().join("other.ag"), "const int LEN = 3;").expect("second dimension constant is written");
+        let helper = format!("fn inspect_arrays(byte[] buffer, int number) {{ {body} }}");
+        let entry_body = if scope == "entry" { body } else { "inspect_arrays(buffer, number);" };
+        let source = format!(
+            r#"
+                import "./sizes.ag" as sizes;
+                import "./other.ag" as other;
+                const int LEN = 9;
+                const byte[2] HEADER = byte[sizes::LEN](0x1122);
+                state CounterState {{ int count; }}
+                {global_helper}
+                actor Counter owns CounterState {{
+                    {actor_helper}
+                    entry check(byte[] buffer, int number) emits none {{ {entry_body} }}
+                }}
+                app Test {{ actor Counter; }}
+            "#,
+            global_helper = if scope == "global" { &helper } else { "" },
+            actor_helper = if scope == "actor" { &helper } else { "" },
+        );
+        let input = dir.path().join("app.ag");
+        fs::write(&input, source).expect("array dimension source is written");
+        let out = dir.path().join("build");
+        crate::build_file(&input, &out).unwrap_or_else(|err| panic!("qualified dimensions in {scope} must compile: {err}"));
+        let sil = fs::read_to_string(out.join("sil/Counter.sil")).expect("Counter Sil exists");
+        let contract = silverscript_lang::ast::parse_contract_ast(&sil).expect("generated Sil parses");
+        let dimension = |value| {
+            &contract
+                .constants
+                .iter()
+                .find(|constant| matches!(constant.expr.kind, silverscript_lang::ast::ExprKind::Int(number) if number == value))
+                .expect("dimension constant is retained")
+                .name
+        };
+        let two = dimension(2);
+        let three = dimension(3);
+        assert_ne!(two, "LEN", "imported dimensions must not capture the root constant:\n{sil}");
+        assert_ne!(two, three, "distinct imported dimensions must retain their identities:\n{sil}");
+        assert!(!sil.contains("sizes::") && !sil.contains("other::"), "dimension paths must lower to Sil names:\n{sil}");
+        for ty in [format!("int[{two}]"), format!("int[{three}]"), format!("int[{two}][{three}]"), format!("State[{two}]")] {
+            assert!(sil.contains(&ty), "missing lowered type {ty} in {scope}:\n{sil}");
+        }
+        assert!(sil.contains(&format!(" as byte[{two}]")), "postfix cast dimension must lower in {scope}:\n{sil}");
+    }
+}
+
+#[test]
 fn inferred_state_array_local_uses_initializer_shape() {
     let sil = emit_unresolved_fixed_state_array_local("inferred-state-array-local", "", "_");
 
