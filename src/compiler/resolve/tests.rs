@@ -226,6 +226,31 @@ fn sil_opcode_builtins_resolve() {
 }
 
 #[test]
+fn sil_state_builtins_resolve_as_calls_not_bare_values() {
+    for name in [
+        "readInputStateWithTemplate",
+        "validateOutputState",
+        "validateOutputStateWithTemplate",
+        "validateOutputStateWithInputTemplate",
+    ] {
+        let program = load_inline_program(PathBuf::from("sil-state-builtin.ag"), format!("fn inspect() {{ {name}(0); }}"))
+            .unwrap_or_else(|error| panic!("{name} should resolve: {error}"));
+        let owner = DeclId::new(ModuleId::new(0), SymbolKind::Function, 0);
+        let call = SourceNodeCursor::new(owner, RootSlot::Declaration)
+            .child(ChildEdge::Body)
+            .child(ChildEdge::Statement(0))
+            .child(ChildEdge::CallTarget);
+        let site = program.nodes().find(&call.address).expect("builtin call is indexed");
+        assert_eq!(program.bindings(owner).sites[&site], Binding::Builtin, "{name}");
+
+        let error =
+            load_inline_program(PathBuf::from("sil-state-builtin-value.ag"), format!("fn inspect() {{ int value = {name}; }}"))
+                .expect_err("builtin names are not bare values");
+        assert!(error.to_string().contains(&format!("unknown reference `{name}`")), "{name}: {error}");
+    }
+}
+
+#[test]
 fn primitive_array_casts_resolve_without_accepting_unknown_types() {
     for name in ["int[]", "int[2]", "int[_]", "temporal[]", "bool[]", "string[]", "pubkey[]", "sig[]", "datasig[]", "byte[]"] {
         load_inline_program(PathBuf::from("array-cast.ag"), format!("const int VALUE = {name}(0);"))
