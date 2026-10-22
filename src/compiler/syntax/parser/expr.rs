@@ -180,7 +180,9 @@ impl<'src> Parser<'src> {
         let byte_span = self.sil_span(literal.span.start, literal.span.end);
         let values = normalized
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let digits = std::str::from_utf8(pair).expect("hex token is ASCII");
                 u8::from_str_radix(digits, 16)
