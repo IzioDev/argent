@@ -7,6 +7,73 @@ use crate::compiler::model::AppCompilationContext;
 use super::*;
 
 #[test]
+fn helper_body_bindings_reject_self_before_lowering() {
+    for scope in ["global", "actor"] {
+        for (case, body) in [
+            ("local", "int self = 7;"),
+            ("local constant", "int constant self = 7;"),
+            ("nested local", "if (true) { int self = 7; }"),
+            ("loop", "for (self, 0, 1, 1) { require(self == 0); }"),
+            ("tuple", "(byte[] self, byte[] other) = byte[](0x0102).split(1);"),
+            ("right tuple binding", "(byte[] other, byte[] self) = byte[](0x0102).split(1);"),
+            ("result", "(int self) = identity(7);"),
+            ("destructure", "S { count: int self } = S { count: 7 };"),
+            ("anonymous destructure", "{ count: int self } = S { count: 7 };"),
+            ("result destructure", "S { count: int self } = state_identity(S { count: 7 });"),
+            ("local state", "S self = S { count: 7 }; require(self.count == 7);"),
+        ] {
+            let helper = format!("fn helper() {{ {body} }}");
+            let (global, actor) = if scope == "global" { (helper.as_str(), "") } else { ("", helper.as_str()) };
+            let source = format!(
+                "state S {{ int count; }} \
+                 fn identity(int value) -> int {{ return value; }} \
+                 fn state_identity(S value) -> S {{ return value; }} \
+                 {global} actor A owns S {{ {actor} entry check() emits none {{ helper(); }} }} \
+                 app Test {{ actor A; }}"
+            );
+            let sources = SourceSet::discover_inline(PathBuf::from("reserved-helper-binding.ag"), source).expect("source discovers");
+            let error = sources
+                .with_resolved(|program| {
+                    AppCompilationContext::from_resolved(
+                        &program,
+                        None,
+                        &BTreeMap::new(),
+                        &crate::compiler::model::default_route_planner,
+                    )
+                    .map(|_| ())
+                })
+                .expect_err("self is reserved in every helper binding form");
+            assert!(
+                error.message.contains("binding identifier `self` is reserved for the current actor context"),
+                "{scope} {case}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn self_is_reserved_for_constants_and_helper_signatures() {
+    for (declarations, actor_body, expected) in [
+        ("const int self = 7;", "", "constant identifier"),
+        ("fn self() {}", "", "function identifier"),
+        ("fn helper(int self) {}", "", "function `helper` parameter identifier"),
+        ("", "fn self() {}", "function identifier"),
+        ("", "fn helper(int self) {}", "actor function `A::helper` parameter identifier"),
+    ] {
+        let source = format!(
+            "state S {{ int count; }} {declarations} \
+             actor A owns S {{ {actor_body} entry check() emits none {{ require(count >= 0); }} }} \
+             app Test {{ actor A; }}"
+        );
+        let error = crate::compile_inline("reserved-self.ag", &source).expect_err("self is a reserved identifier");
+        assert!(
+            error.message.contains(&format!("{expected} `self` is reserved for the current actor context")),
+            "{declarations} {actor_body}: {error}"
+        );
+    }
+}
+
+#[test]
 fn registry_covers_every_entry_namespace_role() {
     let sources = SourceSet::discover_inline(
         PathBuf::from("entry-namespace.ag"),

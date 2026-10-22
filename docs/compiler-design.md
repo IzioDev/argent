@@ -375,3 +375,15 @@ also cover:
 The main focused fixtures are under `tests/fixtures/state_layout/`.
 `./check.sh --full` regenerates the tracked Argent examples. The Argent
 Playground check runs the transaction flows.
+
+## Generated Sil output
+
+Each actor is lowered to one final contract AST. `CompiledActors` retains that
+tree for compilation, and the Sil formatter uses the same tree for generated
+source output.
+
+The pinned Sil AST has no comment nodes. `AnnotatedContractAst` therefore keeps
+generated explanations separately, anchored to contract nodes. This preserves
+their attachment for future comment-aware formatting without reparsing
+generated Sil. Today's formatter ignores the anchors and emits comment-free
+Sil; the comments do not participate in compilation.

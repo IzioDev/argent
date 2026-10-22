@@ -672,6 +672,20 @@ impl AppCompilationContext<'_> {
                 }
             }
         }
+        for owner in self.functions.iter().map(|(id, _)| *id).chain(self.actor_models.keys().copied()) {
+            for (local, name) in &self.resolution.bindings(owner).local_names {
+                let context = match (self.resolution.declaration(owner), local.callable) {
+                    (ResolvedDeclaration::Function(function), RootSlot::Declaration) => {
+                        format!("function `{}` binding", function.name)
+                    }
+                    (ResolvedDeclaration::Actor(actor), RootSlot::ActorFunction(index)) => {
+                        format!("actor function `{}::{}` binding", actor.name, actor.functions[index].name)
+                    }
+                    _ => continue,
+                };
+                reject_reserved_identifier(&context, name)?;
+            }
+        }
         Ok(())
     }
 
