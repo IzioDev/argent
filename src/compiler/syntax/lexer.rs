@@ -24,7 +24,6 @@ pub enum TokenKind {
     Number(String),
     Str(String),
     Arrow,
-    LeftArrow,
     Symbol(char),
     Eof,
 }
@@ -83,11 +82,6 @@ impl Lexer<'_> {
                     let start = self.pos;
                     self.pos += 2;
                     self.push(TokenKind::Arrow, start, self.pos);
-                }
-                b'<' if self.peek_byte(1) == Some(b'-') => {
-                    let start = self.pos;
-                    self.pos += 2;
-                    self.push(TokenKind::LeftArrow, start, self.pos);
                 }
                 b'{' | b'}' | b'(' | b')' | b'[' | b']' | b';' | b':' | b',' | b'|' | b'&' | b'^' | b'!' | b'=' | b'+' | b'-'
                 | b'*' | b'/' | b'%' | b'<' | b'>' | b'.' => {

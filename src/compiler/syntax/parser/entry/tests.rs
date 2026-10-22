@@ -171,6 +171,8 @@ fn malformed_routes_fail_on_the_shared_source_parser() {
         ("become { first <- A, second <- B(next) };", "expected `(` after become target"),
         ("become { first <- A(next); second <- B(next) };", "expected `,` or `}`"),
         ("become Done(next);", "must name its output"),
+        // whitespace isn't allowed
+        ("become next < - self;", "must name its output"),
     ] {
         let source = format!("actor Agent owns State {{ entry step() emits none {{ {body} }} }}");
         let sources = SourceSet::discover_inline(PathBuf::from("invalid-routes.ag"), source).expect("source discovery");

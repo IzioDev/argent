@@ -1063,7 +1063,6 @@ impl<'src> Parser<'src> {
             TokenKind::Number(value) => format!("number `{value}`"),
             TokenKind::Str(value) => format!("string \"{value}\""),
             TokenKind::Arrow => "`->`".to_string(),
-            TokenKind::LeftArrow => "`<-`".to_string(),
             TokenKind::Symbol(value) => format!("`{value}`"),
             TokenKind::Eof => "end of file".to_string(),
         }

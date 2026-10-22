@@ -92,10 +92,19 @@ impl<'src> Parser<'src> {
         let output_start = self.current().span.start;
         let output = self.expect_any_ident()?;
         let output_end = self.previous().span.end;
-        if !matches!(self.current().kind, TokenKind::LeftArrow) {
+
+        // the lexer doesn't interpret arrows, so reconcile `<` and `-` here.
+        if !self.check_symbol('<')
+            || !self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Symbol('-')) && self.current().span.end == token.span.start)
+        {
             return Err(self.error("every `become` route must name its output with `output <- successor`"));
         }
-        self.advance();
+
+        self.pos = self.pos + 2;
+
         let successor_start = self.current().span.start;
         let successor = if self.check_ident(word::SELF)
             && matches!(
