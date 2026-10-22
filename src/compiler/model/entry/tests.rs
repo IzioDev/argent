@@ -370,6 +370,64 @@ fn bound_local_selector_identity_controls_route_expansion() {
 }
 
 #[test]
+fn reassigned_actor_enum_locals_keep_their_full_route_domain() {
+    for assignment in [
+        "target = Move::A;",
+        "if (choose_a) { target = Move::A; }",
+        "{ target = Move::A; }",
+        "for (i, 0, 1, 1) { target = Move::A; }",
+        "if (false) { target = Move::A; }",
+    ] {
+        let program = load_inline_program(
+            std::path::PathBuf::from("reassigned-selector.ag"),
+            format!(
+                r#"
+                    state Game {{ int n; }}
+                    actor A owns Game {{ entry hold() emits none {{ require(n >= 0); }} }}
+                    actor B owns Game {{ entry hold() emits none {{ require(n >= 10); }} }}
+                    actor enum Move {{ A; B; }}
+                    actor Mux owns Game {{
+                        fn unrelated(int target) -> int {{ target = target + 1; return target; }}
+                        entry choose(bool choose_a) emits next: Move {{
+                            Move target = Move::B;
+                            {assignment}
+                            unrestricted(next.value);
+                            become next <- target(Game {{ n: n + 1 }});
+                        }}
+                        entry fixed() emits next: Move {{
+                            Move target = Move::B;
+                            unrestricted(next.value);
+                            become next <- target(Game {{ n: n + 1 }});
+                        }}
+                        entry other() emits none {{ int target = 0; target = 1; require(target == 1); }}
+                    }}
+                    app Test {{ actor A; actor B; actor Mux; }}
+                "#,
+            ),
+        )
+        .expect("selector assignments resolve");
+        let model =
+            AppCompilationContext::from_resolved(&program, None, &BTreeMap::new(), &crate::compiler::model::default_route_planner)
+                .expect("reassigned selectors are planned");
+        let actor = model.types.names["Mux"];
+        let dynamic = model.entry_model_by_id(EntryId { actor, index: 0 }).expect("dynamic entry");
+        let selector = &dynamic.template_selectors()["target"];
+        assert_eq!(selector.fixed_actor, None, "{assignment}");
+        assert_eq!(selector.fixed_index, None, "{assignment}");
+        assert_eq!(
+            selector.route_actor_ids().expect("dynamic route domain"),
+            [StaticActorId::InApp(model.types.names["A"]), StaticActorId::InApp(model.types.names["B"])],
+            "{assignment}"
+        );
+        let fixed = model.entry_model_by_id(EntryId { actor, index: 1 }).expect("fixed entry");
+        let selector = &fixed.template_selectors()["target"];
+        assert_eq!(selector.fixed_actor.as_deref(), Some("B"), "writes to different bindings do not affect this local");
+        assert_eq!(selector.fixed_index, Some(1));
+        assert_eq!(selector.route_actor_ids().expect("fixed route domain"), [StaticActorId::InApp(model.types.names["B"])]);
+    }
+}
+
+#[test]
 fn retained_selector_initializer_uses_bound_ast_expression() {
     let source_text = r#"
         state Game { int n; }
