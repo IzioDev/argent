@@ -122,6 +122,55 @@ fn unknown_initializer_name_is_rejected_before_it_becomes_a_local() {
 }
 
 #[test]
+fn named_dimensions_bind_constants_at_each_type_site() {
+    let program = load_inline_program(
+        PathBuf::from("dimension-bindings.ag"),
+        r#"
+            const int LENGTH = 2;
+            fn inspect(int number) -> int {
+                int[4][LENGTH] values = int[4][LENGTH]{int[4]{1, 2, 3, 4}, int[4]{5, 6, 7, 8}};
+                byte[2] bytes = number as byte[LENGTH];
+                return values.length;
+            }
+        "#
+        .to_string(),
+    )
+    .expect("array dimensions resolve");
+    let owner = DeclId::new(ModuleId::new(0), SymbolKind::Function, 0);
+    let constant = DeclId::new(ModuleId::new(0), SymbolKind::Const, 0);
+    let body = SourceNodeCursor::new(owner, RootSlot::Declaration).child(ChildEdge::Body);
+    let bindings = program.bindings(owner);
+    for (cursor, dimension) in [
+        (body.child(ChildEdge::Statement(0)).child(ChildEdge::TypeUse), 1),
+        (body.child(ChildEdge::Statement(0)).child(ChildEdge::Expression).child(ChildEdge::TypeUse), 1),
+        (body.child(ChildEdge::Statement(1)).child(ChildEdge::Expression).child(ChildEdge::CallTarget), 0),
+    ] {
+        let site = program.nodes().find(&cursor.address).expect("type site is indexed");
+        assert_eq!(bindings.dimension_constants[&(site, dimension)], constant);
+        assert_eq!(bindings.sites[&site], Binding::Builtin, "base types retain their own binding");
+        assert_eq!(
+            program.type_use(site).expect("parsed type exists").ty.array_dims[dimension],
+            silverscript_lang::ast::ArrayDim::Constant("LENGTH".to_string()),
+            "resolution leaves the authored type unchanged"
+        );
+    }
+    assert_eq!(bindings.dimension_constants.len(), 3);
+    assert!(bindings.declarations.contains(&constant), "dimension-only references retain the constant dependency");
+}
+
+#[test]
+fn named_dimensions_reject_missing_and_nonconstant_declarations() {
+    for dimension in ["MISSING", "Row"] {
+        let error = load_inline_program(
+            PathBuf::from("invalid-dimension.ag"),
+            format!("state Row {{ int count; }} fn inspect() {{ int[{dimension}] values = int[]{{1, 2}}; }}"),
+        )
+        .expect_err("dimensions must refer to constants");
+        assert!(error.to_string().contains(dimension), "dimension error must name its source: {error}");
+    }
+}
+
+#[test]
 fn global_helpers_reject_bare_builtin_and_runtime_names() {
     for name in ["co_spent", "tx", "this", "r0", "self", "length", "sha256", "OpTxGas"] {
         let source = format!(

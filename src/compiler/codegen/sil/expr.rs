@@ -127,6 +127,7 @@ impl<'m, 'src> HelperExpressionLowerer<'m, 'src> {
     }
 
     pub(super) fn lower_type(&self, ty: &mut TypeRef, span: Span<'_>) {
+        self.names.lower_type_dimensions(ty, span);
         match &mut ty.base {
             TypeBase::Custom(_) if self.names.type_target(span).is_some_and(|id| id.kind() == SymbolKind::ActorEnum) => {
                 ty.base = TypeBase::Int;
@@ -191,6 +192,11 @@ impl<'ast> AstVisitorMut<'ast> for HelperExpressionLowerer<'_, '_> {
             }
         }
         match &mut expr.kind {
+            ExprKind::Call { name, name_span, .. } if name.starts_with("__as_cast_") => {
+                if let Some(lowered) = self.names.as_cast_name(*name_span) {
+                    *name = lowered;
+                }
+            }
             ExprKind::Call { name, args, .. } if name == word::COVENANT_ID && args.len() == 1 => {
                 *name = "byte[32]".to_string();
             }
