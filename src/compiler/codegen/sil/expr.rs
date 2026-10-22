@@ -128,11 +128,10 @@ impl<'m, 'src> HelperExpressionLowerer<'m, 'src> {
 
     pub(super) fn lower_type(&self, ty: &mut TypeRef, span: Span<'_>) {
         match &mut ty.base {
-            TypeBase::Custom(name)
-                if name == word::COVENANT_ID
-                    || name == word::ACTOR_TYPE
-                    || self.names.type_target(span).is_some_and(|id| id.kind() == SymbolKind::ActorEnum) =>
-            {
+            TypeBase::Custom(_) if self.names.type_target(span).is_some_and(|id| id.kind() == SymbolKind::ActorEnum) => {
+                ty.base = TypeBase::Int;
+            }
+            TypeBase::Custom(name) if name == word::COVENANT_ID || name == word::ACTOR_TYPE => {
                 ty.base = TypeBase::Byte;
                 ty.array_dims.insert(0, ArrayDim::Fixed(32));
             }
