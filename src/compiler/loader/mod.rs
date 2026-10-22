@@ -80,7 +80,7 @@ impl SourceSet {
         }
         let text = fs::read_to_string(&canonical).map_err(|err| ArgentError::at(&canonical, err.to_string()))?;
         let display_path = std::path::absolute(path).map_err(|err| ArgentError::at(path, err.to_string()))?;
-        let base = display_path.parent().ok_or_else(|| ArgentError::at(&display_path, "module path has no parent"))?.to_path_buf();
+        let base = canonical.parent().ok_or_else(|| ArgentError::at(&display_path, "module path has no parent"))?.to_path_buf();
         let id = self.insert_source(identity, display_path, text)?;
         let imports = self.imports[id.0].clone();
         for discovered in imports {
