@@ -1,6 +1,36 @@
 use super::*;
 use crate::compiler::model::AppCompilationContext;
 
+#[cfg(unix)]
+#[test]
+fn symlinked_sources_resolve_imports_from_the_canonical_parent() {
+    let temp = tempfile::tempdir().expect("test source directory exists");
+    let package = temp.path().join("package");
+    fs::create_dir(&package).expect("package directory exists");
+    let source = package.join("app.ag");
+    fs::write(&source, "import \"./types.ag\"; const int LIMIT = VALUE;").expect("module source is written");
+    let dependency = "const int VALUE = 7;";
+    fs::write(package.join("types.ag"), dependency).expect("module dependency is written");
+    let link = temp.path().join("app.ag");
+    std::os::unix::fs::symlink(&source, &link).expect("module symlink exists");
+
+    for shadow_sibling in [false, true] {
+        if shadow_sibling {
+            fs::write(temp.path().join("types.ag"), "const int VALUE = 99;").expect("conflicting sibling is written");
+        }
+        for first in [&link, &source] {
+            let mut sources = SourceSet::discover_file(first).expect("imports resolve beside the actual source file");
+            assert_eq!(sources.files.len(), 2);
+            assert_eq!(sources.files[0].display_path, *first, "diagnostics preserve the requested source path");
+            assert_eq!(sources.files[1].text, dependency, "a sibling beside the link must not change module dependencies");
+            let root = sources.root.expect("root source exists");
+            assert_eq!(sources.load_file(&source).expect("direct module path loads"), root);
+            assert_eq!(sources.load_file(&link).expect("module symlink loads"), root);
+            assert_eq!(sources.files.len(), 2, "both paths retain one canonical module and its dependency");
+        }
+    }
+}
+
 #[test]
 fn selected_apps_reject_duplicate_actor_exports_instead_of_renaming_them() {
     let temp = temp_dir("duplicate-selected-exports");
