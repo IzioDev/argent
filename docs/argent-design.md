@@ -132,8 +132,8 @@ may use shared constants, other global functions, their own parameters and
 locals, and explicit Sil runtime context such as `tx` and `this`.
 
 Actor functions are emitted only into their owning actor contract. They may
-read that actor's available state fields by bare name, as `current()` does
-above, and may call global functions or other functions on the same actor.
+read that actor's available state fields by bare name or `self.<field>`, and
+may call global functions or other functions on the same actor.
 They are not methods: there is no cross-actor `actor.function()` call surface.
 
 | Caller | Global function | Same-actor function | Other actor's function |
@@ -142,9 +142,8 @@ They are not methods: there is no cross-actor `actor.function()` call surface.
 | Actor function | Allowed | Allowed | Not visible |
 | Entry | Allowed | Allowed | Not visible |
 
-`self`, entry input references, output handles, and `state(ref)` reconstruction
-belong to entry lowering and are not available inside either kind of function.
-Functions instead receive authored values explicitly through their parameters.
+Entry input references, output handles, and `state(ref)` reconstruction are
+entry-only. Functions receive complete authored state values through parameters.
 State-valued parameters and results keep their authored Argent types in source;
 the compiler lowers their representation separately for each generated actor
 contract.
@@ -307,6 +306,9 @@ For example, `tx.outputs[i].value` reads the transaction, and
 The ladder moves through three abstraction levels. `tx` exposes the complete
 transaction. `this` identifies the active input and script. `self` presents the
 active input as a logical Argent actor.
+
+`self` is reserved and cannot name declarations or bindings, including in
+global functions.
 
 `self` is a context namespace. It is not an actor handle or another first-class
 actor value. Bare `self` is valid only as an exact successor in

@@ -1,15 +1,33 @@
-# Body lowering notes
+# Body lowering decisions
 
-Small implementation hints to revisit during the current compiler work.
+## Actor-function `self`
 
-- Parse state constructor fields through the Sil AST. Accept comments in valid constructors and reject empty or repeated comma components; generated comments do not need to be preserved.
-- Define actor-function `self` semantics. Actor functions currently access contract fields by bare Sil names and do not receive entry `self.*` lowering; if that syntax is added, reserve `self` as a function binding at the same time.
-- Accept Sil ternaries and bitwise XOR in the shared lexer.
-- Attach body-local selector metadata to parsed binding identities instead of keeping the analyzed selector catalog entry-wide and keyed by name.
-- Decide whether unbraced `if` bodies pass through or are rejected by the source parser.
-- Keep statement terminator policy in source parsing for both ordinary Sil statements and `become`.
-- Reject or define empty `become {}`; it currently becomes a no-op for `emits none`.
-- Retain each entry body's file offset so body diagnostics use source-file locations.
-- Match route-target delimiter kinds so malformed expressions receive structural errors.
-- Split `body.rs` and `emitter.rs` after their authored-value proof, state
-  conversion, naming, and rendering interfaces become stable.
+Actor helpers lower `self.<storage_field>` to contract fields. `state(self)` is
+entry-only. Reconstructing expanded state inside a helper would require extra
+arguments carrying validated expansion preimages; the contract stores only
+their digests.
+
+Decide whether to keep authored state explicit or pass expansion arguments
+through helper calls to support `state(self)`.
+
+## Entry branch and terminator syntax
+
+Entry parsing accepts unbraced `if` branches, but lowering requires blocks
+except for `else if`. Single-route `become` makes the semicolon optional;
+ordinary Sil statements require it.
+
+Decide the accepted forms and enforce them in source parsing.
+
+## Empty transitions
+
+`become {}` is accepted for `emits none` and emits no output validations. It is
+terminal: following statements are rejected.
+
+Decide whether this is valid termination syntax or an empty-route error.
+
+## Sil expression coverage
+
+Argent rejects Sil ternary expressions. This predates the AST-to-AST refactor.
+
+Decide whether Argent supports the pinned Sil expression syntax in full or an
+explicit subset. Align parser compatibility tests with that boundary.
