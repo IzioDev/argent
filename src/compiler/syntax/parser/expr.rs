@@ -156,18 +156,31 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_hex_cast(&mut self, ty: &SilTypeRef, type_span: sil::Span<'src>, start: usize) -> Result<Option<Expr<'src>>> {
-        let [Some(open), Some(literal), Some(close)] =
-            [self.tokens.get(self.pos), self.tokens.get(self.pos + 1), self.tokens.get(self.pos + 2)]
-        else {
+        let mut literal_pos = self.pos;
+        while matches!(self.tokens.get(literal_pos).map(|token| &token.kind), Some(TokenKind::Symbol('('))) {
+            literal_pos += 1;
+        }
+        if literal_pos == self.pos {
             return Ok(None);
-        };
+        }
+        let Some(literal) = self.tokens.get(literal_pos) else { return Ok(None) };
         let TokenKind::Number(raw) = &literal.kind else {
             return Ok(None);
         };
-        if !matches!(open.kind, TokenKind::Symbol('('))
-            || !matches!(close.kind, TokenKind::Symbol(')'))
-            || !raw.starts_with("0x") && !raw.starts_with("0X")
-        {
+        if !raw.starts_with("0x") && !raw.starts_with("0X") {
+            return Ok(None);
+        }
+        let mut end = literal_pos + 1;
+        for _ in 1..literal_pos - self.pos {
+            if !matches!(self.tokens.get(end).map(|token| &token.kind), Some(TokenKind::Symbol(')'))) {
+                return Ok(None);
+            }
+            end += 1;
+        }
+        if matches!(self.tokens.get(end).map(|token| &token.kind), Some(TokenKind::Symbol(','))) {
+            end += 1;
+        }
+        if !matches!(self.tokens.get(end).map(|token| &token.kind), Some(TokenKind::Symbol(')'))) {
             return Ok(None);
         }
         let is_byte_array = matches!(ty.base, sil::TypeBase::Byte) && ty.array_dims.len() == 1;
@@ -190,9 +203,7 @@ impl<'src> Parser<'src> {
                     .map_err(|_| self.file.error_at(literal.span.start, format!("invalid hex literal `{raw}`")))
             })
             .collect::<Result<Vec<_>>>()?;
-        self.advance();
-        self.advance();
-        self.advance();
+        self.pos = end + 1;
         let span = self.sil_span(start, self.previous().span.end);
         if is_byte_array {
             let mut type_ref = ty.clone();

@@ -22,6 +22,18 @@ fn without_spans(value: &mut Value) {
     }
 }
 
+fn assert_upstream_expression_shape(expression: &str) {
+    let source = format!("const int SAMPLE = {expression};");
+    let sources = SourceSet::discover_inline(PathBuf::from("expr.ag"), source).expect("source discovery");
+    let program = sources.parse_modules().expect("source parser");
+    let mut parsed = serde_json::to_value(&program.modules[0].const_values[0]).expect("Argent AST serializes");
+    let mut upstream =
+        serde_json::to_value(parse_expression_ast(expression).expect("upstream expression")).expect("Sil AST serializes");
+    without_spans(&mut parsed);
+    without_spans(&mut upstream);
+    assert_eq!(parsed, upstream, "expression: {expression}");
+}
+
 #[test]
 fn constant_expressions_match_upstream_ast_shapes() {
     for expression in [
@@ -42,17 +54,27 @@ fn constant_expressions_match_upstream_ast_shapes() {
         "buffer.slice(1, 2)",
         "buffer.split(1).1",
         "byte[_](0xaabb)",
+        "byte[2]((0x1122))",
+        "byte[2](0x1122,)",
+        "byte[2](((0x1122)),)",
+        "byte[]((0x),)",
+        "byte[2]((0x1122 + 0))",
+        "byte[2]((0x1122), 1)",
         "date(\"2026-01-02T03:04:05\")",
     ] {
-        let source = format!("const int SAMPLE = {expression};");
-        let sources = SourceSet::discover_inline(PathBuf::from("expr.ag"), source).expect("source discovery");
-        let program = sources.parse_modules().expect("source parser");
-        let mut parsed = serde_json::to_value(&program.modules[0].const_values[0]).expect("Argent AST serializes");
-        let mut upstream =
-            serde_json::to_value(parse_expression_ast(expression).expect("upstream expression")).expect("Sil AST serializes");
-        without_spans(&mut parsed);
-        without_spans(&mut upstream);
-        assert_eq!(parsed, upstream, "expression: {expression}");
+        assert_upstream_expression_shape(expression);
+    }
+}
+
+#[test]
+fn fixed_byte_hex_casts_match_upstream_with_parentheses_and_trailing_commas() {
+    for (ty, len) in [("byte[32]", 32), ("pubkey", 32), ("sig", 65), ("datasig", 64)] {
+        let hex = format!("0x{}", "11".repeat(len));
+        for argument in [hex.clone(), format!("({hex})"), format!("(({hex}))")] {
+            for comma in ["", ","] {
+                assert_upstream_expression_shape(&format!("{ty}({argument}{comma})"));
+            }
+        }
     }
 }
 
@@ -112,7 +134,12 @@ fn empty_hex_byte_array_literal_has_zero_elements() {
         assert!(values.is_empty(), "{literal}");
     }
 
-    for (literal, message) in [("byte[1](0x)", "size mismatch"), ("0x", "invalid hex literal")] {
+    for (literal, message) in [
+        ("byte[1](0x)", "size mismatch"),
+        ("byte[1]((0x),)", "size mismatch"),
+        ("pubkey((0x),)", "size mismatch"),
+        ("0x", "invalid hex literal"),
+    ] {
         let sources = SourceSet::discover_inline(PathBuf::from("invalid-empty-hex.ag"), format!("const int SAMPLE = {literal};"))
             .expect("source discovery");
         let error = sources.parse_modules().expect_err("empty hex literal must be invalid here");
