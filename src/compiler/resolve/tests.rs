@@ -1,7 +1,7 @@
 use super::bindings::Binding;
 use super::*;
 use crate::compiler::loader::load_inline_program;
-use crate::compiler::syntax::node::{ChildEdge, RootSlot, SourceNodeCursor};
+use crate::compiler::syntax::node::{ChildEdge, ReferenceRole, RootSlot, SourceNodeCursor};
 use crate::compiler::syntax::source::Origin;
 use std::path::PathBuf;
 
@@ -34,6 +34,102 @@ fn actor_helper_calls_keep_bound_member_indices() {
             .map(|(_, binding)| binding)
             .collect::<Vec<_>>();
         assert_eq!(calls, [&Binding::ActorHelper(member)]);
+    }
+}
+
+#[test]
+fn calls_resolve_independently_of_same_named_values() {
+    let program = load_inline_program(
+        PathBuf::from("call-value-namespaces.ag"),
+        r#"
+            state S { cov_id member; }
+            fn plus(int value) -> int { return value + 1; }
+            fn shared(int plus, int sha256) -> int {
+                require(sha256(byte[](0x1122)).length == 32);
+                return plus(1) + plus + sha256;
+            }
+            actor A owns S {
+                fn member() -> int { return 2; }
+                fn local(int member) -> int { return member() + member; }
+                entry check(int plus) emits none {
+                    require(plus(1) == plus);
+                    require(member() == 2);
+                    require(member.co_spent());
+                }
+            }
+            app Test { actor A; }
+        "#
+        .to_string(),
+    )
+    .expect("calls and values have separate bindings");
+    let plus = DeclId::new(ModuleId::new(0), SymbolKind::Function, 0);
+    for owner in [DeclId::new(ModuleId::new(0), SymbolKind::Function, 1), DeclId::new(ModuleId::new(0), SymbolKind::Actor, 0)] {
+        for (site, binding) in &program.bindings(owner).sites {
+            let node = program.nodes().node(*site);
+            let Origin::Authored { start, end, .. } = node.origin else { continue };
+            let name = &program.source_text(owner.module)[start..end];
+            match (node.reference_role, name) {
+                (Some(ReferenceRole::Call), "plus") => assert_eq!(*binding, Binding::Source(ResolvedName::Declaration(plus))),
+                (Some(ReferenceRole::Call), "sha256") => assert_eq!(*binding, Binding::Builtin),
+                (Some(ReferenceRole::Call), "member") => assert_eq!(*binding, Binding::ActorHelper(0)),
+                (Some(ReferenceRole::Value), "member") if node.address.root == RootSlot::Entry(0) => {
+                    assert_eq!(*binding, Binding::ActorField);
+                }
+                (Some(ReferenceRole::Value), "plus" | "sha256" | "member") => {
+                    assert!(matches!(binding, Binding::Local(_)), "{name}: {binding:?}");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[test]
+fn constructors_resolve_types_independently_of_same_named_values() {
+    let program = load_inline_program(
+        PathBuf::from("constructor-value-namespaces.ag"),
+        r#"
+            state S { int count; }
+            fn shared(int S) -> S { return S { count: S }; }
+            actor A owns S {
+                fn local(int S) -> S { return S { count: S }; }
+                entry check(int S) emits none {
+                    S value = S { count: S };
+                    require(value.count == S);
+                }
+            }
+            app Test { actor A; }
+        "#
+        .to_string(),
+    )
+    .expect("constructor types and values have separate bindings");
+    let state = DeclId::new(ModuleId::new(0), SymbolKind::State, 0);
+    for owner in [DeclId::new(ModuleId::new(0), SymbolKind::Function, 0), DeclId::new(ModuleId::new(0), SymbolKind::Actor, 0)] {
+        for (site, binding) in &program.bindings(owner).sites {
+            let node = program.nodes().node(*site);
+            let Origin::Authored { start, end, .. } = node.origin else { continue };
+            if &program.source_text(owner.module)[start..end] != "S" {
+                continue;
+            }
+            match node.reference_role {
+                Some(ReferenceRole::Type) => assert_eq!(*binding, Binding::Source(ResolvedName::Declaration(state))),
+                Some(ReferenceRole::Value) => assert!(matches!(binding, Binding::Local(_))),
+                _ => {}
+            }
+        }
+    }
+}
+
+#[test]
+fn value_bindings_do_not_satisfy_missing_calls_or_constructor_types() {
+    for (name, body) in [
+        ("missing", "missing(1);"),
+        ("Missing", "require(Missing { count: 1 }.count == 1);"),
+        ("Missing", "require((new Missing(1)).length == 1);"),
+    ] {
+        let error = load_inline_program(PathBuf::from("missing-call-type.ag"), format!("fn inspect(int {name}) {{ {body} }}"))
+            .expect_err("a local value is not a function or a constructor type");
+        assert!(error.to_string().contains(&format!("unknown reference `{name}`")), "{error}");
     }
 }
 

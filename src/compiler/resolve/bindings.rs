@@ -82,11 +82,18 @@ impl DeclarationBinder<'_, '_> {
         let Origin::Authored { .. } = self.program.nodes().node(id).origin else {
             return Err(ArgentError::at(self.program.declaration_path(self.owner), "generated source reference"));
         };
-        if !name.contains("::")
-            && let Some(binding) = scope.get(name)
-        {
-            self.bindings.sites.insert(id, binding.clone());
-            return Ok(());
+        if !name.contains("::") {
+            // Calls and constructors have separate namespaces from parameters,
+            // locals, and actor fields, even when their source names match.
+            let binding = match self.program.nodes().node(id).reference_role {
+                Some(ReferenceRole::Call) => self.actor_helpers.get(name).copied().map(Binding::ActorHelper),
+                Some(ReferenceRole::Type) => None,
+                _ => scope.get(name).cloned(),
+            };
+            if let Some(binding) = binding {
+                self.bindings.sites.insert(id, binding);
+                return Ok(());
+            }
         }
 
         let resolved = self.program.resolve(self.owner.module, name);
@@ -448,7 +455,7 @@ impl DeclarationBindings {
             ResolvedDeclaration::Actor(item) => {
                 let state = binder.required_site(&SourceNodeCursor::new(owner, RootSlot::ActorState), &[SymbolKind::State])?;
                 binder.actor_helpers.extend(item.functions.iter().enumerate().map(|(index, function)| (function.name.clone(), index)));
-                let mut scope = item.functions.iter().map(|function| function.name.clone()).collect::<BTreeSet<_>>();
+                let mut scope = BTreeSet::new();
                 let mut pending = Some(state);
                 let mut visited = BTreeSet::new();
                 while let Some(id) = pending.take() {
@@ -613,13 +620,7 @@ impl DeclarationBinder<'_, '_> {
 
     fn function(&mut self, index: usize, function: &FunctionDecl, outer: &BTreeSet<String>) -> Result<()> {
         let root = if self.owner.kind() == SymbolKind::Actor { RootSlot::ActorFunction(index) } else { RootSlot::Declaration };
-        let mut scope = outer
-            .iter()
-            .map(|name| {
-                let binding = self.actor_helpers.get(name).map_or(Binding::ActorField, |index| Binding::ActorHelper(*index));
-                (name.clone(), binding)
-            })
-            .collect::<BTreeMap<_, _>>();
+        let mut scope = outer.iter().map(|name| (name.clone(), Binding::ActorField)).collect::<BTreeMap<_, _>>();
         for (index, param) in function.params.iter().enumerate() {
             self.ty(&param.ty)?;
             let id = self.local(&mut scope, &param.name, root);
@@ -641,13 +642,7 @@ impl DeclarationBinder<'_, '_> {
     fn entry(&mut self, index: usize, entry: &EntryDecl, outer: &BTreeSet<String>) -> Result<()> {
         self.entry_parameters = entry.params.iter().map(|param| (param.name.clone(), false)).collect();
         let root = RootSlot::Entry(index);
-        let mut scope = outer
-            .iter()
-            .map(|name| {
-                let binding = self.actor_helpers.get(name).map_or(Binding::ActorField, |index| Binding::ActorHelper(*index));
-                (name.clone(), binding)
-            })
-            .collect::<BTreeMap<_, _>>();
+        let mut scope = outer.iter().map(|name| (name.clone(), Binding::ActorField)).collect::<BTreeMap<_, _>>();
         for (index, param) in entry.params.iter().enumerate() {
             self.ty(&param.ty)?;
             let id = self.local(&mut scope, &param.name, root);
