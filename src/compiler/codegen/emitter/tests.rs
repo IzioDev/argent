@@ -10068,6 +10068,55 @@ fn sil_signature_builtins_pass_through() {
 }
 
 #[test]
+fn sil_state_builtins_pass_through() {
+    let (actors, artifact) = inline_actor_sil_and_artifact(
+        "sil-state-builtins",
+        r#"
+            state CounterState { int count; }
+
+            actor Counter owns CounterState {
+                entry inspect(
+                    CounterState candidate,
+                    byte[] prefix,
+                    byte[] suffix,
+                    int prefix_len,
+                    int suffix_len,
+                    byte[32] template_hash,
+                ) emits next: Counter {
+                    CounterState current = readInputStateWithTemplate(
+                        this.activeInputIndex, prefix_len, suffix_len, template_hash,
+                    );
+                    State {count: int opened} = readInputStateWithTemplate(
+                        this.activeInputIndex, prefix_len, suffix_len, template_hash,
+                    );
+                    require(current.count == count && opened == count);
+                    validateOutputState(0, candidate);
+                    validateOutputStateWithTemplate(0, candidate, prefix, suffix, template_hash);
+                    validateOutputStateWithInputTemplate(
+                        0, candidate, this.activeInputIndex, prefix_len, suffix_len, template_hash,
+                    );
+                    unrestricted(next.value);
+                    become next <- Counter(candidate);
+                }
+            }
+
+            app Test { actor Counter; }
+        "#,
+    );
+    let sil = &actors["Counter"];
+    for call in [
+        "readInputStateWithTemplate(",
+        "validateOutputState(0, candidate);",
+        "validateOutputStateWithTemplate(0, candidate, prefix, suffix, template_hash);",
+        "validateOutputStateWithInputTemplate(0, candidate, this.activeInputIndex, prefix_len, suffix_len, template_hash);",
+    ] {
+        assert!(sil.contains(call), "missing `{call}` in generated Sil:\n{sil}");
+    }
+    let compiled = compile_contract(sil, &[SilExpr::int(0)], CompileOptions::default()).expect("formatted state builtins compile");
+    assert_eq!(compiled.bytecode, artifact.sil_abi.contract("Counter").expect("Counter ABI exists").compiled.bytecode);
+}
+
+#[test]
 fn int_array_cast_compiles() {
     let (actors, _) = inline_actor_sil_and_artifact(
         "primitive-array-casts",
