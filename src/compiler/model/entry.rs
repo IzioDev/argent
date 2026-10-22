@@ -8,7 +8,7 @@ use silverscript_lang::ast::{Expr as SilExpr, ExprKind as SilExprKind, Span as S
 use crate::artifact::MAX_ENTRY_RANGE_CARDINALITY;
 use crate::compiler::resolve::{Binding, ClauseReference, LocalId, ResolvedDeclaration, ResolvedModules, ResolvedName};
 use crate::compiler::syntax::body::{EntrySuccessor, RouteArity};
-use crate::compiler::syntax::node::{ChildEdge, DeclId, EntryId, NodeId, RootSlot, SourceNodeCursor};
+use crate::compiler::syntax::node::{ChildEdge, DeclId, EntryId, NodeId, ReferenceRole, RootSlot, SourceNodeCursor};
 use crate::compiler::syntax::source::Origin;
 use crate::compiler::syntax::word;
 use crate::compiler::syntax::{
@@ -88,6 +88,16 @@ impl<'a> EntryModel<'a> {
         actor_ids: &BTreeMap<String, StaticActorId>,
     ) -> Result<()> {
         let bindings = resolution.bindings(self.id.actor);
+        let assigned_locals = bindings
+            .sites
+            .iter()
+            .filter_map(|(site, binding)| match binding {
+                Binding::Local(local) if resolution.nodes().node(*site).reference_role == Some(ReferenceRole::AssignmentTarget) => {
+                    Some(*local)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
         let ResolvedDeclaration::Actor(authored_actor) = resolution.declaration(self.id.actor) else {
             return Err(ArgentError::new("actor selector owner is not an actor declaration"));
         };
@@ -227,6 +237,8 @@ impl<'a> EntryModel<'a> {
                     )));
                 }
             };
+            // A reassigned enum local routes through its current value, not its initializer.
+            let fixed_actor = if expected_actor_enum.is_some() && assigned_locals.contains(&local) { None } else { fixed_actor };
             let mut selector = self.bound_selector(&name, enumeration, fixed_actor, declared, types, actor_ids)?;
             selector.binding = Some(local);
             enum_values.insert(local, enumeration);

@@ -2917,6 +2917,82 @@ fn toy_chess_builder_redeems_route_family_and_worker_paths() {
 }
 
 #[test]
+fn reassigned_actor_enum_selector_executes_both_conditional_routes() {
+    let artifact = inline_artifact(
+        "reassigned-actor-enum-selector",
+        r#"
+            state S { int count; }
+            actor enum Move { A; B; }
+            actor A owns S {
+                entry choose(bool choose_a) emits next: Move {
+                    Move target = Move::B;
+                    if (choose_a) { target = Move::A; }
+                    require(!choose_a || target == Move::A);
+                    unrestricted(next.value);
+                    become next <- target(S { count: count + 1 });
+                }
+                entry fixed() emits next: Move {
+                    Move target = Move::B;
+                    unrestricted(next.value);
+                    become next <- target(S { count: count + 1 });
+                }
+            }
+            actor B owns S { entry inspect() emits none { require(count >= 0); } }
+            app Test { actor A; actor B; }
+        "#,
+    );
+    let builder = TxBuilder::new(&artifact).expect("builder accepts selector artifact");
+    let covenant_id = Hash::from_bytes([0x75; 32]);
+    let outpoint = TransactionOutpoint { transaction_id: TransactionId::from_bytes([0x76; 32]), index: 0 };
+    let initial = state! { count: 1 };
+    let next = state! { count: 2 };
+    let input_utxo = builder.covenant_utxo("A", initial.clone(), 1_000, 0, false, Some(covenant_id)).expect("A input builds");
+    let fixed_context = TxContext::new().actor_input("A", initial, "fixed", outpoint, input_utxo.clone(), 0).actor_output(
+        "B",
+        next.clone(),
+        CovenantBinding::new(0, covenant_id),
+        1_000,
+    );
+    let baseline = builder.build(&fixed_context).expect("an unwritten selector still resolves its witness automatically");
+    let redeem_script = p2sh_redeem_script(&baseline.inputs[0].signature_script);
+    let contract = artifact.sil_abi.contract("A").expect("A contract");
+    let choose = contract.entry("choose").expect("choose ABI");
+
+    // Body-local dynamic selectors need explicit ABI witnesses; the high-level
+    // builder does not evaluate entry bodies to infer their selected actor.
+    for choose_a in [false, true] {
+        for output_actor in ["A", "B"] {
+            let template = sil_template(artifact.sil_abi.contract(output_actor).expect("output contract"));
+            let entry_sigscript = encode_entry_sig_script(
+                &artifact.sil_abi,
+                "A",
+                contract,
+                "choose",
+                choose,
+                &[ArtifactValue::Bool(choose_a), ArtifactValue::Bytes(template.prefix), ArtifactValue::Bytes(template.suffix)],
+            )
+            .expect("explicit selector witness encodes");
+            let output = builder
+                .covenant_utxo(output_actor, next.clone(), 1_000, 0, false, Some(covenant_id))
+                .expect("output actor state builds");
+            let mut tx = baseline.clone();
+            tx.outputs[0].script_public_key = output.script_public_key;
+            tx.inputs[0].signature_script =
+                pay_to_script_hash_signature_script_with_flags(redeem_script.clone(), entry_sigscript, covenant_engine_flags())
+                    .expect("selector P2SH signature script builds");
+            let result = execute_input_with_covenants(&tx, vec![input_utxo.clone()], 0);
+            let expected = if choose_a { "A" } else { "B" };
+            assert_eq!(result.is_ok(), output_actor == expected, "choose_a={choose_a}, output={output_actor}: {result:?}");
+        }
+    }
+    let dynamic = &entry_artifact(&artifact, "A", "choose").template_selectors[0];
+    assert_eq!(dynamic.fixed_actor, None);
+    assert_eq!(dynamic.variants, ["A", "B"]);
+    let fixed = &entry_artifact(&artifact, "A", "fixed").template_selectors[0];
+    assert_eq!(fixed.fixed_actor.as_deref(), Some("B"));
+}
+
+#[test]
 fn gate_less_route_family_rejects_selector_for_appended_rep() {
     let artifact = inline_artifact(
         "gate-less-selector-bound",
