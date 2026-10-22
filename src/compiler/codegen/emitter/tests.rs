@@ -10068,6 +10068,149 @@ fn sil_signature_builtins_pass_through() {
 }
 
 #[test]
+fn calls_compile_with_same_named_parameters_and_locals() {
+    for scope in ["global", "actor", "entry"] {
+        for parameter in [false, true] {
+            let params = if parameter { "int plus" } else { "" };
+            let declaration = if parameter { "" } else { "int plus = 10;" };
+            let body = format!(
+                "{declaration} int check_value = 10; check_value(check_value); \
+                 (int returned) = plus(1); require(returned == 2); require(plus(1) + plus == 12);"
+            );
+            let functions = "fn plus(int value) -> int { return value + 1; } fn check_value(int value) { require(value == 10); }";
+            let helper = format!("fn inspect_value({params}) {{ {body} }}");
+            let entry_params = if scope == "entry" { params } else { "" };
+            let entry_body = if scope == "entry" {
+                body.clone()
+            } else if parameter {
+                "inspect_value(10);".to_string()
+            } else {
+                "inspect_value();".to_string()
+            };
+            let source = format!(
+                r#"
+                    state CounterState {{ int count; }}
+                    {global_functions}
+                    actor Counter owns CounterState {{
+                        {actor_functions}
+                        entry inspect({entry_params}) emits none {{ {entry_body} }}
+                    }}
+                    app Test {{ actor Counter; }}
+                "#,
+                global_functions = if scope == "global" {
+                    format!("{functions} {helper}")
+                } else if scope == "entry" {
+                    functions.to_string()
+                } else {
+                    String::new()
+                },
+                actor_functions = if scope == "actor" { format!("{functions} {helper}") } else { String::new() },
+            );
+            let (actors, artifact) = inline_actor_sil_and_artifact("call-value-namespaces", &source);
+            let sil = &actors["Counter"];
+            assert!(sil.contains("(int returned) = plus(1);") || sil.contains("(int gen__glob_returned) = plus(1);"), "{sil}");
+            let compiled =
+                compile_contract(sil, &[SilExpr::int(0)], CompileOptions::default()).expect("formatted helper calls compile");
+            assert_eq!(compiled.bytecode, artifact.sil_abi.contract("Counter").expect("Counter ABI exists").compiled.bytecode);
+        }
+    }
+}
+
+#[test]
+fn state_constructors_compile_with_same_named_parameters_and_locals() {
+    for scope in ["global", "actor", "entry"] {
+        for parameter in [false, true] {
+            let params = if parameter { "int CounterState" } else { "" };
+            let declaration = if parameter { "" } else { "int CounterState = 10;" };
+            let body = format!(
+                "{declaration} CounterState snapshot = CounterState {{ count: CounterState }}; require(snapshot.count == CounterState);"
+            );
+            let helper = format!("fn inspect_value({params}) {{ {body} }}");
+            let entry_params = if scope == "entry" { params } else { "" };
+            let entry_body = if scope == "entry" {
+                body.clone()
+            } else if parameter {
+                "inspect_value(10);".to_string()
+            } else {
+                "inspect_value();".to_string()
+            };
+            let source = format!(
+                r#"
+                    state CounterState {{ int count; }}
+                    {global_helper}
+                    actor Counter owns CounterState {{
+                        {actor_helper}
+                        entry inspect({entry_params}) emits none {{ {entry_body} }}
+                    }}
+                    app Test {{ actor Counter; }}
+                "#,
+                global_helper = if scope == "global" { &helper } else { "" },
+                actor_helper = if scope == "actor" { &helper } else { "" },
+            );
+            let (actors, artifact) = inline_actor_sil_and_artifact("constructor-value-namespaces", &source);
+            let sil = &actors["Counter"];
+            assert!(sil.contains("= State {count:"), "{sil}");
+            let compiled =
+                compile_contract(sil, &[SilExpr::int(0)], CompileOptions::default()).expect("formatted constructors compile");
+            assert_eq!(compiled.bytecode, artifact.sil_abi.contract("Counter").expect("Counter ABI exists").compiled.bytecode);
+        }
+    }
+}
+
+#[test]
+fn global_helpers_keep_builtin_calls_and_constructors_outside_the_value_namespace() {
+    let (actors, artifact) = inline_actor_sil_and_artifact(
+        "builtin-value-namespaces",
+        r#"
+            state CounterState { int count; }
+            fn inspect_value(int sha256) -> int {
+                int ScriptPubKeyP2SH = 10;
+                byte[32] hash = sha256(byte[](0x1122));
+                byte[37] script = new ScriptPubKeyP2SH(hash);
+                require(script.length == 37);
+                return sha256 + ScriptPubKeyP2SH;
+            }
+            actor Counter owns CounterState {
+                entry inspect() emits none { require(inspect_value(2) == 12); }
+            }
+            app Test { actor Counter; }
+        "#,
+    );
+    let sil = &actors["Counter"];
+    assert!(sil.contains("= sha256(byte[](0x1122));"), "{sil}");
+    assert!(sil.contains("new ScriptPubKeyP2SH(gen__glob_hash)"), "{sil}");
+    let compiled = compile_contract(sil, &[SilExpr::int(0)], CompileOptions::default()).expect("formatted builtin calls compile");
+    assert_eq!(compiled.bytecode, artifact.sil_abi.contract("Counter").expect("Counter ABI exists").compiled.bytecode);
+}
+
+#[test]
+fn actor_helper_names_do_not_hide_state_fields() {
+    let (actors, artifact) = inline_actor_sil_and_artifact(
+        "actor-helper-field-namespaces",
+        r#"
+            state CounterState { cov_id member; }
+            actor Counter owns CounterState {
+                fn member() -> int {
+                    require(member.co_spent());
+                    return 2;
+                }
+                entry inspect() emits none {
+                    require(member.co_spent());
+                    require(member() == 2);
+                }
+            }
+            app Test { actor Counter; }
+        "#,
+    );
+    let sil = &actors["Counter"];
+    assert_eq!(sil.matches("OpCovInputCount(member) > 0").count(), 2, "{sil}");
+    assert!(sil.contains("require(member() == 2);"), "{sil}");
+    let compiled = compile_contract(sil, &[SilExpr::bytes(vec![0; 32])], CompileOptions::default())
+        .expect("formatted actor helper and field names compile");
+    assert_eq!(compiled.bytecode, artifact.sil_abi.contract("Counter").expect("Counter ABI exists").compiled.bytecode);
+}
+
+#[test]
 fn sil_state_builtins_pass_through() {
     let (actors, artifact) = inline_actor_sil_and_artifact(
         "sil-state-builtins",
