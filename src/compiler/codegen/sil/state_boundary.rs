@@ -190,12 +190,12 @@ impl OutputStateTarget {
             && self.sil_type == self.authored_sil_type
     }
 
-    pub(in crate::compiler::codegen) fn materialize_authored_ast(
+    pub(in crate::compiler::codegen) fn materialize_authored_ast<'ast>(
         &self,
-        authored: SilExpr<'static>,
+        authored: SilExpr<'ast>,
         lowering: &ContractStateLowering,
         model: &AppCompilationContext<'_>,
-    ) -> Option<SilExpr<'static>> {
+    ) -> Option<SilExpr<'ast>> {
         if self.is_unwrapped_authored_value() {
             return Some(authored);
         }
@@ -511,12 +511,12 @@ pub(in crate::compiler::codegen) struct PlannedOutputValidation {
 }
 
 impl PlannedOutputValidation {
-    pub(in crate::compiler::codegen) fn direct_ast_statements(
+    pub(in crate::compiler::codegen) fn direct_ast_statements<'ast>(
         self,
         target: &OutputStateTarget,
-        output_index: SilExpr<'static>,
-        state: SilExpr<'static>,
-    ) -> Option<Vec<SilStatement<'static>>> {
+        output_index: SilExpr<'ast>,
+        state: SilExpr<'ast>,
+    ) -> Option<Vec<SilStatement<'ast>>> {
         let span = SilSpan::default();
         let mut statements = Vec::new();
         let state = if !target.is_unwrapped_authored_value() {

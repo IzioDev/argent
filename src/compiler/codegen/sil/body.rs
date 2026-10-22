@@ -1811,8 +1811,9 @@ impl<'a, 'm, 'p> BodyLowerer<'a, 'm, 'p> {
                         {
                             value = projected;
                         }
-                        let source_name = match &mut value.kind {
-                            SilExprKind::Identifier(name) => name.clone(),
+                        // Retain authored identifier spans for the later bound-name lowering pass.
+                        let source = match &mut value.kind {
+                            SilExprKind::Identifier(_) => value,
                             _ => {
                                 if let SilExprKind::StructLiteral { name, .. } = &mut value.kind {
                                     *name = target.authored_sil_type().to_string();
@@ -1835,12 +1836,11 @@ impl<'a, 'm, 'p> BodyLowerer<'a, 'm, 'p> {
                                     modifier_spans: Vec::new(),
                                     name_span: span,
                                 });
-                                source_name
+                                SilExpr::identifier(source_name)
                             }
                         };
                         let lowering = self.model.state_lowering_by_id(self.entry_id.actor).ok()?;
-                        let physical_ast =
-                            target.materialize_authored_ast(SilExpr::identifier(source_name.clone()), lowering, self.model)?;
+                        let physical_ast = target.materialize_authored_ast(source, lowering, self.model)?;
                         let context = match selector {
                             Some(selector) => OutputValidationContext::Selector {
                                 selector,
@@ -2061,8 +2061,8 @@ impl<'a, 'm, 'p> BodyLowerer<'a, 'm, 'p> {
         {
             value = projected;
         }
-        let source_name = match &mut value.kind {
-            SilExprKind::Identifier(name) => name.clone(),
+        let source = match &mut value.kind {
+            SilExprKind::Identifier(_) => value,
             _ => {
                 if let SilExprKind::StructLiteral { name, .. } = &mut value.kind {
                     *name = target.authored_sil_type().to_string();
@@ -2082,11 +2082,11 @@ impl<'a, 'm, 'p> BodyLowerer<'a, 'm, 'p> {
                     modifier_spans: Vec::new(),
                     name_span: span,
                 });
-                source_name
+                SilExpr::identifier(source_name)
             }
         };
         let lowering = self.model.state_lowering_by_id(self.entry_id.actor).ok()?;
-        let physical_ast = target.materialize_authored_ast(SilExpr::identifier(source_name.clone()), lowering, self.model)?;
+        let physical_ast = target.materialize_authored_ast(source, lowering, self.model)?;
         let observed_spec = match context {
             CovenantOutputContext::Existing { .. } => {
                 Some(self.model.entry_output_plan_by_id(self.entry_id).ok()?.observed_witness(interaction_id).ok()?)
