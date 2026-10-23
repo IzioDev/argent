@@ -103,7 +103,7 @@ impl<'src> Parser<'src> {
             return Err(self.error("every `become` route must name its output with `output <- successor`"));
         }
 
-        self.pos = self.pos + 2;
+        self.pos += 2;
 
         let successor_start = self.current().span.start;
         let successor = if self.check_ident(word::SELF)
