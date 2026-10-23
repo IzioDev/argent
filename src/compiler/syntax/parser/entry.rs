@@ -93,7 +93,8 @@ impl<'src> Parser<'src> {
         let output = self.expect_any_ident()?;
         let output_end = self.previous().span.end;
 
-        // the lexer doesn't interpret arrows, so reconcile `<` and `-` here.
+        // The lexer leaves `<-` as two symbols so comparisons such as `x<-1` remain valid.
+        // Require adjacent symbols when parsing a route arrow.
         if !self.check_symbol('<')
             || !self
                 .tokens
