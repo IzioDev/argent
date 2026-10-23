@@ -1379,6 +1379,9 @@ impl AppCompilationContext<'_> {
 }
 
 fn reject_reserved_function_identifier(name: &str) -> Result<()> {
+    if name == word::CO_SPENT {
+        return Err(ArgentError::new(format!("function identifier `{}` is reserved for covenant co-spend checks", word::CO_SPENT)));
+    }
     if name == word::DIGEST {
         return Err(ArgentError::new(format!("function identifier `{}` is reserved for authored state digests", word::DIGEST)));
     }
